@@ -32,15 +32,36 @@ C = {
     "overtime_meal": "\u52a0\u73ed\u9910\u8d39",
     "business_trip_meal_policy": "\u51fa\u5dee\u9910\u8d39",
     "local_overtime_meal_policy": "\u672c\u5730\u52a0\u73ed\u9910\u8d39",
+    "hotel_policy_first_tier": "\u9152\u5e97\uff08\u5317\u4e0a\u5e7f\u6df1\uff09",
+    "hotel_policy_other_city": "\u9152\u5e97\uff08\u5176\u4ed6\u57ce\u5e02\uff09",
     "invoice_amount": "\u53d1\u7968\u91d1\u989d",
     "reimbursable_amount": "\u5b9e\u9645\u62a5\u9500",
     "meal_cap_ok": "\u672a\u8d85\u6807",
     "meal_cap_over_with_attendees": "\u8d85\u6807\uff0c\u5df2\u6709\u591a\u4eba\u4fe1\u606f\uff0c\u4ec5\u63d0\u793a\u590d\u6838",
     "meal_cap_over_needs_confirmation": "\u8d85\u6807\uff0c\u9700\u786e\u8ba4\u65e5\u671f/\u591a\u4eba/\u5b9e\u62a5\u91d1\u989d",
+    "hotel_cap_missing_nights": "\u7f3a\u5c11\u665a\u6570\uff0c\u9700\u786e\u8ba4\u5165\u4f4f/\u79bb\u5e97/\u665a\u6570",
+    "hotel_cap_missing_city": "\u7f3a\u5c11\u57ce\u5e02\uff0c\u9700\u786e\u8ba4\u57ce\u5e02\u6863\u4f4d",
+    "hotel_cap_over_with_shared_room": "\u8d85\u6807\uff0c\u5df2\u6709\u540c\u4f4f/\u6807\u95f4\u4fe1\u606f\uff0c\u4ec5\u63d0\u793a\u590d\u6838",
+    "hotel_cap_over_needs_confirmation": "\u8d85\u6807\uff0c\u9700\u786e\u8ba4\u665a\u6570/\u540c\u4f4f/\u5b9e\u62a5\u91d1\u989d",
 }
 
 BUSINESS_TRIP_MEAL_DAILY_CAP = Decimal("150.00")
 LOCAL_OVERTIME_MEAL_DAILY_CAP = Decimal("60.00")
+FIRST_TIER_HOTEL_CAP = Decimal("800.00")
+OTHER_CITY_HOTEL_CAP = Decimal("600.00")
+ADMIN_CODE = "CORP-2026-ADMIN"
+ADMIN_FALLBACK_CLIENT = "\u9879\u76ee\u3001\u8c03\u7814\u4ee5\u5916\u7684\u5176\u4ed6\u8d39\u7528"
+MOBILE_CLIENT = "\u901a\u8baf\u8d39"
+FIRST_TIER_CITIES = {
+    "\u5317\u4eac",
+    "\u4e0a\u6d77",
+    "\u5e7f\u5dde",
+    "\u6df1\u5733",
+    "beijing",
+    "shanghai",
+    "guangzhou",
+    "shenzhen",
+}
 
 
 AMOUNT_COLUMNS = {
@@ -148,6 +169,17 @@ def clean(value: Any) -> str:
     return re.sub(r"\s+", " ", "" if value is None else str(value)).strip()
 
 
+def normalized_client_name(unit: dict[str, Any]) -> str:
+    client = clean(unit.get("client_name"))
+    code = clean(unit.get("client_charge_code")).upper()
+    if code != ADMIN_CODE:
+        return client
+    placeholder = client.lower() in {"", "admin", ADMIN_CODE.lower()}
+    if unit.get("source_category") == "mobile" or unit.get("final_template_column") == "mobile":
+        return MOBILE_CLIENT if placeholder or client == ADMIN_FALLBACK_CLIENT else client
+    return ADMIN_FALLBACK_CLIENT if placeholder else client
+
+
 def money(value: Any) -> str:
     if value in (None, ""):
         return "0.00"
@@ -186,6 +218,8 @@ def require_ready(allocation: dict[str, Any], allow_unconfirmed: bool) -> list[s
         if not allow_unconfirmed and status not in {"confirmed", "fixed"}:
             errors.append(f"{unit.get('unit_id')} is not confirmed or fixed.")
         for field in ["client_name", "client_charge_code", "final_template_column", "amount", "expense_date"]:
+            if field == "client_name" and clean(unit.get("client_charge_code")).upper() == ADMIN_CODE:
+                continue
             if not unit.get(field):
                 errors.append(f"{unit.get('unit_id')} missing {field}.")
     return errors
@@ -316,7 +350,7 @@ def make_rows(units: list[dict[str, Any]], requester: str) -> list[dict[str, Any
         rows.append({
             "date": date_yyyymmdd(unit.get("expense_date", "")),
             "requester": requester,
-            "client": unit.get("client_name", ""),
+            "client": normalized_client_name(unit),
             "client_charge_code": unit.get("client_charge_code", ""),
             "expenses_nature": expense_nature(unit),
             "note": final_note(unit),
@@ -335,6 +369,14 @@ def make_rows(units: list[dict[str, Any]], requester: str) -> list[dict[str, Any
             "seller_name": unit.get("seller_name", ""),
             "attendees": unit.get("attendees", ""),
             "meal_context": unit.get("meal_context", ""),
+            "hotel_city": unit.get("hotel_city", ""),
+            "hotel_city_tier": unit.get("hotel_city_tier", ""),
+            "hotel_nights": unit.get("hotel_nights", ""),
+            "check_in_date": unit.get("check_in_date", ""),
+            "check_out_date": unit.get("check_out_date", ""),
+            "shared_room": unit.get("shared_room", False),
+            "room_shared_with": unit.get("room_shared_with", ""),
+            "room_share_note": unit.get("room_share_note", ""),
             "is_substitute_invoice": bool(unit.get("is_substitute_invoice")),
             "substitute_for": unit.get("substitute_for", ""),
             "approval_required": unit.get("approval_required", ""),
@@ -481,6 +523,189 @@ def print_meal_cap_check(checks: list[dict[str, Any]]) -> None:
                 f"{item.get('source_filename') or '-'} | invoice {item['invoice_amount']} | "
                 f"reimburse {item['reimbursable_amount']} | attendees {item.get('attendees') or '-'}"
             )
+        if check["suggested_adjustments"]:
+            print("  suggested adjustment to fit cap:")
+            for adjustment in check["suggested_adjustments"]:
+                print(
+                    f"  item {adjustment.get('user_no') or '-'} "
+                    f"{adjustment['current_reimbursable_amount']} -> "
+                    f"{adjustment['suggested_reimbursable_amount']} "
+                    f"(reduce {adjustment['reduce_by']})"
+                )
+
+
+def boolish(value: Any) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        return bool(value)
+    return clean(value).lower() in {"1", "true", "yes", "y", "provided", "\u662f", "\u6709", "\u540c\u4f4f"}
+
+
+def parse_positive_int(value: Any) -> int | None:
+    if value in (None, ""):
+        return None
+    match = re.search(r"\d+", str(value))
+    if not match:
+        return None
+    parsed = int(match.group(0))
+    return parsed if parsed > 0 else None
+
+
+def parse_date_object(value: Any) -> datetime.date | None:
+    match = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", clean(value))
+    if not match:
+        return None
+    try:
+        return datetime(int(match.group(1)), int(match.group(2)), int(match.group(3))).date()
+    except ValueError:
+        return None
+
+
+def date_strings(value: Any) -> list[str]:
+    return [
+        f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
+        for match in re.finditer(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", clean(value))
+    ]
+
+
+def hotel_city_policy(row: dict[str, Any]) -> dict[str, Any] | None:
+    tier = clean(row.get("hotel_city_tier")).lower()
+    if tier in {"first_tier", "tier1", "1", "\u4e00\u7ebf", "\u5317\u4e0a\u5e7f\u6df1"}:
+        return {"city_tier": "first_tier", "policy_name": C["hotel_policy_first_tier"], "cap_per_night": FIRST_TIER_HOTEL_CAP}
+    if tier in {"other", "non_first_tier", "2", "\u5176\u4ed6", "\u975e\u4e00\u7ebf"}:
+        return {"city_tier": "other", "policy_name": C["hotel_policy_other_city"], "cap_per_night": OTHER_CITY_HOTEL_CAP}
+    city = clean(row.get("hotel_city") or row.get("city"))
+    if not city:
+        return None
+    city_lower = city.lower()
+    if any(name in city or name in city_lower for name in FIRST_TIER_CITIES):
+        return {"city_tier": "first_tier", "policy_name": C["hotel_policy_first_tier"], "cap_per_night": FIRST_TIER_HOTEL_CAP}
+    return {"city_tier": "other", "policy_name": C["hotel_policy_other_city"], "cap_per_night": OTHER_CITY_HOTEL_CAP}
+
+
+def hotel_stay_details(row: dict[str, Any]) -> dict[str, Any]:
+    note = clean(row.get("note"))
+    nights = parse_positive_int(row.get("hotel_nights") or row.get("nights"))
+    if not nights:
+        night_match = re.search(r"(\d+)\s*\u665a", note)
+        if night_match:
+            nights = int(night_match.group(1))
+    check_in = clean(row.get("check_in_date"))
+    check_out = clean(row.get("check_out_date"))
+    date_candidates = date_strings(note)
+    if not check_in and date_candidates:
+        check_in = date_candidates[0]
+    if not check_out and len(date_candidates) >= 2:
+        check_out = date_candidates[1]
+    if not nights and check_in and check_out:
+        start = parse_date_object(check_in)
+        end = parse_date_object(check_out)
+        if start and end and end > start:
+            nights = (end - start).days
+    return {"nights": nights, "check_in_date": check_in, "check_out_date": check_out}
+
+
+def has_hotel_shared_room(row: dict[str, Any]) -> bool:
+    return boolish(row.get("shared_room")) or bool(clean(row.get("room_shared_with") or row.get("room_share_note") or row.get("attendees")))
+
+
+def hotel_item(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "user_no": row.get("user_no", ""),
+        "proof_no": row.get("proof_no", ""),
+        "source_unit_id": row.get("source_unit_id", ""),
+        "source_filename": row.get("source_filename") or row.get("supporting_invoice_filename") or "",
+        "seller_name": row.get("seller_name", ""),
+        "invoice_amount": row.get("invoice_amount", "0.00"),
+        "reimbursable_amount": row.get("reimbursable_amount", row.get("amount", "0.00")),
+        "note": row.get("note", ""),
+        "room_shared_with": row.get("room_shared_with", ""),
+        "room_share_note": row.get("room_share_note", ""),
+    }
+
+
+def hotel_cap_checks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = []
+    for row in rows:
+        if row.get("source_category") != "hotel" and row.get("amount_column") != "hotel":
+            continue
+        stay = hotel_stay_details(row)
+        policy = hotel_city_policy(row)
+        amount = Decimal(money(row.get("amount")))
+        has_shared = has_hotel_shared_room(row)
+        status = C["meal_cap_ok"]
+        requires_confirmation = False
+        suggested_adjustments: list[dict[str, Any]] = []
+        cap_total: Decimal | None = None
+        over_by: Decimal | None = None
+
+        if not stay["nights"]:
+            status = C["hotel_cap_missing_nights"]
+            requires_confirmation = True
+        elif not policy:
+            status = C["hotel_cap_missing_city"]
+            requires_confirmation = True
+        else:
+            cap_total = policy["cap_per_night"] * Decimal(stay["nights"])
+            over_by = amount - cap_total
+            if over_by > 0:
+                if has_shared:
+                    status = C["hotel_cap_over_with_shared_room"]
+                else:
+                    status = C["hotel_cap_over_needs_confirmation"]
+                    requires_confirmation = True
+                    suggested_adjustments.append({
+                        "user_no": row.get("user_no", ""),
+                        "proof_no": row.get("proof_no", ""),
+                        "source_unit_id": row.get("source_unit_id", ""),
+                        "source_filename": row.get("source_filename") or row.get("supporting_invoice_filename") or "",
+                        "current_reimbursable_amount": money(amount),
+                        "suggested_reimbursable_amount": money(cap_total),
+                        "reduce_by": money(over_by),
+                    })
+
+        checks.append({
+            "policy": "hotel_cap",
+            "policy_name": policy["policy_name"] if policy else "",
+            "city_tier": policy["city_tier"] if policy else "",
+            "city": clean(row.get("hotel_city") or row.get("city")),
+            "date": row.get("date") or date_yyyymmdd(row.get("expense_date", "")),
+            "check_in_date": stay["check_in_date"],
+            "check_out_date": stay["check_out_date"],
+            "nights": stay["nights"] or "",
+            "cap_per_night": money(policy["cap_per_night"]) if policy else "",
+            "cap_total": money(cap_total) if cap_total is not None else "",
+            "total": money(amount),
+            "over_by": money(over_by) if over_by and over_by > 0 else "0.00",
+            "status": status,
+            "has_shared_room": has_shared,
+            "requires_user_confirmation": requires_confirmation,
+            "items": [hotel_item(row)],
+            "suggested_adjustments": suggested_adjustments,
+        })
+    return checks
+
+
+def print_hotel_cap_check(checks: list[dict[str, Any]]) -> None:
+    print("\nHOTEL CAP CHECK TO SHOW IN CHAT")
+    print("Copy or summarize this check in the conversation before final submission.")
+    if not checks:
+        print("No hotel rows requiring cap checks found.")
+        return
+    for check in checks:
+        print(
+            f"- item {check['items'][0].get('user_no') or '-'} | {check.get('city') or '-'} "
+            f"[{check.get('policy_name') or 'city tier unknown'}] | "
+            f"{check.get('nights') or '?'} night(s) | total {check['total']} / "
+            f"cap {check.get('cap_total') or '?'} / over {check['over_by']} / {check['status']}"
+        )
+        item = check["items"][0]
+        print(
+            f"  proof {item.get('proof_no') or '-'} | {item.get('source_filename') or '-'} | "
+            f"invoice {item['invoice_amount']} | reimburse {item['reimbursable_amount']} | "
+            f"shared {item.get('room_shared_with') or item.get('room_share_note') or '-'}"
+        )
         if check["suggested_adjustments"]:
             print("  suggested adjustment to fit cap:")
             for adjustment in check["suggested_adjustments"]:
@@ -866,6 +1091,20 @@ def build_markdown(payload: dict[str, Any], workbook: Path) -> str:
             f"| {check.get('policy_name', '')} | {check['date']} | {check['total']} | {check['cap']} | {check['over_by']} | "
             f"{check['status']} | {check['requires_user_confirmation']} |"
         )
+    lines += [
+        "",
+        "## Hotel Cap Checks",
+        "",
+        "| Item | City | Nights | Total | Cap Total | Over By | Status | Needs Confirmation |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | --- | --- |",
+    ]
+    for check in payload.get("hotel_cap_checks", []):
+        item = check.get("items", [{}])[0]
+        lines.append(
+            f"| {item.get('user_no', '')} | {check.get('city', '')} | {check.get('nights', '')} | "
+            f"{check['total']} | {check.get('cap_total', '')} | {check['over_by']} | "
+            f"{check['status']} | {check['requires_user_confirmation']} |"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -916,8 +1155,10 @@ def main(argv: list[str] | None = None) -> int:
     rows = make_rows(units, args.requester)
     rows.sort(key=lambda r: (r["client"], r["client_charge_code"], ROW_ORDER.get(r["row_order_type"], 99), r["expense_date"], r["proof_no"]))
     meal_checks = meal_daily_cap_checks(rows)
+    hotel_checks = hotel_cap_checks(rows)
     project_blocks, summary_rows = write_workbook(Path(args.output), rows, template_path, layout)
     meal_check_status = "needs_confirmation" if any(check["requires_user_confirmation"] for check in meal_checks) else "ok"
+    hotel_check_status = "needs_confirmation" if any(check["requires_user_confirmation"] for check in hotel_checks) else "ok"
 
     payload = {
         "schema_version": "final_expense_rows.v1",
@@ -933,6 +1174,7 @@ def main(argv: list[str] | None = None) -> int:
         "project_blocks": project_blocks,
         "summary_rows": summary_rows,
         "meal_daily_cap_checks": meal_checks,
+        "hotel_cap_checks": hotel_checks,
         "checks": [
             {
                 "name": "meal_daily_caps",
@@ -943,6 +1185,16 @@ def main(argv: list[str] | None = None) -> int:
                 "status": meal_check_status,
                 "days_checked": len(meal_checks),
                 "days_requiring_confirmation": sum(1 for check in meal_checks if check["requires_user_confirmation"]),
+            },
+            {
+                "name": "hotel_caps",
+                "caps": {
+                    "first_tier_city_per_night": money(FIRST_TIER_HOTEL_CAP),
+                    "other_city_per_night": money(OTHER_CITY_HOTEL_CAP),
+                },
+                "status": hotel_check_status,
+                "items_checked": len(hotel_checks),
+                "items_requiring_confirmation": sum(1 for check in hotel_checks if check["requires_user_confirmation"]),
             }
         ],
     }
@@ -953,6 +1205,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote {process_dir / 'final-expense-rows.json'}")
     print(f"Wrote {process_dir / 'final-expense-rows.md'}")
     print_meal_cap_check(meal_checks)
+    print_hotel_cap_check(hotel_checks)
     return 0
 
 

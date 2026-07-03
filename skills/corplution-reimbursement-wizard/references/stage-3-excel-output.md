@@ -37,7 +37,7 @@ Write these fields:
 | --- | --- |
 | `Date (YYYYMMDD)` | `expense_date` formatted as `YYYYMMDD` |
 | `Requester` | ask user if missing |
-| `Client` | confirmed `client_name` |
+| `Client` | confirmed `client_name`; for `CORP-2026-ADMIN`, normalize mobile to `通讯费` and other missing/admin placeholders to `项目、调研以外的其他费用` |
 | `Client Charge Code` | confirmed `client_charge_code` |
 | `Expenses Nature` | formal local/trip rule below |
 | `Note` | confirmed `final_note` from stage 2 |
@@ -83,6 +83,35 @@ For each date and meal policy:
 
 Always copy or summarize the script's `MEAL DAILY CAP CHECK TO SHOW IN CHAT` output in the conversation. Do not leave this only in `final-expense-rows.json/md`.
 
+## Hotel Caps
+
+Corplution's hotel standards are:
+
+- Beijing, Shanghai, Guangzhou, Shenzhen: RMB 800 per night.
+- Other cities: RMB 600 per night.
+
+After final rows are built and before final submission, calculate each hotel item's reimbursable amount per stay against the relevant cap.
+
+Use these sources for hotel nights, in order:
+
+- `hotel_nights`
+- `check_in_date` and `check_out_date`
+- `final_note` text such as `出差酒店（2晚，2026-06-10-2026-06-12）`
+
+If nights cannot be determined, ask the user for check-in date, check-out date, and number of nights. Do not invent the night count.
+
+For each hotel item:
+
+- Determine city tier from `hotel_city_tier` when present; otherwise infer from `hotel_city` or `city`.
+- Calculate cap total as per-night cap multiplied by nights.
+- If reimbursable amount is within cap, mark the item as OK.
+- If the amount exceeds cap and `shared_room`, `room_shared_with`, or `room_share_note` is present, show a warning only: the hotel exceeds the standard but may be valid because it was a shared standard room.
+- If the amount exceeds cap and no shared-room information exists, ask whether the nights/city tier are wrong, there was a co-occupant/shared standard room, or the hotel should be partially reimbursed.
+- When partial reimbursement is needed, suggest `reimbursable_amount = cap_total`.
+- Apply user-confirmed partial reimbursement with `scripts/apply_allocation_answers.py`, then regenerate the workbook. The final note should show the invoice/reimbursable difference automatically.
+
+Always copy or summarize the script's `HOTEL CAP CHECK TO SHOW IN CHAT` output in the conversation. Do not leave this only in `final-expense-rows.json/md`.
+
 ## Workbook Format
 
 When no template is supplied, generate the workbook from `assets/reimbursement-workbook-layout.toml` plus script-written rows and formulas. Keep static workbook layout in TOML and keep reimbursement business logic in Python.
@@ -123,6 +152,8 @@ Client + Client Charge Code
 ```
 
 If two projects share the same `Client Charge Code` but have different `Client` values, treat them as separate project blocks. This is common when several pending projects use `CORP-2026-BD`.
+
+For `CORP-2026-ADMIN`, do not group all rows under `Admin`. Treat the Client value as the admin matter name. Mobile rows should group under `通讯费 / CORP-2026-ADMIN`; other admin rows should use the specific matter name when provided, or `项目、调研以外的其他费用 / CORP-2026-ADMIN` as the non-blocking default.
 
 For each project block:
 
@@ -361,6 +392,14 @@ Create or update:
       "seller_name": "",
       "attendees": "",
       "meal_context": "",
+      "hotel_city": "",
+      "hotel_city_tier": "",
+      "hotel_nights": "",
+      "check_in_date": "",
+      "check_out_date": "",
+      "shared_room": false,
+      "room_shared_with": "",
+      "room_share_note": "",
       "is_substitute_invoice": false,
       "substitute_for": "",
       "approval_required": "",
@@ -403,6 +442,27 @@ Create or update:
       "suggested_adjustments": []
     }
   ],
+  "hotel_cap_checks": [
+    {
+      "policy": "hotel_cap",
+      "policy_name": "酒店（北上广深）",
+      "city_tier": "first_tier",
+      "city": "上海",
+      "date": "YYYYMMDD",
+      "check_in_date": "YYYY-MM-DD",
+      "check_out_date": "YYYY-MM-DD",
+      "nights": 1,
+      "cap_per_night": "800.00",
+      "cap_total": "800.00",
+      "total": "0.00",
+      "over_by": "0.00",
+      "status": "未超标",
+      "has_shared_room": false,
+      "requires_user_confirmation": false,
+      "items": [],
+      "suggested_adjustments": []
+    }
+  ],
   "checks": [
     {
       "name": "meal_daily_caps",
@@ -413,6 +473,16 @@ Create or update:
       "status": "ok",
       "days_checked": 0,
       "days_requiring_confirmation": 0
+    },
+    {
+      "name": "hotel_caps",
+      "caps": {
+        "first_tier_city_per_night": "800.00",
+        "other_city_per_night": "600.00"
+      },
+      "status": "ok",
+      "items_checked": 0,
+      "items_requiring_confirmation": 0
     }
   ]
 }
@@ -437,6 +507,7 @@ Before delivering the workbook:
 - `Expense Nature` follows the formal Shanghai/non-Shanghai rule.
 - All substitute invoice notes include `（抵）`.
 - Meal daily cap checks are present and have been shown in chat. Any over-cap day without attendees must be resolved or explicitly acknowledged before final submission.
+- Hotel cap checks are present and have been shown in chat. Missing nights/city tier or any over-cap hotel without shared-room details must be resolved or explicitly acknowledged before final submission.
 - Substitute invoice approval fields are preserved in `final-expense-rows.json` for Stage 4 packaging.
 - Manual correction metadata is preserved in `final-expense-rows.json`.
 - Missing approval screenshots remain visible in checks/issues.

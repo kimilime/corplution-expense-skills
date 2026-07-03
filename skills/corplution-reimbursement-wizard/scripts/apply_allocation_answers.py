@@ -14,6 +14,9 @@ from typing import Any
 ALLOWED_COLUMNS = {"hotel", "travel", "taxi", "meal", "mobile", "other"}
 OPEN_STATUSES = {"open", "needs_confirmation", "draft"}
 CLOSED_UNIT_STATUSES = {"confirmed", "fixed", "dropped", "excluded", "non_reimbursable"}
+ADMIN_CODE = "CORP-2026-ADMIN"
+ADMIN_FALLBACK_CLIENT = "项目、调研以外的其他费用"
+MOBILE_CLIENT = "通讯费"
 
 META_FIELDS = {
     "answer",
@@ -32,6 +35,7 @@ ALLOWED_UNIT_FIELDS = {
     "approval_file",
     "approval_file_status",
     "approval_required",
+    "admin_client_review_needed",
     "attendees",
     "business_reason",
     "city",
@@ -48,6 +52,11 @@ ALLOWED_UNIT_FIELDS = {
     "expenses_nature",
     "final_note",
     "final_template_column",
+    "check_in_date",
+    "check_out_date",
+    "hotel_city",
+    "hotel_city_tier",
+    "hotel_nights",
     "invoice_amount",
     "is_substitute_invoice",
     "issues",
@@ -60,6 +69,9 @@ ALLOWED_UNIT_FIELDS = {
     "place_type_needs_confirmation",
     "project_context_id",
     "reimbursable_amount",
+    "room_share_note",
+    "room_shared_with",
+    "shared_room",
     "route",
     "source_note",
     "status",
@@ -86,6 +98,41 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def clean(value: Any) -> str:
     return "" if value is None else str(value).strip()
+
+
+def is_admin_code(value: Any) -> bool:
+    return clean(value).upper() == ADMIN_CODE
+
+
+def is_mobile_admin_unit(unit: dict[str, Any]) -> bool:
+    return unit.get("source_category") == "mobile" or unit.get("final_template_column") == "mobile"
+
+
+def normalize_admin_client(unit: dict[str, Any]) -> None:
+    if not is_admin_code(unit.get("client_charge_code")):
+        return
+    client = clean(unit.get("client_name"))
+    placeholder = client.lower() in {"", "admin", ADMIN_CODE.lower()}
+    if is_mobile_admin_unit(unit):
+        if placeholder or client == ADMIN_FALLBACK_CLIENT:
+            unit["client_name"] = MOBILE_CLIENT
+        unit["admin_client_review_needed"] = False
+        return
+    if placeholder:
+        unit["client_name"] = ADMIN_FALLBACK_CLIENT
+        unit["admin_client_review_needed"] = True
+    elif client == ADMIN_FALLBACK_CLIENT:
+        unit["admin_client_review_needed"] = True
+    else:
+        unit["admin_client_review_needed"] = False
+
+
+def needs_admin_client_review(unit: dict[str, Any]) -> bool:
+    return (
+        is_admin_code(unit.get("client_charge_code"))
+        and not is_mobile_admin_unit(unit)
+        and clean(unit.get("client_name")) == ADMIN_FALLBACK_CLIENT
+    )
 
 
 def as_bool(value: Any) -> bool:
@@ -200,7 +247,7 @@ def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: boo
             continue
         if field not in ALLOWED_UNIT_FIELDS:
             continue
-        if field in {"is_substitute_invoice", "place_type_needs_confirmation"}:
+        if field in {"is_substitute_invoice", "place_type_needs_confirmation", "shared_room"}:
             value = as_bool(value)
         unit[field] = value
 
@@ -218,6 +265,8 @@ def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: boo
     if unit.get("origin_place_type") and unit.get("destination_place_type"):
         unit["place_type_needs_confirmation"] = False
         unit["place_type_confidence"] = unit.get("place_type_confidence") or "confirmed"
+
+    normalize_admin_client(unit)
 
     after = {field: unit.get(field) for field in ALLOWED_UNIT_FIELDS if field in update}
     changed_fields = [
@@ -288,6 +337,39 @@ def close_answered_questions(payload: dict[str, Any], touched_units: set[str]) -
             question["status"] = "answered"
 
 
+def sync_admin_client_advisories(payload: dict[str, Any]) -> None:
+    questions = payload.setdefault("questions", [])
+    existing = {
+        q.get("unit_ids", [""])[0]: q
+        for q in questions
+        if q.get("question_type") == "admin_client_description" and q.get("unit_ids")
+    }
+    for unit in payload.get("allocation_units", []):
+        unit_id = unit.get("unit_id", "")
+        question = existing.get(unit_id)
+        if needs_admin_client_review(unit):
+            if question:
+                if question.get("status") == "answered":
+                    question["status"] = "advisory"
+                continue
+            questions.append({
+                "question_id": f"Q-ADMIN-CLIENT-{unit_id}",
+                "question_type": "admin_client_description",
+                "unit_ids": [unit_id],
+                "user_no": unit_no(unit),
+                "question": (
+                    f"第{unit_no(unit)}项已经归到 CORP-2026-ADMIN，Client 暂写为"
+                    f"“{ADMIN_FALLBACK_CLIENT}”。如果其实是年会、半年会、客户会、"
+                    "行业协会会议等具体事项，请直接告诉我要改成什么；不改也可以继续写表。"
+                ),
+                "why_it_matters": "Admin 的 Client 列用于说明事项，不能笼统写 Admin；事项名称缺失不是阻塞项。",
+                "status": "advisory",
+                "blocking": False,
+            })
+        elif question and question.get("status") == "advisory":
+            question["status"] = "answered"
+
+
 def build_markdown(payload: dict[str, Any]) -> str:
     lines = [
         "# Expense Allocation Process",
@@ -343,10 +425,21 @@ def print_open_questions(payload: dict[str, Any]) -> None:
     open_questions = [q for q in payload.get("questions", []) if q.get("status", "open") == "open"]
     if not open_questions:
         print("No open allocation questions remain.")
+    else:
+        print("")
+        print("QUESTIONS STILL OPEN:")
+        for idx, question in enumerate(open_questions, start=1):
+            print(f"{idx}. {question.get('question', '')}")
+
+
+def print_advisory_questions(payload: dict[str, Any]) -> None:
+    advisory_questions = [q for q in payload.get("questions", []) if q.get("status") == "advisory"]
+    if not advisory_questions:
         return
     print("")
-    print("QUESTIONS STILL OPEN:")
-    for idx, question in enumerate(open_questions, start=1):
+    print("NON-BLOCKING PROMPTS TO SHOW IN CHAT:")
+    print("These are optional refinements. They do not block Excel output if the default value is acceptable.")
+    for idx, question in enumerate(advisory_questions, start=1):
         print(f"{idx}. {question.get('question', '')}")
 
 
@@ -377,8 +470,12 @@ def apply_answers(
             changes.append(apply_unit_update(unit, update, lenient))
             touched_units.add(unit["unit_id"])
 
+    for unit in payload.get("allocation_units", []):
+        normalize_admin_client(unit)
+
     apply_question_updates(payload, question_updates)
     close_answered_questions(payload, touched_units)
+    sync_admin_client_advisories(payload)
     payload["generated_at"] = datetime.now().replace(microsecond=0).isoformat()
     payload.setdefault("change_log", []).append({
         "timestamp": payload["generated_at"],
@@ -420,6 +517,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote {output_path}")
     print(f"Wrote {markdown_path}")
     print_open_questions(payload)
+    print_advisory_questions(payload)
     return 0
 
 

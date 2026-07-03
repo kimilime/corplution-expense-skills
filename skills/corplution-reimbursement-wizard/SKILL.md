@@ -144,8 +144,9 @@ Read `references/stage-2-allocation.md` before allocating expenses. Keep these c
 - Match railway and flight travel by route, destination city, and travel date.
 - Match hotels by city and stay date when available; otherwise use city plus nearby project period and ask when uncertain.
 - Treat meals as confirmation-heavy because invoice issue date may not equal meal date; ask the user for meal date/project/attendees when needed.
-- Allocate mobile expenses to `CORP-2026-ADMIN`.
-- Ask about `other` expenses by default.
+- Allocate mobile expenses to `CORP-2026-ADMIN` with `client_name = 通讯费`, not `Admin`.
+- For other `CORP-2026-ADMIN` expenses, use a specific matter name as `client_name` when known, such as `年会`, `半年会`, `客户会`, or `行业协会会议`; if missing, use `项目、调研以外的其他费用` and show a non-blocking chat prompt so the applicant can refine it.
+- Ask about `other` expenses by default unless the user already confirmed `CORP-2026-ADMIN`; in that case the matter-name prompt is advisory and must not block Excel output.
 - Ask follow-up questions directly in the current conversation. Use `process/expense-allocation.md/json` as internal process files only; do not tell the user to inspect those files. Each question should name the relevant invoice or trip item, amount, seller/service provider, date, suggested project if any, and why confirmation is needed.
 - Before asking follow-up questions, show a compact applicant review list in chat with item number, source filename, seller/provider, date, amount, category, suggested project, and status.
 - Combine all uncertainties for the same item into one question block. For example, a meal with no matched project should ask for actual meal date, project/client, attendees, and note type together under the same item number.
@@ -166,6 +167,7 @@ Read `references/stage-3-excel-output.md` before writing the reimbursement workb
 - Use the confirmed stage-2 `final_note` for `Note`.
 - Put each amount in exactly one template amount column: hotel, travel, taxi, meal, mobile, or other.
 - For meal expenses with daily standards, apply the cap after rows are built: business-trip meals are RMB 150/day, local overtime meals are RMB 60/day. Show `meal_daily_cap_checks` in chat. If a date exceeds the relevant cap without attendee details, ask whether the meal date is wrong, attendees are missing, or one item should use a lower `reimbursable_amount`; if reimbursable amount differs from invoice amount, the final note must state `发票金额XX/实际报销XX`.
+- For hotel expenses, apply the per-night cap after rows are built: Beijing/Shanghai/Guangzhou/Shenzhen are RMB 800/night, other cities are RMB 600/night. Show `hotel_cap_checks` in chat. If nights or city tier are missing, ask for check-in/check-out/nights/city. If a hotel exceeds the relevant cap, ask whether there was a shared standard room/co-occupant or whether one item should use a lower `reimbursable_amount`.
 - Assign overall proof numbers by substantive proof order: flight/rail, hotel, taxi/Didi, Gaode, meal, mobile, other.
 - Split Didi/Gaode trip reports into one row per ride, but reuse the same overall proof number for all rides supported by the same invoice.
 - Write rows as project blocks; each block gets a subtotal row, then workbook-level column totals, Total, Grand Total, and Status formulas.
@@ -194,6 +196,6 @@ Before declaring the workflow complete:
 - Markdown and JSON outputs contain the same documents, amounts, categories, links, and review issues.
 - Stage 1 extraction review list has been shown or summarized in chat when there are recognized files or items needing review.
 - Stage 2 allocation has either a confirmed project/context assignment or a user-facing question for every allocation unit.
-- Stage 3 output has a requester, no unconfirmed blocking items, one amount column per row, no duplicate Didi/Gaode summary rows, meal daily cap checks shown in chat, and totals reconcile to confirmed allocation units.
+- Stage 3 output has a requester, no unconfirmed blocking items, one amount column per row, no duplicate Didi/Gaode summary rows, meal and hotel cap checks shown in chat, and totals reconcile to confirmed allocation units.
 - Substitute invoice metadata and approval screenshot paths remain in `final-expense-rows.json` even though they are not written into the visible Excel rows.
 - Stage 4 package contains the workbook at root plus separate invoice and support-document folders, with filenames matching final proof numbers.

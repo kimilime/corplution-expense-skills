@@ -171,6 +171,21 @@ Final note:
 
 If stay dates or nights are missing, infer from project context only when high confidence. Otherwise ask the user for check-in date, check-out date, and number of nights.
 
+Also ask for shared-room/co-occupant details when a hotel may exceed the per-night standard. Stage 3 applies hotel caps after final rows are built: Beijing/Shanghai/Guangzhou/Shenzhen are RMB 800 per night, other cities are RMB 600 per night.
+
+Carry these fields when known:
+
+- `hotel_city`
+- `hotel_city_tier`: `first_tier` for Beijing/Shanghai/Guangzhou/Shenzhen, otherwise `other`
+- `hotel_nights`
+- `check_in_date`
+- `check_out_date`
+- `shared_room`
+- `room_shared_with`
+- `room_share_note`
+
+If the user says only the cap amount should be reimbursed, keep `amount` / `invoice_amount` as the invoice amount and write the amount to claim in `reimbursable_amount`.
+
 ### Meal
 
 Treat meals as confirmation-heavy because invoice issue date may not equal actual meal date.
@@ -204,7 +219,7 @@ If the user says only part of a meal invoice should be reimbursed, keep `amount`
 Assign mobile/telecom expenses to:
 
 - `client_charge_code`: `CORP-2026-ADMIN`
-- `client_name`: `Admin`
+- `client_name`: `通讯费`
 - confidence: `fixed`
 
 Final template column: `mobile`.
@@ -214,6 +229,16 @@ Final note:
 - `X月通讯费`
 
 Use the billing period, not the invoice issue date, when available. For example, billing period `202605` becomes `5月通讯费`.
+
+### Admin Matter Client Names
+
+Never use `Admin` as the final `client_name` for `CORP-2026-ADMIN` rows. The Client column should describe the matter:
+
+- Mobile/telecom: use `通讯费` automatically and do not ask the user.
+- Other admin expenses: use the specific matter when known, such as `年会`, `半年会`, `客户会`, or `行业协会会议`.
+- If the matter is missing, set `client_name` to `项目、调研以外的其他费用` and show a non-blocking prompt in chat asking whether the applicant wants to replace it with a more specific matter name.
+
+This prompt is advisory only. Do not block stage 3 Excel output merely because the admin matter name is still the default.
 
 ### Other
 
@@ -315,6 +340,8 @@ Stage 2 is intentionally iterative:
 
 Group questions by user-facing item number. If one item has multiple uncertainties, ask them together under that item. It is fine to include several item blocks in one chat message, but do not scatter the same item across multiple questions.
 
+Use `status: advisory` with `blocking: false` for optional refinements that should be shown in chat but must not block Excel output, such as replacing the default admin Client `项目、调研以外的其他费用` with a more specific matter name.
+
 Every user-facing question must be answerable without opening any file. Include:
 
 - simple item number, such as `第1项` or `第2项`; do not expose internal IDs such as `DOC-001` or `UNIT-001` in conversation
@@ -380,12 +407,18 @@ Answers JSON shape:
       "status": "confirmed",
       "client_name": "",
       "client_charge_code": "",
+      "admin_client_review_needed": false,
       "project_context_id": "CTX-001",
       "expense_date": "YYYY-MM-DD",
       "city": "",
       "final_template_column": "travel",
       "final_note": "",
       "reimbursable_amount": "",
+      "hotel_nights": "",
+      "check_in_date": "",
+      "check_out_date": "",
+      "shared_room": false,
+      "room_shared_with": "",
       "origin_place_type": "",
       "destination_place_type": "",
       "attendees": "",
@@ -485,6 +518,14 @@ Write `process/expense-allocation.json`:
       "source_category": "meal",
       "final_template_column": "travel",
       "city": "",
+      "hotel_city": "",
+      "hotel_city_tier": "",
+      "hotel_nights": "",
+      "check_in_date": "",
+      "check_out_date": "",
+      "shared_room": false,
+      "room_shared_with": "",
+      "room_share_note": "",
       "route": "",
       "origin_place_type": "",
       "destination_place_type": "",
@@ -494,6 +535,7 @@ Write `process/expense-allocation.json`:
       "project_context_id": "CTX-001",
       "client_name": "",
       "client_charge_code": "",
+      "admin_client_review_needed": false,
       "expenses_nature": "out_of_town",
       "expense_note": "",
       "final_note": "",

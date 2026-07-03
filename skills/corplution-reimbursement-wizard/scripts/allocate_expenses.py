@@ -27,6 +27,7 @@ C = {
     "didi": "\u6ef4\u6ef4",
     "admin": "Admin",
     "admin_code": "CORP-2026-ADMIN",
+    "admin_fallback_client": "\u9879\u76ee\u3001\u8c03\u7814\u4ee5\u5916\u7684\u5176\u4ed6\u8d39\u7528",
     "travel_meal": "\u51fa\u5dee\u9910\u8d39",
     "station_meal": "\u51fa\u5dee\u9910\u8d39\uff08\u9ad8\u94c1\u7ad9/\u673a\u573a\uff09",
     "overtime_meal": "\u52a0\u73ed\u9910\u8d39",
@@ -66,6 +67,33 @@ def write_json(path: Path, payload: dict[str, Any]) -> None:
 
 def clean(value: Any) -> str:
     return re.sub(r"\s+", " ", "" if value is None else str(value)).strip()
+
+
+def is_admin_code(value: Any) -> bool:
+    return clean(value).upper() == C["admin_code"]
+
+
+def is_mobile_admin_unit(unit: dict[str, Any]) -> bool:
+    return unit.get("source_category") == "mobile" or unit.get("final_template_column") == "mobile"
+
+
+def normalize_admin_client(unit: dict[str, Any]) -> None:
+    if not is_admin_code(unit.get("client_charge_code")):
+        return
+    client = clean(unit.get("client_name"))
+    placeholder = client.lower() in {"", "admin", C["admin_code"].lower()}
+    if is_mobile_admin_unit(unit):
+        if placeholder or client == C["admin_fallback_client"]:
+            unit["client_name"] = C["mobile"]
+        unit["admin_client_review_needed"] = False
+        return
+    if placeholder:
+        unit["client_name"] = C["admin_fallback_client"]
+        unit["admin_client_review_needed"] = True
+    elif client == C["admin_fallback_client"]:
+        unit["admin_client_review_needed"] = True
+    else:
+        unit["admin_client_review_needed"] = False
 
 
 def money(value: Any) -> str:
@@ -375,6 +403,14 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
                 "final_note": "",
                 "billing_period": billing_period,
                 "attendees": "",
+                "hotel_city": city if source_category == "hotel" else "",
+                "hotel_city_tier": "",
+                "hotel_nights": "",
+                "check_in_date": "",
+                "check_out_date": "",
+                "shared_room": False,
+                "room_shared_with": "",
+                "room_share_note": "",
                 "is_substitute_invoice": False,
                 "substitute_for": "",
                 "approval_required": "",
@@ -423,12 +459,13 @@ def apply_matches(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -
         if unit.get("source_category") == "mobile":
             unit.update({
                 "project_context_id": "CTX-ADMIN",
-                "client_name": C["admin"],
+                "client_name": C["mobile"],
                 "client_charge_code": C["admin_code"],
                 "confidence": "fixed",
                 "status": "confirmed",
-                "match_reason": "Mobile/telecom expenses are assigned to admin by rule.",
+                "match_reason": "Mobile/telecom expenses are assigned to CORP-2026-ADMIN with Client = 通讯费.",
             })
+            normalize_admin_client(unit)
             continue
         scored = sorted(
             [(score_context(unit, ctx), ctx) for ctx in contexts],
@@ -437,14 +474,21 @@ def apply_matches(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -
         )
         if scored and scored[0][0] >= 5:
             ctx = scored[0][1]
+            matched_status = "needs_confirmation"
+            if scored[0][0] >= 7:
+                if unit.get("source_category") not in {"meal", "other"}:
+                    matched_status = "confirmed"
+                elif unit.get("source_category") == "other" and is_admin_code(ctx.get("client_charge_code")):
+                    matched_status = "confirmed"
             unit.update({
                 "project_context_id": ctx.get("context_id", ""),
                 "client_name": ctx.get("client_name", ""),
                 "client_charge_code": ctx.get("client_charge_code", ""),
                 "confidence": "high" if scored[0][0] >= 7 else "medium",
-                "status": "confirmed" if scored[0][0] >= 7 and unit.get("source_category") not in {"meal", "other"} else "needs_confirmation",
+                "status": matched_status,
                 "match_reason": f"Matched by date/city/context score {scored[0][0]}.",
             })
+        normalize_admin_client(unit)
     return units
 
 
@@ -583,6 +627,25 @@ def add_combined_question(
     })
 
 
+def add_advisory_question(
+    questions: list[dict[str, Any]],
+    unit: dict[str, Any],
+    question_text: str,
+    why_it_matters: str,
+) -> None:
+    if not question_text:
+        return
+    questions.append({
+        "question_id": f"Q-ADV-{len(questions) + 1:03d}",
+        "unit_ids": [unit["unit_id"]],
+        "user_no": unit_user_no(unit),
+        "question": f"{unit_brief(unit)}\n{question_text}",
+        "why_it_matters": why_it_matters,
+        "status": "advisory",
+        "blocking": False,
+    })
+
+
 def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]]) -> list[dict[str, Any]]:
     questions = [normalize_existing_question(q) for q in existing]
     for unit in units:
@@ -598,15 +661,38 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
                 )
             )
         elif unit.get("status") == "needs_confirmation" or unit.get("confidence") == "medium":
-            prompts.append(
-                (
-                    (
-                        "我初步判断它归属于上述项目。请确认这个归属是否正确；"
-                        "如果不正确，请回复正确的客户、项目编号和原因。"
-                    ),
-                    "这是模型可以初步判断但需要你确认的项目归属，尤其适用于跨日期交通、重名 code 或证据不完整的情况。",
-                )
+            admin_matter_only = (
+                source_category == "other"
+                and is_admin_code(unit.get("client_charge_code"))
+                and unit.get("confidence") == "high"
             )
+            if admin_matter_only:
+                pass
+            else:
+                prompts.append(
+                    (
+                        (
+                            "我初步判断它归属于上述项目。请确认这个归属是否正确；"
+                            "如果不正确，请回复正确的客户、项目编号和原因。"
+                        ),
+                        "这是模型可以初步判断但需要你确认的项目归属，尤其适用于跨日期交通、重名 code 或证据不完整的情况。",
+                    )
+                )
+
+        if source_category == "hotel":
+            final_note = clean(unit.get("final_note"))
+            has_nights = bool(
+                unit.get("hotel_nights")
+                or (unit.get("check_in_date") and unit.get("check_out_date"))
+                or re.search(r"\d+\s*\u665a", final_note)
+            )
+            if not has_nights:
+                prompts.append(
+                    (
+                        "这是酒店费用。请确认入住日期、离店日期、住宿晚数；如果是标间同住，也请说明同住人或同住情况。",
+                        "酒店报销标准按每晚计算：北上广深 800/晚，其他城市 600/晚；缺少晚数时无法判断是否超标。",
+                    )
+                )
 
         if source_category == "meal":
             prompts.append(
@@ -619,7 +705,7 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
                 )
             )
 
-        if source_category == "other":
+        if source_category == "other" and not is_admin_code(unit.get("client_charge_code")):
             prompts.append(
                 (
                     "这是其他费用。请确认项目归属、最终金额列，以及 Note 应该怎么写。",
@@ -640,6 +726,21 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
                 )
             )
         add_combined_question(questions, unit, prompts)
+        if (
+            is_admin_code(unit.get("client_charge_code"))
+            and not is_mobile_admin_unit(unit)
+            and clean(unit.get("client_name")) == C["admin_fallback_client"]
+        ):
+            add_advisory_question(
+                questions,
+                unit,
+                (
+                    "这笔费用已经归到 CORP-2026-ADMIN，Client 暂写为“项目、调研以外的其他费用”。"
+                    "如果其实是年会、半年会、客户会、行业协会会议等具体事项，请直接告诉我应改成什么；"
+                    "如果不改，这个默认值也可以先进入最终表。"
+                ),
+                "Admin 的 Client 列用于说明事项，不能笼统写 Admin；但事项名称缺失不是阻塞项。",
+            )
     return questions
 
 
@@ -658,7 +759,7 @@ def unit_review_line(unit: dict[str, Any]) -> str:
     status = "待确认" if unit.get("status") != "confirmed" or unit.get("confidence") in {"low", "medium"} else "已确认"
     if unit.get("place_type_needs_confirmation"):
         status = "待确认地点类型"
-    if category in {"meal", "other"}:
+    if category in {"meal", "other"} and not (category == "other" and is_admin_code(code) and unit.get("status") == "confirmed"):
         status = "待确认"
     return (
         f"{unit_label(unit)} | 文件 {source} | 开具方/服务方 {seller} | 日期 {date_value} | "
@@ -681,11 +782,25 @@ def print_open_questions(payload: dict[str, Any]) -> None:
     open_questions = [q for q in payload.get("questions", []) if q.get("status", "open") == "open"]
     if not open_questions:
         print("No open allocation questions. Stage 2 is ready for Excel output.")
+    else:
+        print("")
+        print("QUESTIONS TO ASK USER DIRECTLY IN THIS CHAT:")
+        print("Do not ask the user to open expense-allocation.md/json; copy or summarize these questions in the conversation.")
+        for idx, question in enumerate(open_questions, start=1):
+            print(f"{idx}. {question.get('question', '')}")
+            why = clean(question.get("why_it_matters"))
+            if why:
+                print(f"   Why: {why}")
+
+
+def print_advisory_questions(payload: dict[str, Any]) -> None:
+    advisory_questions = [q for q in payload.get("questions", []) if q.get("status") == "advisory"]
+    if not advisory_questions:
         return
     print("")
-    print("QUESTIONS TO ASK USER DIRECTLY IN THIS CHAT:")
-    print("Do not ask the user to open expense-allocation.md/json; copy or summarize these questions in the conversation.")
-    for idx, question in enumerate(open_questions, start=1):
+    print("NON-BLOCKING PROMPTS TO SHOW IN CHAT:")
+    print("These are optional refinements. They do not block Excel output if the default value is acceptable.")
+    for idx, question in enumerate(advisory_questions, start=1):
         print(f"{idx}. {question.get('question', '')}")
         why = clean(question.get("why_it_matters"))
         if why:
@@ -778,6 +893,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote {output / 'expense-allocation.md'}")
     print_applicant_review_list(payload)
     print_open_questions(payload)
+    print_advisory_questions(payload)
     return 0
 
 

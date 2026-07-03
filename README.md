@@ -45,8 +45,10 @@ The agent should not ask the applicant to open `process/*.md` or write JSON manu
 4. Paste or summarize the allocation review list in chat before asking project/allocation questions, including item number, source filename, date, amount, category, and suggested project.
 5. Ask grouped questions by item number when something is uncertain.
 6. Accept corrections such as "第9项金额不对" and trace the item back to its source filename before updating.
-7. After writing the workbook, paste or summarize the meal daily cap check. Business-trip meals are capped at RMB 150/day and local overtime meals at RMB 60/day; if a day exceeds the relevant cap without attendee details, ask whether the date, attendees, or `reimbursable_amount` should be corrected.
-8. End with a package summary: workbook, invoice count, support-document count, and unresolved issues.
+7. For `CORP-2026-ADMIN` rows, use `通讯费` as the Client for mobile expenses. For other admin expenses, use the specific matter name when known; otherwise use `项目、调研以外的其他费用` and paste a non-blocking chat prompt asking whether the applicant wants a more specific matter such as 年会、半年会、客户会、行业协会会议.
+8. After writing the workbook, paste or summarize the meal daily cap check. Business-trip meals are capped at RMB 150/day and local overtime meals at RMB 60/day; if a day exceeds the relevant cap without attendee details, ask whether the date, attendees, or `reimbursable_amount` should be corrected.
+9. Paste or summarize the hotel cap check. Beijing/Shanghai/Guangzhou/Shenzhen hotels are capped at RMB 800/night and other cities at RMB 600/night; if nights are missing or a hotel exceeds the cap without shared-room details, ask for confirmation or a `reimbursable_amount` adjustment.
+10. End with a package summary: workbook, invoice count, support-document count, and unresolved issues.
 
 ## Dependencies and OCR
 
