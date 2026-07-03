@@ -83,9 +83,12 @@ Invoice fields:
 Classification fields:
 
 - `expense_category`: `hotel`, `travel`, `taxi`, `meal`, `mobile`, `other`, or `unknown`
-- `expense_date`
+- `expense_date`: reliable occurrence date only, not the invoice issue date by default
+- `expense_date_source`: source of `expense_date`, such as `railway_travel_date`, `trip_report_period_start`, or blank when no reliable occurrence date was extracted
 - `expense_note`
 - `reason`
+
+Keep `invoice.issue_date` as the formal invoice date. Do not copy it into `classification.expense_date` for ordinary invoices, meal invoices, taxi summary invoices, hotel invoices without stay dates, or `other`/`unknown` invoices. Stage 2 will ask the applicant for the actual date when it is not reliable.
 
 Didi trip reports additionally need:
 

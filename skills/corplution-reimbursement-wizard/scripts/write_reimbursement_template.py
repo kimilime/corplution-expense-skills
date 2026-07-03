@@ -217,6 +217,14 @@ def require_ready(allocation: dict[str, Any], allow_unconfirmed: bool) -> list[s
             continue
         if not allow_unconfirmed and status not in {"confirmed", "fixed"}:
             errors.append(f"{unit.get('unit_id')} is not confirmed or fixed.")
+        if not allow_unconfirmed and unit.get("date_required"):
+            errors.append(f"{unit.get('unit_id')} still requires a user-confirmed expense date.")
+        if (
+            not allow_unconfirmed
+            and unit.get("date_is_provisional")
+            and unit.get("source_category") != "other"
+        ):
+            errors.append(f"{unit.get('unit_id')} has a provisional date but is not an other expense.")
         for field in ["client_name", "client_charge_code", "final_template_column", "amount", "expense_date"]:
             if field == "client_name" and clean(unit.get("client_charge_code")).upper() == ADMIN_CODE:
                 continue
@@ -366,6 +374,10 @@ def make_rows(units: list[dict[str, Any]], requester: str) -> list[dict[str, Any
             "source_category": unit.get("source_category", ""),
             "source_filename": unit.get("source_filename", ""),
             "supporting_invoice_filename": unit.get("supporting_invoice_filename", ""),
+            "issue_date": unit.get("issue_date", ""),
+            "date_source": unit.get("date_source", ""),
+            "date_is_provisional": unit.get("date_is_provisional", False),
+            "date_required": unit.get("date_required", False),
             "seller_name": unit.get("seller_name", ""),
             "attendees": unit.get("attendees", ""),
             "meal_context": unit.get("meal_context", ""),
@@ -481,13 +493,16 @@ def meal_daily_cap_checks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         over_by = total - cap
         has_attendees = any(clean(row.get("attendees")) for row in day_rows)
         status = C["meal_cap_ok"]
+        severity = "ok"
         requires_confirmation = False
         suggestions: list[dict[str, Any]] = []
         if over_by > 0:
             if has_attendees:
                 status = C["meal_cap_over_with_attendees"]
+                severity = "advisory"
             else:
                 status = C["meal_cap_over_needs_confirmation"]
+                severity = "blocking"
                 requires_confirmation = True
                 suggestions = suggest_meal_adjustments(day_rows, over_by)
         checks.append({
@@ -498,6 +513,8 @@ def meal_daily_cap_checks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "total": money(total),
             "over_by": money(over_by) if over_by > 0 else "0.00",
             "status": status,
+            "severity": severity,
+            "advisory": severity == "advisory",
             "has_attendees": has_attendees,
             "requires_user_confirmation": requires_confirmation,
             "items": [meal_item(row) for row in day_rows],
@@ -515,7 +532,7 @@ def print_meal_cap_check(checks: list[dict[str, Any]]) -> None:
     for check in checks:
         print(
             f"- {check['date']} [{check.get('policy_name', '')}]: total {check['total']} / cap {check['cap']} / "
-            f"over {check['over_by']} / {check['status']}"
+            f"over {check['over_by']} / {check['status']} / severity {check.get('severity', 'ok')}"
         )
         for item in check["items"]:
             print(
@@ -635,6 +652,7 @@ def hotel_cap_checks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
         amount = Decimal(money(row.get("amount")))
         has_shared = has_hotel_shared_room(row)
         status = C["meal_cap_ok"]
+        severity = "ok"
         requires_confirmation = False
         suggested_adjustments: list[dict[str, Any]] = []
         cap_total: Decimal | None = None
@@ -642,9 +660,11 @@ def hotel_cap_checks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
         if not stay["nights"]:
             status = C["hotel_cap_missing_nights"]
+            severity = "blocking"
             requires_confirmation = True
         elif not policy:
             status = C["hotel_cap_missing_city"]
+            severity = "blocking"
             requires_confirmation = True
         else:
             cap_total = policy["cap_per_night"] * Decimal(stay["nights"])
@@ -652,8 +672,10 @@ def hotel_cap_checks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             if over_by > 0:
                 if has_shared:
                     status = C["hotel_cap_over_with_shared_room"]
+                    severity = "advisory"
                 else:
                     status = C["hotel_cap_over_needs_confirmation"]
+                    severity = "blocking"
                     requires_confirmation = True
                     suggested_adjustments.append({
                         "user_no": row.get("user_no", ""),
@@ -679,6 +701,8 @@ def hotel_cap_checks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "total": money(amount),
             "over_by": money(over_by) if over_by and over_by > 0 else "0.00",
             "status": status,
+            "severity": severity,
+            "advisory": severity == "advisory",
             "has_shared_room": has_shared,
             "requires_user_confirmation": requires_confirmation,
             "items": [hotel_item(row)],
@@ -698,7 +722,8 @@ def print_hotel_cap_check(checks: list[dict[str, Any]]) -> None:
             f"- item {check['items'][0].get('user_no') or '-'} | {check.get('city') or '-'} "
             f"[{check.get('policy_name') or 'city tier unknown'}] | "
             f"{check.get('nights') or '?'} night(s) | total {check['total']} / "
-            f"cap {check.get('cap_total') or '?'} / over {check['over_by']} / {check['status']}"
+            f"cap {check.get('cap_total') or '?'} / over {check['over_by']} / {check['status']} / "
+            f"severity {check.get('severity', 'ok')}"
         )
         item = check["items"][0]
         print(
@@ -1083,29 +1108,37 @@ def build_markdown(payload: dict[str, Any], workbook: Path) -> str:
         "",
         "## Meal Daily Cap Checks",
         "",
-        "| Policy | Date | Total | Cap | Over By | Status | Needs Confirmation |",
-        "| --- | --- | ---: | ---: | ---: | --- | --- |",
+        "| Policy | Date | Total | Cap | Over By | Status | Severity | Needs Confirmation |",
+        "| --- | --- | ---: | ---: | ---: | --- | --- | --- |",
     ]
     for check in payload.get("meal_daily_cap_checks", []):
         lines.append(
             f"| {check.get('policy_name', '')} | {check['date']} | {check['total']} | {check['cap']} | {check['over_by']} | "
-            f"{check['status']} | {check['requires_user_confirmation']} |"
+            f"{check['status']} | {check.get('severity', 'ok')} | {check['requires_user_confirmation']} |"
         )
     lines += [
         "",
         "## Hotel Cap Checks",
         "",
-        "| Item | City | Nights | Total | Cap Total | Over By | Status | Needs Confirmation |",
-        "| ---: | --- | ---: | ---: | ---: | ---: | --- | --- |",
+        "| Item | City | Nights | Total | Cap Total | Over By | Status | Severity | Needs Confirmation |",
+        "| ---: | --- | ---: | ---: | ---: | ---: | --- | --- | --- |",
     ]
     for check in payload.get("hotel_cap_checks", []):
         item = check.get("items", [{}])[0]
         lines.append(
             f"| {item.get('user_no', '')} | {check.get('city', '')} | {check.get('nights', '')} | "
             f"{check['total']} | {check.get('cap_total', '')} | {check['over_by']} | "
-            f"{check['status']} | {check['requires_user_confirmation']} |"
+            f"{check['status']} | {check.get('severity', 'ok')} | {check['requires_user_confirmation']} |"
         )
     return "\n".join(lines) + "\n"
+
+
+def aggregate_check_status(checks: list[dict[str, Any]]) -> str:
+    if any(check.get("requires_user_confirmation") for check in checks):
+        return "needs_confirmation"
+    if any(check.get("severity") == "advisory" or check.get("advisory") for check in checks):
+        return "advisory"
+    return "ok"
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1157,8 +1190,8 @@ def main(argv: list[str] | None = None) -> int:
     meal_checks = meal_daily_cap_checks(rows)
     hotel_checks = hotel_cap_checks(rows)
     project_blocks, summary_rows = write_workbook(Path(args.output), rows, template_path, layout)
-    meal_check_status = "needs_confirmation" if any(check["requires_user_confirmation"] for check in meal_checks) else "ok"
-    hotel_check_status = "needs_confirmation" if any(check["requires_user_confirmation"] for check in hotel_checks) else "ok"
+    meal_check_status = aggregate_check_status(meal_checks)
+    hotel_check_status = aggregate_check_status(hotel_checks)
 
     payload = {
         "schema_version": "final_expense_rows.v1",
@@ -1184,6 +1217,7 @@ def main(argv: list[str] | None = None) -> int:
                 },
                 "status": meal_check_status,
                 "days_checked": len(meal_checks),
+                "days_with_advisory": sum(1 for check in meal_checks if check.get("severity") == "advisory"),
                 "days_requiring_confirmation": sum(1 for check in meal_checks if check["requires_user_confirmation"]),
             },
             {
@@ -1194,6 +1228,7 @@ def main(argv: list[str] | None = None) -> int:
                 },
                 "status": hotel_check_status,
                 "items_checked": len(hotel_checks),
+                "items_with_advisory": sum(1 for check in hotel_checks if check.get("severity") == "advisory"),
                 "items_requiring_confirmation": sum(1 for check in hotel_checks if check["requires_user_confirmation"]),
             }
         ],

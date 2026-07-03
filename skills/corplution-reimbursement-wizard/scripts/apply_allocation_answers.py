@@ -47,6 +47,10 @@ ALLOWED_UNIT_FIELDS = {
     "correction_note",
     "destination",
     "destination_place_type",
+    "date_question_reason",
+    "date_is_provisional",
+    "date_required",
+    "date_source",
     "expense_date",
     "expense_note",
     "expenses_nature",
@@ -58,6 +62,7 @@ ALLOWED_UNIT_FIELDS = {
     "hotel_city_tier",
     "hotel_nights",
     "invoice_amount",
+    "issue_date",
     "is_substitute_invoice",
     "issues",
     "match_reason",
@@ -247,9 +252,16 @@ def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: boo
             continue
         if field not in ALLOWED_UNIT_FIELDS:
             continue
-        if field in {"is_substitute_invoice", "place_type_needs_confirmation", "shared_room"}:
+        if field in {"date_is_provisional", "date_required", "is_substitute_invoice", "place_type_needs_confirmation", "shared_room"}:
             value = as_bool(value)
         unit[field] = value
+
+    if "expense_date" in update and clean(unit.get("expense_date")):
+        unit["date_required"] = False
+        unit["date_is_provisional"] = False
+        source = clean(unit.get("date_source"))
+        if not source or source == "needs_user_date" or source.endswith("_provisional"):
+            unit["date_source"] = "user_confirmed"
 
     if unit.get("is_substitute_invoice"):
         unit["approval_required"] = unit.get("approval_required") or "partner_approval_screenshot"

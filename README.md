@@ -43,12 +43,14 @@ The agent should not ask the applicant to open `process/*.md` or write JSON manu
 2. Convert project notes into temporary `project-context.json` internally when enough facts are present.
 3. Paste or summarize the extraction review list in chat after recognition, including item number, source filename, role, type, invoice number, seller/provider, date, amount, category, and review status.
 4. Paste or summarize the allocation review list in chat before asking project/allocation questions, including item number, source filename, date, amount, category, and suggested project.
-5. Ask grouped questions by item number when something is uncertain.
-6. Accept corrections such as "第9项金额不对" and trace the item back to its source filename before updating.
-7. For `CORP-2026-ADMIN` rows, use `通讯费` as the Client for mobile expenses. For other admin expenses, use the specific matter name when known; otherwise use `项目、调研以外的其他费用` and paste a non-blocking chat prompt asking whether the applicant wants a more specific matter such as 年会、半年会、客户会、行业协会会议.
-8. After writing the workbook, paste or summarize the meal daily cap check. Business-trip meals are capped at RMB 150/day and local overtime meals at RMB 60/day; if a day exceeds the relevant cap without attendee details, ask whether the date, attendees, or `reimbursable_amount` should be corrected.
-9. Paste or summarize the hotel cap check. Beijing/Shanghai/Guangzhou/Shenzhen hotels are capped at RMB 800/night and other cities at RMB 600/night; if nights are missing or a hotel exceeds the cap without shared-room details, ask for confirmation or a `reimbursable_amount` adjustment.
-10. End with a package summary: workbook, invoice count, support-document count, and unresolved issues.
+5. Treat invoice issue dates as evidence only, except pure `other` expenses may temporarily use invoice issue date with a non-blocking advisory. Ask for the actual occurrence/record date when the date is not reliable: printed flight/rail date, hotel stay dates, Didi/Gaode trip-report time, or mobile month-end.
+6. Ask grouped questions by expense type when many items need the same kind of answer. For example, combine meal questions into one list and let the applicant answer by item numbers and dates instead of asking every invoice separately.
+7. Auto-match by expense type rather than by one generic city rule: hotels use stay/city evidence, meals use explicit notes or unique non-Shanghai city, taxi rides use journey/transfer logic, flight/rail use destination/date, and `other` is not pre-matched by issuer city.
+8. Accept corrections such as "第9项金额不对" and trace the item back to its source filename before updating.
+9. For `CORP-2026-ADMIN` rows, use `通讯费` as the Client for mobile expenses. For other admin expenses, use the specific matter name when known; otherwise use `项目、调研以外的其他费用` and paste a non-blocking chat prompt asking whether the applicant wants a more specific matter such as 年会、半年会、客户会、行业协会会议.
+10. After writing the workbook, paste or summarize the meal daily cap check. Business-trip meals are capped at RMB 150/day and local overtime meals at RMB 60/day; over-cap days with attendee details are advisory, while over-cap days without attendee details require confirmation or a `reimbursable_amount` correction.
+11. Paste or summarize the hotel cap check. Beijing/Shanghai/Guangzhou/Shenzhen hotels are capped at RMB 800/night and other cities at RMB 600/night; over-cap hotels with shared-room/co-occupant details are advisory, while missing nights or over-cap hotels without shared-room details require confirmation or a `reimbursable_amount` adjustment.
+12. End with a package summary: workbook, invoice count, support-document count, and unresolved issues.
 
 ## Dependencies and OCR
 

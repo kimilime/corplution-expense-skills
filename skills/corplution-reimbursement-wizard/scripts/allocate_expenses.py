@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import calendar
 import json
 import re
 import sys
@@ -111,6 +112,8 @@ def parse_date(value: str) -> date | None:
         return None
     match = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", value)
     if not match:
+        match = re.search(r"(\d{4})\s*年\s*(\d{1,2})\s*月\s*(\d{1,2})\s*日", value)
+    if not match:
         return None
     try:
         return date(int(match.group(1)), int(match.group(2)), int(match.group(3)))
@@ -121,6 +124,96 @@ def parse_date(value: str) -> date | None:
 def date_key(value: str) -> str:
     d = parse_date(value)
     return d.isoformat() if d else ""
+
+
+def first_date_in_text(value: Any) -> str:
+    return date_key(clean(value))
+
+
+def billing_month_end(billing_period: str, issue_date: str = "") -> tuple[str, str]:
+    period = clean(billing_period)
+    match = re.search(r"(\d{4})(\d{2})", period)
+    if match:
+        year = int(match.group(1))
+        month = int(match.group(2))
+        if 1 <= month <= 12:
+            day = calendar.monthrange(year, month)[1]
+            return date(year, month, day).isoformat(), "mobile_billing_period_month_end"
+    issued = parse_date(issue_date)
+    if issued:
+        day = calendar.monthrange(issued.year, issued.month)[1]
+        return date(issued.year, issued.month, day).isoformat(), "mobile_issue_month_end"
+    return "", "needs_user_date"
+
+
+def hotel_stay_dates(classification: dict[str, Any], invoice: dict[str, Any], source_note: str) -> tuple[str, str]:
+    check_in = ""
+    check_out = ""
+    for key in ["check_in_date", "hotel_check_in_date", "stay_start", "date_start"]:
+        check_in = first_date_in_text(classification.get(key) or invoice.get(key))
+        if check_in:
+            break
+    for key in ["check_out_date", "hotel_check_out_date", "stay_end", "date_end"]:
+        check_out = first_date_in_text(classification.get(key) or invoice.get(key))
+        if check_out:
+            break
+    if check_in and check_out:
+        return check_in, check_out
+    dates = re.findall(r"\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{4}\s*年\s*\d{1,2}\s*月\s*\d{1,2}\s*日", source_note or "")
+    normalized = [date_key(item) for item in dates]
+    normalized = [item for item in normalized if item]
+    if len(normalized) >= 2:
+        return normalized[0], normalized[1]
+    return check_in, check_out
+
+
+def reliable_invoice_expense_date(
+    *,
+    source_category: str,
+    subtype: str,
+    classification: dict[str, Any],
+    invoice: dict[str, Any],
+    source_note: str,
+    billing_period: str,
+    check_in_date: str,
+    check_out_date: str,
+) -> tuple[str, str, bool, str]:
+    issue_date = date_key(invoice.get("issue_date", ""))
+    class_date = date_key(classification.get("expense_date", ""))
+    date_source = clean(classification.get("expense_date_source") or classification.get("date_source"))
+    note_date = first_date_in_text(source_note)
+
+    if source_category == "mobile":
+        value, source = billing_month_end(billing_period, issue_date)
+        return value, source, not bool(value), "通讯费按账期或开票月份的最后一天填 Date。"
+
+    if source_category == "hotel":
+        if check_in_date and check_out_date:
+            return check_out_date, "hotel_check_out_date", False, "酒店发票有入住/离店日期，Date 使用离店日期。"
+        return "", "needs_user_date", True, "酒店没有可靠入住/离店日期，不能用开票日期代替。"
+
+    if subtype == "railway_e_ticket":
+        if date_source in {"railway_travel_date", "travel_date"} and class_date:
+            return class_date, date_source, False, "高铁/铁路电子客票使用票面乘车日期。"
+        if note_date:
+            return note_date, "railway_note_travel_date", False, "高铁/铁路电子客票从票面备注识别到乘车日期。"
+        if class_date and class_date != issue_date:
+            return class_date, "railway_classification_date", False, "高铁/铁路电子客票识别日期不同于开票日期，按乘车日期处理。"
+        return "", "needs_user_date", True, "高铁/铁路电子客票未可靠识别乘车日期，不能用开票日期代替。"
+
+    if source_category == "travel":
+        if date_source in {"flight_date", "travel_date", "railway_travel_date"} and class_date:
+            return class_date, date_source, False, "机票/交通票据使用票面出行日期。"
+        if note_date:
+            return note_date, "travel_note_date", False, "机票/交通票据备注中识别到出行日期。"
+        return "", "needs_user_date", True, "机票/交通票据没有可靠出行日期，不能用开票日期代替。"
+
+    if source_category == "other":
+        if issue_date:
+            return issue_date, "other_invoice_issue_date_provisional", False, "其他费用暂用开票日期作为 Date；请提示用户复核，不作为阻塞项。"
+        return "", "needs_user_date", True, "其他费用没有可用开票日期，需要用户确认记账日期。"
+
+    return "", "needs_user_date", True, "普通发票开票日期不能直接作为报销发生日期。"
 
 
 def load_context(path: Path | None) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
@@ -315,7 +408,12 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
                     "amount": money(item.get("amount")),
                     "invoice_amount": money(item.get("amount")),
                     "reimbursable_amount": "",
+                    "issue_date": (docs.get(linked_invoice_id, {}).get("invoice") or {}).get("issue_date", ""),
                     "expense_date": date_key(item.get("ride_datetime", "")),
+                    "date_source": "trip_report_ride_datetime" if date_key(item.get("ride_datetime", "")) else "needs_user_date",
+                    "date_is_provisional": False,
+                    "date_required": not bool(date_key(item.get("ride_datetime", ""))),
+                    "date_question_reason": "滴滴/高德行程单行程时间是可靠发生日期；未识别到行程时间时需要用户补充。",
                     "source_category": source_category,
                     "final_template_column": col,
                     "city": city,
@@ -364,6 +462,17 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
             match = re.search(r"(\d{6})", invoice.get("raw_remarks", "") + " " + source_note)
             if source_category == "mobile" and match:
                 billing_period = match.group(1)
+            check_in_date, check_out_date = hotel_stay_dates(classification, invoice, source_note)
+            expense_date, date_source, date_required, date_question_reason = reliable_invoice_expense_date(
+                source_category=source_category,
+                subtype=subtype,
+                classification=classification,
+                invoice=invoice,
+                source_note=source_note,
+                billing_period=billing_period,
+                check_in_date=check_in_date,
+                check_out_date=check_out_date,
+            )
             unit = {
                 "unit_id": f"UNIT-{unit_idx:03d}",
                 "user_no": unit_idx,
@@ -381,7 +490,12 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
                 "amount": money(invoice.get("total_amount")),
                 "invoice_amount": money(invoice.get("total_amount")),
                 "reimbursable_amount": "",
-                "expense_date": classification.get("expense_date") or invoice.get("issue_date", ""),
+                "issue_date": invoice.get("issue_date", ""),
+                "expense_date": expense_date,
+                "date_source": date_source,
+                "date_is_provisional": date_source == "other_invoice_issue_date_provisional",
+                "date_required": date_required,
+                "date_question_reason": date_question_reason,
                 "source_category": source_category,
                 "document_subtype": subtype,
                 "final_template_column": col,
@@ -406,8 +520,8 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
                 "hotel_city": city if source_category == "hotel" else "",
                 "hotel_city_tier": "",
                 "hotel_nights": "",
-                "check_in_date": "",
-                "check_out_date": "",
+                "check_in_date": check_in_date,
+                "check_out_date": check_out_date,
                 "shared_room": False,
                 "room_shared_with": "",
                 "room_share_note": "",
@@ -439,6 +553,89 @@ def date_in_context(unit_date: str, ctx: dict[str, Any]) -> bool:
     return start - timedelta(days=buffer) <= d <= end + timedelta(days=buffer)
 
 
+def context_start(ctx: dict[str, Any]) -> date | None:
+    return parse_date(ctx.get("date_start", ""))
+
+
+def context_end(ctx: dict[str, Any]) -> date | None:
+    return parse_date(ctx.get("date_end", ""))
+
+
+def date_range_overlaps_context(start: date | None, end: date | None, ctx: dict[str, Any]) -> bool:
+    ctx_start = context_start(ctx)
+    ctx_end = context_end(ctx)
+    if not start or not end or not ctx_start or not ctx_end:
+        return False
+    if end < start:
+        start, end = end, start
+    return start <= ctx_end and end >= ctx_start
+
+
+def city_key(value: Any) -> str:
+    return clean(value).lower().replace("\u5e02", "")
+
+
+def is_shanghai_city(value: Any) -> bool:
+    text = clean(value).lower()
+    return "\u4e0a\u6d77" in text or "shanghai" in text
+
+
+def contains_text(text: str, needle: str) -> bool:
+    if not needle:
+        return False
+    return needle in text or needle.lower() in text.lower()
+
+
+def unit_match_text(unit: dict[str, Any]) -> str:
+    return clean(" ".join([
+        clean(unit.get("city")),
+        clean(unit.get("route")),
+        clean(unit.get("source_note")),
+        clean(unit.get("expense_note")),
+        clean(unit.get("seller_name")),
+    ]))
+
+
+def city_matches_unit(unit: dict[str, Any], ctx: dict[str, Any]) -> bool:
+    ctx_city = clean(ctx.get("city"))
+    if not ctx_city:
+        return False
+    return contains_text(unit_match_text(unit), ctx_city)
+
+
+def city_contexts_for_unit(
+    unit: dict[str, Any],
+    contexts: list[dict[str, Any]],
+    *,
+    require_non_shanghai: bool,
+) -> dict[str, Any] | None:
+    candidates: list[dict[str, Any]] = []
+    for ctx in contexts:
+        ctx_city = clean(ctx.get("city"))
+        if not ctx_city or not city_matches_unit(unit, ctx):
+            continue
+        if require_non_shanghai and is_shanghai_city(ctx_city):
+            continue
+        same_city_contexts = [
+            item for item in contexts
+            if city_key(item.get("city")) == city_key(ctx_city)
+        ]
+        if len(same_city_contexts) != 1:
+            continue
+        candidates.append(ctx)
+    context_ids = {clean(ctx.get("context_id")) for ctx in candidates}
+    if len(context_ids) == 1:
+        return candidates[0]
+    return None
+
+
+def unique_non_shanghai_context_for_unit(
+    unit: dict[str, Any],
+    contexts: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    return city_contexts_for_unit(unit, contexts, require_non_shanghai=True)
+
+
 def score_context(unit: dict[str, Any], ctx: dict[str, Any]) -> int:
     score = 0
     if date_in_context(unit.get("expense_date", ""), ctx):
@@ -454,6 +651,184 @@ def score_context(unit: dict[str, Any], ctx: dict[str, Any]) -> int:
     return score
 
 
+def route_endpoints(unit: dict[str, Any]) -> tuple[str, str]:
+    route = clean(unit.get("route"))
+    if not route:
+        route = route_from_note(clean(unit.get("source_note") or unit.get("expense_note")))
+    if not route:
+        return "", ""
+    parts = re.split(r"\s*(?:->|-|—|~|至|到)\s*", route, maxsplit=1)
+    if len(parts) == 2:
+        return clean(parts[0]), clean(parts[1])
+    return "", clean(route)
+
+
+def context_city_in_text(ctx: dict[str, Any], text: str) -> bool:
+    city = clean(ctx.get("city"))
+    return bool(city and contains_text(text, city))
+
+
+def apply_context_match(
+    unit: dict[str, Any],
+    ctx: dict[str, Any],
+    *,
+    confidence: str,
+    status: str,
+    auto_project_match: str,
+    reason: str,
+) -> None:
+    unit.update({
+        "project_context_id": ctx.get("context_id", ""),
+        "client_name": ctx.get("client_name", ""),
+        "client_charge_code": ctx.get("client_charge_code", ""),
+        "confidence": confidence,
+        "status": status,
+        "auto_project_match": auto_project_match,
+        "match_reason": reason,
+    })
+    normalize_admin_client(unit)
+
+
+def match_hotel(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    city = clean(unit.get("hotel_city") or unit.get("city"))
+    if not city:
+        return None
+    check_in = parse_date(unit.get("check_in_date", ""))
+    check_out = parse_date(unit.get("check_out_date", ""))
+    if check_in and check_out:
+        candidates = [
+            ctx for ctx in contexts
+            if context_city_in_text(ctx, city) and date_range_overlaps_context(check_in, check_out, ctx)
+        ]
+        if len({clean(ctx.get("context_id")) for ctx in candidates}) == 1:
+            ctx = candidates[0]
+            return {
+                "ctx": ctx,
+                "auto": "hotel_stay_dates",
+                "reason": f"Hotel city and stay dates match project context {ctx.get('context_id', '')}.",
+            }
+    unique_city_ctx = city_contexts_for_unit(unit, contexts, require_non_shanghai=False)
+    if unique_city_ctx:
+        return {
+            "ctx": unique_city_ctx,
+            "auto": "hotel_unique_city",
+            "reason": f"Hotel city has exactly one project context: {unique_city_ctx.get('city', '')}.",
+        }
+    return None
+
+
+def match_meal(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    unique_city_ctx = unique_non_shanghai_context_for_unit(unit, contexts)
+    if unique_city_ctx:
+        return {
+            "ctx": unique_city_ctx,
+            "auto": "unique_non_shanghai_city",
+            "reason": f"Meal city has exactly one non-Shanghai project context: {unique_city_ctx.get('city', '')}.",
+        }
+    return None
+
+
+def is_transfer_endpoint(unit: dict[str, Any]) -> bool:
+    place_types = {
+        clean(unit.get("origin_place_type")),
+        clean(unit.get("destination_place_type")),
+    }
+    if C["airport"] in place_types or C["railway_station"] in place_types:
+        return True
+    text = clean(" ".join([
+        unit.get("origin", ""),
+        unit.get("destination", ""),
+        unit.get("source_note", ""),
+        unit.get("expense_note", ""),
+    ]))
+    return any(keyword in text for keyword in ["\u673a\u573a", "\u706b\u8f66\u7ad9", "\u9ad8\u94c1\u7ad9", "\u8f66\u7ad9"])
+
+
+def next_project_for_transfer(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    ride_date = parse_date(unit.get("expense_date", ""))
+    if not ride_date or not is_transfer_endpoint(unit):
+        return None
+    candidates: list[tuple[date, dict[str, Any]]] = []
+    for ctx in contexts:
+        start = context_start(ctx)
+        if not start:
+            continue
+        if ride_date <= start <= ride_date + timedelta(days=1):
+            candidates.append((start, ctx))
+    candidates.sort(key=lambda item: (item[0], clean(item[1].get("context_id"))))
+    context_ids = {clean(ctx.get("context_id")) for _, ctx in candidates}
+    if len(context_ids) == 1:
+        return candidates[0][1]
+    return None
+
+
+def city_date_context(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    candidates = [
+        ctx for ctx in contexts
+        if city_matches_unit(unit, ctx) and date_in_context(unit.get("expense_date", ""), ctx)
+    ]
+    context_ids = {clean(ctx.get("context_id")) for ctx in candidates}
+    if len(context_ids) == 1:
+        return candidates[0]
+    return None
+
+
+def match_taxi(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    next_ctx = next_project_for_transfer(unit, contexts)
+    if next_ctx:
+        return {
+            "ctx": next_ctx,
+            "auto": "taxi_transfer_to_next_project",
+            "reason": f"Taxi appears to be an airport/station transfer to next project context {next_ctx.get('context_id', '')}.",
+        }
+    ctx = city_date_context(unit, contexts)
+    if ctx:
+        return {
+            "ctx": ctx,
+            "auto": "taxi_city_date",
+            "reason": f"Taxi city and date match project context {ctx.get('context_id', '')}.",
+        }
+    return None
+
+
+def match_travel(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    origin, destination = route_endpoints(unit)
+    dated_contexts = [ctx for ctx in contexts if date_in_context(unit.get("expense_date", ""), ctx)]
+    if destination:
+        dest_matches = [ctx for ctx in dated_contexts if context_city_in_text(ctx, destination)]
+        if len({clean(ctx.get("context_id")) for ctx in dest_matches}) == 1:
+            ctx = dest_matches[0]
+            return {
+                "ctx": ctx,
+                "auto": "travel_destination_date",
+                "reason": f"Travel destination and date match project context {ctx.get('context_id', '')}.",
+            }
+    route_text = clean(f"{origin} {destination} {unit.get('route', '')} {unit.get('source_note', '')}")
+    route_matches = [ctx for ctx in dated_contexts if context_city_in_text(ctx, route_text)]
+    if len({clean(ctx.get("context_id")) for ctx in route_matches}) == 1:
+        ctx = route_matches[0]
+        return {
+            "ctx": ctx,
+            "auto": "travel_route_date",
+            "reason": f"Travel route and date match project context {ctx.get('context_id', '')}.",
+        }
+    return None
+
+
+def typed_project_match(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    category = clean(unit.get("source_category"))
+    subtype = clean(unit.get("document_subtype"))
+    if category == "hotel":
+        return match_hotel(unit, contexts)
+    if category == "meal":
+        return match_meal(unit, contexts)
+    if category == "taxi":
+        return match_taxi(unit, contexts)
+    if category == "travel" or subtype == "railway_e_ticket":
+        return match_travel(unit, contexts)
+    return None
+
+
 def apply_matches(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     for unit in units:
         if unit.get("source_category") == "mobile":
@@ -467,6 +842,19 @@ def apply_matches(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -
             })
             normalize_admin_client(unit)
             continue
+        if unit.get("source_category") in {"other", "unknown"}:
+            continue
+        typed_match = typed_project_match(unit, contexts)
+        if typed_match:
+            apply_context_match(
+                unit,
+                typed_match["ctx"],
+                confidence="high",
+                status="confirmed",
+                auto_project_match=typed_match["auto"],
+                reason=typed_match["reason"],
+            )
+            continue
         scored = sorted(
             [(score_context(unit, ctx), ctx) for ctx in contexts],
             key=lambda item: item[0],
@@ -476,9 +864,7 @@ def apply_matches(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -
             ctx = scored[0][1]
             matched_status = "needs_confirmation"
             if scored[0][0] >= 7:
-                if unit.get("source_category") not in {"meal", "other"}:
-                    matched_status = "confirmed"
-                elif unit.get("source_category") == "other" and is_admin_code(ctx.get("client_charge_code")):
+                if unit.get("source_category") not in {"meal", "hotel", "taxi", "travel", "other", "unknown"}:
                     matched_status = "confirmed"
             unit.update({
                 "project_context_id": ctx.get("context_id", ""),
@@ -566,6 +952,17 @@ def unit_label(unit: dict[str, Any]) -> str:
     return f"第{unit_user_no(unit)}项"
 
 
+def display_date(unit: dict[str, Any]) -> str:
+    value = clean(unit.get("expense_date"))
+    if value and unit.get("date_is_provisional"):
+        return f"{value}（暂用开票日）"
+    if value:
+        return value
+    if unit.get("issue_date"):
+        return f"开票{unit.get('issue_date')}（需补发生日期）"
+    return ""
+
+
 def unit_brief(unit: dict[str, Any]) -> str:
     parts = [unit_label(unit)]
     schedule_filename = clean(unit.get("supporting_schedule_filename"))
@@ -585,8 +982,9 @@ def unit_brief(unit: dict[str, Any]) -> str:
         parts.append(f"开具方/服务方 {seller}")
     if unit.get("amount"):
         parts.append(f"金额 {unit.get('amount')}")
-    if unit.get("expense_date"):
-        parts.append(f"日期 {unit.get('expense_date')}")
+    date_value = display_date(unit)
+    if date_value:
+        parts.append(f"日期 {date_value}")
     category = clean(unit.get("source_category"))
     final_column = clean(unit.get("final_template_column"))
     if category or final_column:
@@ -646,12 +1044,232 @@ def add_advisory_question(
     })
 
 
+def question_unit(question: dict[str, Any], units_by_id: dict[str, dict[str, Any]]) -> dict[str, Any] | None:
+    unit_ids = question.get("unit_ids", [])
+    if len(unit_ids) != 1:
+        return None
+    return units_by_id.get(unit_ids[0])
+
+
+def batch_group_key(question: dict[str, Any], unit: dict[str, Any]) -> str:
+    category = clean(unit.get("source_category")) or "unknown"
+    if category == "meal":
+        return "meal"
+    if category == "hotel":
+        return "hotel"
+    if unit.get("place_type_needs_confirmation"):
+        return "taxi_place"
+    if category == "other":
+        if unit.get("date_required") and not unit.get("expense_date"):
+            return "other_date"
+        return "other"
+    if not unit.get("client_charge_code"):
+        return f"{category}_project"
+    if unit.get("date_required") and not unit.get("expense_date"):
+        return f"{category}_date"
+    if unit.get("status") == "needs_confirmation" or unit.get("confidence") == "medium":
+        return f"{category}_confirm"
+    return ""
+
+
+def batch_item_line(unit: dict[str, Any]) -> str:
+    source = clean(unit.get("source_filename")) or clean(unit.get("supporting_schedule_filename")) or "-"
+    invoice = clean(unit.get("supporting_invoice_filename"))
+    if invoice and invoice != source:
+        source = f"{source} / 发票 {invoice}"
+    parts = [f"{unit_user_no(unit)}"]
+    parts.append(f"文件 {source}")
+    if unit.get("invoice_no"):
+        parts.append(f"发票号 {unit.get('invoice_no')}")
+    seller = clean(unit.get("seller_name"))
+    if seller:
+        parts.append(f"开具方/服务方 {seller}")
+    date_value = display_date(unit)
+    if date_value:
+        parts.append(f"日期 {date_value}")
+    if unit.get("amount"):
+        parts.append(f"金额 {unit.get('amount')}")
+    category = clean(unit.get("source_category"))
+    column = clean(unit.get("final_template_column"))
+    if category or column:
+        parts.append(f"分类 {category or '?'}->{column or '?'}")
+    if unit.get("client_name") or unit.get("client_charge_code"):
+        parts.append(f"初步归属 {unit.get('client_name') or '?'} / {unit.get('client_charge_code') or '?'}")
+    note = clean(unit.get("source_note") or unit.get("expense_note"))
+    if note:
+        parts.append(f"备注 {note}")
+    return "- " + " | ".join(parts)
+
+
+def batch_prompt_for_key(key: str) -> str:
+    if key == "meal":
+        return (
+            "以下餐费请批量确认或修正实际就餐日期、归属项目、同行人/招待对象，以及 Note 类型。开票日期不能直接当就餐日期。"
+            "可以按项目和日期一起回复，例如：1/3/5/7 属于山西信托，日期分别是 6/3、6/4、6/5、6/6；"
+            "2/4/6 属于广联达，日期分别是 6/10、6/11、6/12。"
+        )
+    if key == "hotel":
+        return "以下酒店费用请批量确认入住日期、离店日期、住宿晚数；如果是标间同住，也请说明同住人或同住情况。"
+    if key == "taxi_place":
+        return "以下打车/行程地点类型或行程日期不明确，请批量确认实际行程日期，以及出发地和目的地应写公司、客户、酒店、机场、火车站、家、餐厅或其他。"
+    if key == "other":
+        return "以下其他费用请批量确认项目归属、最终金额列，以及 Note 应该怎么写；日期已暂用开票日，如不对请按编号改成实际发生/记账日期。如果是 ADMIN，也请说明具体事项名称。"
+    if key == "other_date":
+        return "以下其他费用缺少可用日期，请批量确认实际发生/记账日期、项目归属、最终金额列，以及 Note 应该怎么写。如果是 ADMIN，也请说明具体事项名称。"
+    if key.startswith("travel_"):
+        return "以下机票/高铁/交通票据缺少可靠出行日期或项目归属，请批量确认出行日期、路线和客户/项目编号。开票日期不能直接作为出行日期。"
+    if key.startswith("taxi_"):
+        return "以下打车/行程缺少可靠行程日期或项目归属，请批量确认实际行程日期、出发地/目的地场景和归属项目。只有行程单时间才能直接作为打车发生日期。"
+    if key.startswith("unknown_"):
+        return "以下费用类型或日期不明确，请批量确认记在哪天、费用类型、项目归属和 Note。开票日期不能直接作为发生日期。"
+    return "以下费用存在相同类型的不确定信息，请按项目、日期或处理方式批量回复；只要列出需要修改或确认的项目编号即可。"
+
+
+def build_batch_question(
+    key: str,
+    grouped_questions: list[dict[str, Any]],
+    units_by_id: dict[str, dict[str, Any]],
+    question_id: str,
+) -> dict[str, Any]:
+    units = [question_unit(question, units_by_id) for question in grouped_questions]
+    units = [unit for unit in units if unit]
+    why_lines: list[str] = []
+    for question in grouped_questions:
+        why = clean(question.get("why_it_matters"))
+        if why and why not in why_lines:
+            why_lines.append(why)
+    return {
+        "question_id": question_id,
+        "question_type": f"batch_{key}",
+        "unit_ids": [unit["unit_id"] for unit in units],
+        "user_nos": [unit_user_no(unit) for unit in units],
+        "question": batch_prompt_for_key(key) + "\n" + "\n".join(batch_item_line(unit) for unit in units),
+        "why_it_matters": "；".join(why_lines),
+        "status": "open",
+        "blocking": True,
+    }
+
+
+def group_open_questions(questions: list[dict[str, Any]], units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    units_by_id = {unit["unit_id"]: unit for unit in units}
+    groups: dict[str, list[dict[str, Any]]] = {}
+    slots: list[tuple[str, Any]] = []
+    for question in questions:
+        if question.get("status", "open") != "open":
+            slots.append(("single", question))
+            continue
+        unit = question_unit(question, units_by_id)
+        key = batch_group_key(question, unit) if unit else ""
+        if not key:
+            slots.append(("single", question))
+            continue
+        if key not in groups:
+            groups[key] = []
+            slots.append(("group", key))
+        groups[key].append(question)
+
+    out: list[dict[str, Any]] = []
+    group_idx = 1
+    for slot_type, value in slots:
+        if slot_type == "single":
+            out.append(value)
+            continue
+        grouped_questions = groups[value]
+        if len(grouped_questions) == 1:
+            out.append(grouped_questions[0])
+            continue
+        out.append(build_batch_question(value, grouped_questions, units_by_id, f"Q-GROUP-{group_idx:03d}"))
+        group_idx += 1
+    return out
+
+
+def add_auto_matched_meal_review(questions: list[dict[str, Any]], units: list[dict[str, Any]]) -> None:
+    auto_meals = [
+        unit for unit in units
+        if unit.get("source_category") == "meal"
+        and unit.get("auto_project_match") == "unique_non_shanghai_city"
+        and unit.get("status") == "confirmed"
+        and unit.get("expense_date")
+    ]
+    if not auto_meals:
+        return
+    questions.append({
+        "question_id": f"Q-ADV-MEAL-{len(questions) + 1:03d}",
+        "question_type": "auto_matched_meal_review",
+        "unit_ids": [unit["unit_id"] for unit in auto_meals],
+        "user_nos": [unit_user_no(unit) for unit in auto_meals],
+        "question": (
+            "以下餐费已按“非上海城市唯一项目”自动归属。"
+            "开票日期不作为就餐日期；如果有归属、日期、同行人或实报金额需要调整，请直接按编号批量回复。"
+            "\n" + "\n".join(batch_item_line(unit) for unit in auto_meals)
+        ),
+        "why_it_matters": "非上海城市在本周期只有一个项目时，默认归属通常足够可靠；餐费日期和同行人仍允许用户批量修正。",
+        "status": "advisory",
+        "blocking": False,
+    })
+
+
+def add_provisional_other_date_review(questions: list[dict[str, Any]], units: list[dict[str, Any]]) -> None:
+    provisional_units = [
+        unit for unit in units
+        if unit.get("source_category") == "other"
+        and unit.get("date_is_provisional")
+        and unit.get("expense_date")
+    ]
+    if not provisional_units:
+        return
+    questions.append({
+        "question_id": f"Q-ADV-OTHER-DATE-{len(questions) + 1:03d}",
+        "question_type": "provisional_other_date_review",
+        "unit_ids": [unit["unit_id"] for unit in provisional_units],
+        "user_nos": [unit_user_no(unit) for unit in provisional_units],
+        "question": (
+            "以下 other 费用的 Date 已暂用发票开票日期。这个不是阻塞项；如果实际发生/记账日期不同，请按编号批量更正。"
+            "\n" + "\n".join(batch_item_line(unit) for unit in provisional_units)
+        ),
+        "why_it_matters": "纯 other 费用通常可以先用开票日期推进；这里是给申请人的非阻塞复核提示。",
+        "status": "advisory",
+        "blocking": False,
+    })
+
+
+def date_prompt_for_unit(unit: dict[str, Any]) -> tuple[str, str] | None:
+    if not unit.get("date_required") or unit.get("expense_date") or is_mobile_admin_unit(unit):
+        return None
+    source_category = clean(unit.get("source_category")) or "unknown"
+    reason = clean(unit.get("date_question_reason")) or "开票日期不能直接作为报销发生日期。"
+    if source_category in {"meal", "hotel"}:
+        return None
+    if source_category == "taxi":
+        return (
+            "这笔打车/行程没有可靠行程日期。请确认实际行程日期；如果缺行程单，也请说明是否会补行程单，或是否按汇总发票处理。",
+            reason,
+        )
+    if source_category == "travel":
+        return (
+            "这笔机票/高铁/交通票据没有可靠出行日期。请确认实际出行日期和路线；不能直接使用开票日期。",
+            reason,
+        )
+    if source_category == "other":
+        return (
+            "这笔其他费用需要确认记在哪一天。请提供发生日期/记账日期；不能直接使用开票日期。",
+            reason,
+        )
+    return (
+        "这笔费用缺少可靠发生日期。请确认应记在哪一天；不能直接使用开票日期。",
+        reason,
+    )
+
+
 def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]]) -> list[dict[str, Any]]:
     questions = [normalize_existing_question(q) for q in existing]
     for unit in units:
         source_category = unit.get("source_category")
         has_project = bool(unit.get("client_charge_code"))
         prompts: list[tuple[str, str]] = []
+        date_prompt = date_prompt_for_unit(unit)
+        if date_prompt:
+            prompts.append(date_prompt)
 
         if not has_project and source_category != "mobile":
             prompts.append(
@@ -686,15 +1304,17 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
                 or (unit.get("check_in_date") and unit.get("check_out_date"))
                 or re.search(r"\d+\s*\u665a", final_note)
             )
-            if not has_nights:
+            if not has_nights or not unit.get("expense_date"):
                 prompts.append(
                     (
                         "这是酒店费用。请确认入住日期、离店日期、住宿晚数；如果是标间同住，也请说明同住人或同住情况。",
-                        "酒店报销标准按每晚计算：北上广深 800/晚，其他城市 600/晚；缺少晚数时无法判断是否超标。",
+                        "酒店报销标准按每晚计算：北上广深 800/晚，其他城市 600/晚；缺少入住/离店日期和晚数时无法判断日期与是否超标。",
                     )
                 )
 
-        if source_category == "meal":
+        if source_category == "meal" and (
+            unit.get("auto_project_match") != "unique_non_shanghai_city" or not unit.get("expense_date")
+        ):
             prompts.append(
                 (
                     (
@@ -706,10 +1326,16 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
             )
 
         if source_category == "other" and not is_admin_code(unit.get("client_charge_code")):
+            if unit.get("date_is_provisional"):
+                other_question = "这是其他费用。请确认项目归属、最终金额列，以及 Note 应该怎么写；日期已暂用开票日，如不对请一起更正。"
+                other_reason = "其他费用无法用通用规则稳定归集，需要用户给出会计口径；日期暂用开票日仅作为非阻塞复核项。"
+            else:
+                other_question = "这是其他费用。请确认发生日期/记账日期、项目归属、最终金额列，以及 Note 应该怎么写。"
+                other_reason = "这笔其他费用没有可暂用的开票日期，需要用户给出日期和会计口径。"
             prompts.append(
                 (
-                    "这是其他费用。请确认项目归属、最终金额列，以及 Note 应该怎么写。",
-                    "其他费用无法用通用规则稳定归集，需要用户给出会计口径。",
+                    other_question,
+                    other_reason,
                 )
             )
 
@@ -741,6 +1367,9 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
                 ),
                 "Admin 的 Client 列用于说明事项，不能笼统写 Admin；但事项名称缺失不是阻塞项。",
             )
+    questions = group_open_questions(questions, units)
+    add_auto_matched_meal_review(questions, units)
+    add_provisional_other_date_review(questions, units)
     return questions
 
 
@@ -750,7 +1379,7 @@ def unit_review_line(unit: dict[str, Any]) -> str:
     if invoice and invoice != source:
         source = f"{source} / 发票 {invoice}"
     seller = clean(unit.get("seller_name")) or "-"
-    date_value = clean(unit.get("expense_date")) or "-"
+    date_value = display_date(unit) or "-"
     amount = clean(unit.get("amount")) or "-"
     category = clean(unit.get("source_category")) or "-"
     column = clean(unit.get("final_template_column")) or "-"
@@ -759,7 +1388,12 @@ def unit_review_line(unit: dict[str, Any]) -> str:
     status = "待确认" if unit.get("status") != "confirmed" or unit.get("confidence") in {"low", "medium"} else "已确认"
     if unit.get("place_type_needs_confirmation"):
         status = "待确认地点类型"
-    if category in {"meal", "other"} and not (category == "other" and is_admin_code(code) and unit.get("status") == "confirmed"):
+    if category == "meal":
+        if unit.get("status") == "confirmed":
+            status = "已自动归属，可复核" if unit.get("auto_project_match") else "已确认"
+        else:
+            status = "待确认"
+    if category == "other" and not (is_admin_code(code) and unit.get("status") == "confirmed"):
         status = "待确认"
     return (
         f"{unit_label(unit)} | 文件 {source} | 开具方/服务方 {seller} | 日期 {date_value} | "

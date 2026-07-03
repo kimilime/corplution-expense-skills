@@ -87,10 +87,22 @@ Each allocation unit should carry:
 - invoice number if available
 - source category from stage 1
 - amount
-- expense date or date range
+- formal invoice issue date when available
+- reliable expense date or date range, plus `date_source` and `date_required`
 - city, origin, destination, route, seller, and note evidence
 - raw remarks
 - linked support documents
+
+Do not treat `invoice.issue_date` as the expense date. Reliable occurrence dates are limited to:
+
+- flight or rail travel date printed on the ticket/invoice
+- hotel check-in/check-out dates printed on the invoice; use checkout date as the workbook `Date` while preserving the stay range
+- Didi/Gaode ride datetime from a trip report
+- mobile/telecom month-end from the billing period, or the invoice month when no billing period is extractable
+
+For pure `other` invoices, use `invoice.issue_date` as a provisional `expense_date` when it exists. Set `date_source: other_invoice_issue_date_provisional`, `date_is_provisional: true`, and show a non-blocking advisory so the applicant can correct the occurrence/record date if needed.
+
+For ordinary meal, taxi summary, hotel-without-stay-date, and `unknown` invoices, leave `expense_date` blank, set `date_required: true`, and ask the applicant which date to record. If an `unknown` item is later reclassified as pure `other`, it can then use the provisional `other` date rule.
 
 ## Matching Method
 
@@ -100,7 +112,7 @@ For each allocation unit, score candidate project contexts using:
 - City fit: exact city match, destination city match, route endpoint match, or strong textual city evidence.
 - Expense-type logic: taxi, travel, hotel, meal, mobile, other.
 - User notes: direct mention of seller, restaurant, route, event, attendee, or special circumstance.
-- Conflict checks: overlapping projects, same code with different clients, missing city, missing actual meal date, or unsupported substitute invoice.
+- Conflict checks: overlapping projects, same code with different clients, missing city, missing reliable expense date, missing actual meal date, or unsupported substitute invoice.
 
 Use confidence labels:
 
@@ -108,6 +120,16 @@ Use confidence labels:
 - `medium`: provide a suggested assignment and ask for confirmation in the chat.
 - `low`: do not assign; ask the user.
 - `fixed`: deterministic assignment such as mobile to admin.
+
+Use type-specific pre-allocation rules. Do not apply one generic city/date rule to every invoice type:
+
+- Hotel: prioritize hotel city plus stay dates. If stay dates or project dates are missing, pre-allocate only when the hotel city maps to exactly one project context; still ask for missing nights/check-in/check-out for cap checks.
+- Meal: invoice date is unreliable. Use explicit user-provided meal details when available; otherwise pre-allocate only when a non-Shanghai meal city maps to exactly one project context. The project inference may be advisory, but the actual meal date remains blocking unless the user already provided it.
+- Taxi/Didi: allocate to the project journey the ride supports. Ordinary city rides match by city/date. Airport/station transfers belong to the upcoming destination project when the next project starts within the travel buffer. Transfers from one project city to a station/airport for the next city belong to the project being traveled to.
+- Flight/rail: match by route destination and travel date, allowing a reasonable +/- 1 day project buffer.
+- Other and unknown: do not pre-match by invoice city. Ask the user for accounting note and project/admin matter because issuer city can be misleading for SaaS, online meeting, association, platform, or generic service expenses. For pure `other`, temporarily use the invoice issue date as Date and advise the user to confirm/correct it; for `unknown`, ask for the actual date until reclassified.
+
+Record deterministic pre-allocation in `auto_project_match` with values such as `hotel_stay_dates`, `hotel_unique_city`, `unique_non_shanghai_city`, `taxi_transfer_to_next_project`, `taxi_city_date`, `travel_destination_date`, or `travel_route_date`, and explain the basis in `match_reason`.
 
 ## Expense-Type Rules
 
@@ -125,6 +147,13 @@ Match by:
 
 Allow reasonable cross-date travel logic. Example: if the project starts on the 3rd in Shanxi, a taxi on the 2nd to an airport or railway station can belong to that project.
 
+For airport/station transfer rides, prefer the project being traveled to:
+
+- Shanghai taxi to airport/station on the day before an out-of-town project -> upcoming destination project.
+- Taxi from a project city to airport/station when another city project starts within the next day -> the next/destination project.
+- Arrival-side taxi in the destination city from airport/station to hotel/client -> the destination project.
+- If there is no travel document and two projects can both explain the ride, mark medium confidence and ask in the batch taxi question.
+
 If a ride city/date does not match any provided trip/project, ask the user. The answer may be a local overtime taxi, a missing project context, personal/non-reimbursable, or another business reason.
 
 Final template column:
@@ -141,7 +170,9 @@ Determine `origin_place_type` and `destination_place_type` before finalizing the
 
 ### Railway And Flight Travel
 
-Match by route, destination city, and travel date. Travel is usually high-confidence when a route endpoint and date align with a project city/date range.
+Match by route, destination city, and travel date. Travel is usually high-confidence when the destination city and travel date align with a project city/date range, allowing a reasonable +/- 1 day buffer.
+
+When travel connects two project cities, assign it to the project being traveled to. Return travel without a following project usually belongs to the project just completed. If route direction is unclear, ask in the travel batch question.
 
 Final template column: `travel`.
 
@@ -154,12 +185,12 @@ Use city or station/airport names from the route. Do not include train number, f
 
 ### Hotel
 
-Match by hotel city and stay date when available. If the invoice has no stay date, use hotel/seller city plus nearby project period.
+Match by hotel city and stay date when available. If the invoice has no stay date, the project context lacks dates, or the stay date cannot be reliably extracted, use hotel/seller city only when that city maps to exactly one project context.
 
 Ask the user if:
 
 - city matches multiple contexts
-- invoice date is far from the project period
+- stay dates are missing, unreliable, or conflict with the project period
 - hotel city cannot be inferred
 - there are overlapping trips
 
@@ -169,7 +200,7 @@ Final note:
 
 - `出差酒店（X晚，入住日-离店日）`
 
-If stay dates or nights are missing, infer from project context only when high confidence. Otherwise ask the user for check-in date, check-out date, and number of nights.
+If stay dates or nights are missing, infer project ownership from city uniqueness only when high confidence, but still ask the user for check-in date, check-out date, and number of nights. Project pre-allocation and hotel cap validation are separate: a hotel can be pre-allocated while still requiring stay-night confirmation.
 
 Also ask for shared-room/co-occupant details when a hotel may exceed the per-night standard. Stage 3 applies hotel caps after final rows are built: Beijing/Shanghai/Guangzhou/Shenzhen are RMB 800 per night, other cities are RMB 600 per night.
 
@@ -189,6 +220,12 @@ If the user says only the cap amount should be reimbursed, keep `amount` / `invo
 ### Meal
 
 Treat meals as confirmation-heavy because invoice issue date may not equal actual meal date.
+
+If the user's project notes already say which meal/date/amount belongs to which project, use those notes directly. Otherwise, do not rely on invoice issue date for project matching or workbook Date. Use the invoice city for project pre-allocation only when it is a non-Shanghai city and that city maps to exactly one project in the reimbursement period.
+
+For a large batch of meal invoices, do not ask one chat question per invoice. Use one grouped meal question that lists item number, source filename, invoice number, seller, invoice date, amount, and suggested project. The applicant can answer in batches, such as: "1/3/5/7 属于山西信托，日期分别是 6/3、6/4、6/5、6/6；2/4/6 属于广联达，日期分别是 6/10、6/11、6/12。"
+
+If a meal was auto-assigned by the unique non-Shanghai city rule, make the project ownership review advisory rather than blocking. Do not use invoice date as the provisional meal date. If the actual meal date is missing, keep a blocking grouped meal question open so the applicant can provide dates, attendees, or reimbursable amount changes. Shanghai meals are not auto-confirmed merely because dates line up; they may be local project meals, overtime meals, client meetings, or other local events.
 
 Create a meal review list unless the user already provided clear meal details. Ask for:
 
@@ -228,7 +265,7 @@ Final note:
 
 - `X月通讯费`
 
-Use the billing period, not the invoice issue date, when available. For example, billing period `202605` becomes `5月通讯费`.
+Use the billing period, not the invoice issue date, when available. For example, billing period `202605` becomes `5月通讯费`, and `expense_date` should be `2026-05-31`. If no billing period is extractable, use the last day of the invoice month rather than the issue day itself.
 
 ### Admin Matter Client Names
 
@@ -242,7 +279,11 @@ This prompt is advisory only. Do not block stage 3 Excel output merely because t
 
 ### Other
 
-Ask the user by default. Do not invent a project assignment.
+Ask the user by default. Do not invent a project assignment and do not pre-match by invoice issuer city. The issuer's city is often misleading for online meetings, SaaS, platform services, industry associations, and generic service providers.
+
+For pure `other`, temporarily use the invoice issue date as the workbook Date when available. Mark it provisional and show an advisory review item in chat; do not block Stage 3 only because the applicant has not separately confirmed this date. If the applicant says the actual occurrence/record date differs, update `expense_date`, set `date_source: user_confirmed`, and clear `date_is_provisional`.
+
+For `unknown`, do not use the invoice issue date until the item has been reclassified. Ask what it is and which date to record.
 
 Final template column: `other` unless user context clearly says it belongs to another template column.
 
@@ -334,13 +375,27 @@ Stage 2 is intentionally iterative:
 4. Assign high-confidence and fixed items.
 5. Create suggested assignments for medium-confidence items.
 6. Show an applicant review list in the current conversation before questions, so the user can identify each item by simple number and source filename.
-7. Ask targeted questions in the current conversation for low-confidence, medium-confidence, meal, other, conflicting, or substitute-invoice items.
+7. Ask targeted questions in the current conversation for low-confidence, medium-confidence, meal, other, conflicting, or substitute-invoice items. Batch repetitive questions by expense type whenever several items need the same kind of answer.
 8. Convert user answers into `allocation-answers.json`, apply them with `scripts/apply_allocation_answers.py`, and regenerate `expense-allocation.md/json`.
 9. Repeat until every allocation unit is confirmed or explicitly left in the question queue.
 
-Group questions by user-facing item number. If one item has multiple uncertainties, ask them together under that item. It is fine to include several item blocks in one chat message, but do not scatter the same item across multiple questions.
+Group questions by expense type first, then list user-facing item numbers inside each group. If one item has multiple uncertainties, ask them together in that type group. For example, a single meal group can ask for actual meal date, project/client, attendees, and note type for items 1/3/5/7. A single hotel group can ask for check-in/check-out/nights for several hotels. A single taxi group can ask for unclear origin/destination place types for several rides.
 
-Use `status: advisory` with `blocking: false` for optional refinements that should be shown in chat but must not block Excel output, such as replacing the default admin Client `项目、调研以外的其他费用` with a more specific matter name.
+When presenting a grouped question, include enough information for batch replies:
+
+- item number
+- source filename, and supporting invoice filename when different
+- invoice number when available
+- seller or service provider
+- reliable expense date, or invoice issue date clearly labeled as not enough
+- amount
+- category/final column
+- suggested client/code/project
+- short evidence note
+
+Tell the user they can answer by grouped item numbers, such as: "1/3/5/7 属于山西信托，日期分别是...；2/4/6 属于广联达，日期分别是..." The agent should translate that natural-language answer into `unit_updates` with `unit_nos` arrays.
+
+Use `status: advisory` with `blocking: false` for optional refinements that should be shown in chat but must not block Excel output, such as replacing the default admin Client `项目、调研以外的其他费用` with a more specific matter name, or reviewing pure `other` items whose Date temporarily uses the invoice issue date.
 
 Every user-facing question must be answerable without opening any file. Include:
 
@@ -349,7 +404,7 @@ Every user-facing question must be answerable without opening any file. Include:
 - invoice number when available
 - seller or service provider
 - amount
-- expense date or trip date
+- expense/trip date when reliable; for pure `other`, label invoice-date-derived values as provisional; for `unknown` or non-`other` unreliable dates, ask for actual occurrence date
 - category and final column when known
 - suggested client/code/project when available
 - the specific uncertainty: project ownership, actual meal date, attendees, taxi place types, missing trip report, substitute approval screenshot, or whether to drop
@@ -410,6 +465,9 @@ Answers JSON shape:
       "admin_client_review_needed": false,
       "project_context_id": "CTX-001",
       "expense_date": "YYYY-MM-DD",
+      "date_source": "user_confirmed",
+      "date_is_provisional": false,
+      "date_required": false,
       "city": "",
       "final_template_column": "travel",
       "final_note": "",
@@ -444,6 +502,8 @@ Convenience keys are also supported:
 - `confirm_units`: list of user-facing item numbers or internal unit IDs to mark confirmed.
 - `drop_units`: list of user-facing item numbers or internal unit IDs to drop.
 - `exclude_units`: list of user-facing item numbers or internal unit IDs to exclude.
+
+For grouped questions, translate each natural-language batch into one or more `unit_updates` using `unit_nos`, for example `{"unit_nos": [1, 3, 5, 7], "client_name": "山西信托", "client_charge_code": "CORP-2026-BD", ...}`. If the user provides different dates for each item, create separate unit updates or separate per-item entries so each `expense_date` is correct.
 
 Prefer `unit_no` or numeric lists when translating user answers. Internal `unit_id` / `unit_ids` remain supported for scripts and process files, but they should not be shown to the user in chat.
 
@@ -514,7 +574,12 @@ Write `process/expense-allocation.json`:
       "amount": "0.00",
       "invoice_amount": "0.00",
       "reimbursable_amount": "",
+      "issue_date": "YYYY-MM-DD",
       "expense_date": "YYYY-MM-DD",
+      "date_source": "user_confirmed",
+      "date_is_provisional": false,
+      "date_required": false,
+      "date_question_reason": "",
       "source_category": "meal",
       "final_template_column": "travel",
       "city": "",
@@ -546,6 +611,7 @@ Write `process/expense-allocation.json`:
       "approval_file": "",
       "approval_file_status": "",
       "confidence": "medium",
+      "auto_project_match": "",
       "match_reason": "",
       "status": "needs_confirmation",
       "manual_correction": false,
@@ -556,11 +622,14 @@ Write `process/expense-allocation.json`:
   ],
   "questions": [
     {
-      "question_id": "Q-001",
-      "unit_ids": ["UNIT-001"],
+      "question_id": "Q-GROUP-001",
+      "question_type": "batch_meal",
+      "unit_ids": ["UNIT-001", "UNIT-003", "UNIT-005"],
+      "user_nos": [1, 3, 5],
       "question": "",
       "why_it_matters": "",
-      "status": "open"
+      "status": "open",
+      "blocking": true
     }
   ],
   "change_log": []
@@ -573,6 +642,7 @@ Stage 2 is complete when:
 
 - The user-provided project context has been structured and confirmed enough to allocate expenses.
 - Every allocation unit has a project assignment, fixed admin assignment, or open question.
+- Every included allocation unit has a reliable `expense_date`, a pure-`other` provisional invoice-date `expense_date` with an advisory review item, or a blocking open question asking the applicant for the actual date to record.
 - Meals have actual date/project/attendee details when needed.
 - `CORP-2026-BD` collisions are separated by client/city/date context.
 - Substitute invoices are marked and screenshot requirements are recorded.

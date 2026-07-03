@@ -140,16 +140,18 @@ Read `references/stage-2-allocation.md` before allocating expenses. Keep these c
 
 - Treat project identity as `client_name + city + date_range + charge_code + user_description`; do not treat charge code alone as unique because many pending projects may share `CORP-2026-BD`.
 - Use LLM judgment for first-pass matching, but ask the user about low-confidence or conflicting items.
-- Match taxi and Didi ride items by city and date, allowing reasonable prior-day or next-day airport/station transfers.
-- Match railway and flight travel by route, destination city, and travel date.
-- Match hotels by city and stay date when available; otherwise use city plus nearby project period and ask when uncertain.
-- Treat meals as confirmation-heavy because invoice issue date may not equal meal date; ask the user for meal date/project/attendees when needed.
-- Allocate mobile expenses to `CORP-2026-ADMIN` with `client_name = 通讯费`, not `Admin`.
+- Treat `invoice.issue_date` as evidence, not a default occurrence date. Reliable occurrence dates are: printed flight/rail travel date, printed hotel check-in/check-out dates, Didi/Gaode ride datetime from a trip report, and mobile month-end from the billing period or invoice month. For pure `other` expenses, you may temporarily use `invoice.issue_date` as `expense_date`, but mark it provisional and show a non-blocking advisory for user review.
+- Match hotels first by hotel city plus stay dates; when stay dates or project dates are missing, use city uniqueness only for project pre-allocation, and still ask for missing nights/check-in/check-out needed for hotel caps.
+- Match meals by explicit user-provided meal notes when available; otherwise treat invoice dates as unreliable and auto-assign only when a non-Shanghai invoice city has exactly one project in the period. Show those inferred meals as advisory so the user can batch-correct dates/attendees/amounts.
+- Match taxi and Didi ride items by the project journey they support: city/date for ordinary rides, airport/station transfer to the upcoming destination project, and project-to-project station/airport transfers to the project being traveled to.
+- Match railway and flight travel by route destination and travel date with a reasonable +/- 1 day project buffer.
+- Do not pre-match `other` or `unknown` by invoice city. Ask the user; invoice issuer city can be misleading for SaaS, online meetings, associations, and other services.
+- Allocate mobile expenses to `CORP-2026-ADMIN` with `client_name = 通讯费`, not `Admin`; fill Date as that month's last day.
 - For other `CORP-2026-ADMIN` expenses, use a specific matter name as `client_name` when known, such as `年会`, `半年会`, `客户会`, or `行业协会会议`; if missing, use `项目、调研以外的其他费用` and show a non-blocking chat prompt so the applicant can refine it.
-- Ask about `other` expenses by default unless the user already confirmed `CORP-2026-ADMIN`; in that case the matter-name prompt is advisory and must not block Excel output.
-- Ask follow-up questions directly in the current conversation. Use `process/expense-allocation.md/json` as internal process files only; do not tell the user to inspect those files. Each question should name the relevant invoice or trip item, amount, seller/service provider, date, suggested project if any, and why confirmation is needed.
+- Ask about `other` and `unknown` expenses by default. For `other`, project/note/accounting treatment may still be blocking, but the date can temporarily use the invoice date with an advisory. For `unknown`, ask for the actual date unless the user reclassifies it as pure `other`.
+- Ask follow-up questions directly in the current conversation. Use `process/expense-allocation.md/json` as internal process files only; do not tell the user to inspect those files. Group repetitive uncertainties by expense type, such as one meal batch question listing all meal item numbers, files, invoice numbers, dates, amounts, and suggested projects.
 - Before asking follow-up questions, show a compact applicant review list in chat with item number, source filename, seller/provider, date, amount, category, suggested project, and status.
-- Combine all uncertainties for the same item into one question block. For example, a meal with no matched project should ask for actual meal date, project/client, attendees, and note type together under the same item number.
+- Combine all uncertainties for the same item into one question block, then batch same-type items into one grouped question whenever practical. For example, ask meal details once for items 1/3/5/7 instead of repeating the same question four times.
 - Use simple user-facing item numbers in conversation, such as item 1 or item 2, instead of internal IDs like `DOC-001` or `UNIT-001`. Keep internal IDs only in process JSON/Markdown for traceability.
 - When a user challenges an item, run `scripts/trace_expense_item.py` and identify the source filename, invoice number, seller, amount, date, and trip details before applying corrections.
 - Track substitute invoices separately, ask the user for the partner approval screenshot, append the substitute marker to the final note, and carry the substitute flag to the Excel stage.
@@ -162,12 +164,13 @@ Read `references/stage-3-excel-output.md` before writing the reimbursement workb
 
 - Ask the user for `Requester` if not already known.
 - Write `Date` as `YYYYMMDD`.
+- Use only confirmed, reliable, or explicitly provisional `other` `expense_date`; if `date_required` is true or `expense_date` is blank, ask in chat before writing the workbook.
 - Use confirmed `client_name` and `client_charge_code` from stage 2.
 - Set `Expense Nature` by formal invoice/location city: Shanghai means local; otherwise business trip.
 - Use the confirmed stage-2 `final_note` for `Note`.
 - Put each amount in exactly one template amount column: hotel, travel, taxi, meal, mobile, or other.
-- For meal expenses with daily standards, apply the cap after rows are built: business-trip meals are RMB 150/day, local overtime meals are RMB 60/day. Show `meal_daily_cap_checks` in chat. If a date exceeds the relevant cap without attendee details, ask whether the meal date is wrong, attendees are missing, or one item should use a lower `reimbursable_amount`; if reimbursable amount differs from invoice amount, the final note must state `发票金额XX/实际报销XX`.
-- For hotel expenses, apply the per-night cap after rows are built: Beijing/Shanghai/Guangzhou/Shenzhen are RMB 800/night, other cities are RMB 600/night. Show `hotel_cap_checks` in chat. If nights or city tier are missing, ask for check-in/check-out/nights/city. If a hotel exceeds the relevant cap, ask whether there was a shared standard room/co-occupant or whether one item should use a lower `reimbursable_amount`.
+- For meal expenses with daily standards, apply the cap after rows are built: business-trip meals are RMB 150/day, local overtime meals are RMB 60/day. Show `meal_daily_cap_checks` in chat. If a date exceeds the relevant cap without attendee details, ask whether the meal date is wrong, attendees are missing, or one item should use a lower `reimbursable_amount`; if attendee details exist, treat the over-cap result as advisory only. If reimbursable amount differs from invoice amount, the final note must state `发票金额XX/实际报销XX`.
+- For hotel expenses, apply the per-night cap after rows are built: Beijing/Shanghai/Guangzhou/Shenzhen are RMB 800/night, other cities are RMB 600/night. Show `hotel_cap_checks` in chat. If nights or city tier are missing, ask for check-in/check-out/nights/city. If a hotel exceeds the relevant cap with shared-room/co-occupant details, treat it as advisory only; otherwise ask whether one item should use a lower `reimbursable_amount`.
 - Assign overall proof numbers by substantive proof order: flight/rail, hotel, taxi/Didi, Gaode, meal, mobile, other.
 - Split Didi/Gaode trip reports into one row per ride, but reuse the same overall proof number for all rides supported by the same invoice.
 - Write rows as project blocks; each block gets a subtotal row, then workbook-level column totals, Total, Grand Total, and Status formulas.

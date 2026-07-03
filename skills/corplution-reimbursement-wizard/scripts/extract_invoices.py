@@ -620,6 +620,7 @@ def base_document(document_id: str, path: Path, source: ExtractedText) -> dict[s
         "classification": {
             "expense_category": "unknown",
             "expense_date": "",
+            "expense_date_source": "",
             "expense_note": "",
             "reason": "",
         },
@@ -648,6 +649,7 @@ def extract_document(document_id: str, path: Path) -> dict[str, Any]:
         doc["classification"] = {
             "expense_category": "travel" if any(item.get("expense_category") == "travel" for item in items) else "taxi",
             "expense_date": schedule.get("period_start", ""),
+            "expense_date_source": "trip_report_period_start" if schedule.get("period_start") else "",
             "expense_note": "Didi trip report",
             "reason": "Trip report parsed into ride-level support items.",
         }
@@ -672,12 +674,15 @@ def extract_document(document_id: str, path: Path) -> dict[str, Any]:
         category, reason = classify_expense(text, invoice.get("seller_name", ""), invoice.get("line_item_name", ""), subtype)
         invoice_note = note_for_invoice(text, invoice, category, subtype)
         doc["invoice"] = invoice
-        expense_date = invoice.get("issue_date", "")
+        expense_date = ""
+        expense_date_source = ""
         if subtype == "railway_e_ticket":
-            expense_date = railway_travel_date(text) or expense_date
+            expense_date = railway_travel_date(text)
+            expense_date_source = "railway_travel_date" if expense_date else ""
         doc["classification"] = {
             "expense_category": category,
             "expense_date": expense_date,
+            "expense_date_source": expense_date_source,
             "expense_note": invoice_note,
             "reason": reason,
         }

@@ -24,6 +24,7 @@ Do not write the final workbook until:
 - `Requester` is known.
 - Every included allocation unit is confirmed or fixed.
 - Open questions that affect client, charge code, final template column, amount, date, note, or proof number are resolved.
+- No included unit has `date_required: true`, and no included unit has a blank `expense_date`. Pure `other` rows may use a provisional invoice-date `expense_date` when `date_is_provisional: true`; this is advisory, not blocking.
 - Substitute invoices either have approval screenshot paths or explicit missing-screenshot issues.
 - Didi/Gaode summary invoices linked to trip reports are not duplicated as standalone expense rows.
 
@@ -35,7 +36,7 @@ Write these fields:
 
 | Template Column | Source |
 | --- | --- |
-| `Date (YYYYMMDD)` | `expense_date` formatted as `YYYYMMDD` |
+| `Date (YYYYMMDD)` | confirmed, reliable, or pure-`other` provisional `expense_date` formatted as `YYYYMMDD`; do not fall back to invoice issue date for non-`other` items |
 | `Requester` | ask user if missing |
 | `Client` | confirmed `client_name`; for `CORP-2026-ADMIN`, normalize mobile to `通讯费` and other missing/admin placeholders to `项目、调研以外的其他费用` |
 | `Client Charge Code` | confirmed `client_charge_code` |
@@ -52,6 +53,17 @@ Write these fields:
 Amounts must be numeric values. Each row must have exactly one populated amount column.
 
 Use `reimbursable_amount` for the visible Excel amount when it is present; otherwise use `amount`. Preserve `invoice_amount` in `final-expense-rows.json`. If the reimbursable amount differs from the invoice amount, append `（发票金额XX/实际报销XX）` to the final note.
+
+Date must come from Stage 2:
+
+- flight/rail: printed travel date
+- hotel: checkout date when check-in/check-out are known
+- Didi/Gaode: ride datetime from the trip report
+- mobile: last day of the billing month or invoice month
+- meal, unknown, and taxi without trip report: user-confirmed occurrence/record date
+- pure `other`: invoice issue date may be used provisionally with `date_source: other_invoice_issue_date_provisional` and a non-blocking advisory
+
+If a non-`other` allocation only has `issue_date`, stop and ask the applicant for the actual date.
 
 ## Meal Daily Caps
 
@@ -76,7 +88,7 @@ For each date and meal policy:
 
 - Sum the visible Excel amounts, meaning `reimbursable_amount` when present, otherwise `amount`.
 - If total is within the relevant cap, mark the date as OK.
-- If total exceeds the relevant cap and at least one item has `attendees`, show a warning only: the day exceeds the standard but may be valid because multiple people are involved.
+- If total exceeds the relevant cap and at least one item has `attendees`, set `severity: advisory` and show a warning only: the day exceeds the standard but may be valid because multiple people are involved.
 - If total exceeds the relevant cap and no item has `attendees`, ask the user directly whether the actual meal date is wrong, attendee details are missing, or one item should be partially reimbursed.
 - When partial reimbursement is needed, suggest a `reimbursable_amount` adjustment that makes the day total exactly equal to the relevant cap. For example, if a local overtime meal is 70, suggest changing `reimbursable_amount` to 60; if two same-day trip meals are 90 + 90, suggest changing one item's `reimbursable_amount` to 60.
 - Apply user-confirmed partial reimbursement with `scripts/apply_allocation_answers.py`, then regenerate the workbook. The final note should show the invoice/reimbursable difference automatically.
@@ -105,7 +117,7 @@ For each hotel item:
 - Determine city tier from `hotel_city_tier` when present; otherwise infer from `hotel_city` or `city`.
 - Calculate cap total as per-night cap multiplied by nights.
 - If reimbursable amount is within cap, mark the item as OK.
-- If the amount exceeds cap and `shared_room`, `room_shared_with`, or `room_share_note` is present, show a warning only: the hotel exceeds the standard but may be valid because it was a shared standard room.
+- If the amount exceeds cap and `shared_room`, `room_shared_with`, or `room_share_note` is present, set `severity: advisory` and show a warning only: the hotel exceeds the standard but may be valid because it was a shared standard room.
 - If the amount exceeds cap and no shared-room information exists, ask whether the nights/city tier are wrong, there was a co-occupant/shared standard room, or the hotel should be partially reimbursed.
 - When partial reimbursement is needed, suggest `reimbursable_amount = cap_total`.
 - Apply user-confirmed partial reimbursement with `scripts/apply_allocation_answers.py`, then regenerate the workbook. The final note should show the invoice/reimbursable difference automatically.
@@ -389,6 +401,10 @@ Create or update:
       "source_category": "meal",
       "source_filename": "",
       "supporting_invoice_filename": "",
+      "issue_date": "YYYY-MM-DD",
+      "date_source": "user_confirmed",
+      "date_is_provisional": false,
+      "date_required": false,
       "seller_name": "",
       "attendees": "",
       "meal_context": "",
@@ -436,6 +452,8 @@ Create or update:
       "total": "0.00",
       "over_by": "0.00",
       "status": "未超标",
+      "severity": "ok",
+      "advisory": false,
       "has_attendees": false,
       "requires_user_confirmation": false,
       "items": [],
@@ -457,6 +475,8 @@ Create or update:
       "total": "0.00",
       "over_by": "0.00",
       "status": "未超标",
+      "severity": "ok",
+      "advisory": false,
       "has_shared_room": false,
       "requires_user_confirmation": false,
       "items": [],
@@ -472,6 +492,7 @@ Create or update:
       },
       "status": "ok",
       "days_checked": 0,
+      "days_with_advisory": 0,
       "days_requiring_confirmation": 0
     },
     {
@@ -482,6 +503,7 @@ Create or update:
       },
       "status": "ok",
       "items_checked": 0,
+      "items_with_advisory": 0,
       "items_requiring_confirmation": 0
     }
   ]
@@ -494,6 +516,7 @@ Before delivering the workbook:
 
 - Every included allocation unit appears in `final-expense-rows.json`.
 - Dropped/excluded units do not appear in workbook rows.
+- Every workbook row has a confirmed, reliable, or pure-`other` provisional Date. No non-`other` row uses invoice issue date merely because the actual occurrence date was missing.
 - Each workbook row has exactly one amount column populated.
 - Row totals equal the sum of included allocation units' reimbursable amounts.
 - Proof group totals equal the sum of rows using that proof number.
@@ -506,8 +529,8 @@ Before delivering the workbook:
 - No Didi/Gaode summary invoice is also written as a duplicate row.
 - `Expense Nature` follows the formal Shanghai/non-Shanghai rule.
 - All substitute invoice notes include `（抵）`.
-- Meal daily cap checks are present and have been shown in chat. Any over-cap day without attendees must be resolved or explicitly acknowledged before final submission.
-- Hotel cap checks are present and have been shown in chat. Missing nights/city tier or any over-cap hotel without shared-room details must be resolved or explicitly acknowledged before final submission.
+- Meal daily cap checks are present and have been shown in chat. Any over-cap day with attendees is advisory only; any over-cap day without attendees must be resolved or explicitly acknowledged before final submission.
+- Hotel cap checks are present and have been shown in chat. Any over-cap hotel with shared-room/co-occupant details is advisory only; missing nights/city tier or any over-cap hotel without shared-room details must be resolved or explicitly acknowledged before final submission.
 - Substitute invoice approval fields are preserved in `final-expense-rows.json` for Stage 4 packaging.
 - Manual correction metadata is preserved in `final-expense-rows.json`.
 - Missing approval screenshots remain visible in checks/issues.
