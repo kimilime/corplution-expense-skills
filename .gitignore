@@ -1,0 +1,38 @@
+# Python
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.mypy_cache/
+.ruff_cache/
+.venv/
+venv/
+
+# Local runtime/output artifacts
+tmp/
+process/
+output/
+outputs/
+package/
+*.log
+*.bak
+
+# Reimbursement generated files
+invoice-extraction.json
+invoice-extraction.md
+expense-allocation.json
+expense-allocation.md
+final-expense-rows.json
+final-expense-rows.md
+package-manifest.json
+package-manifest.md
+
+# Local archive packages
+*.rar
+*.zip
+
+# OS/editor noise
+.DS_Store
+Thumbs.db
+desktop.ini
+.idea/
+.vscode/

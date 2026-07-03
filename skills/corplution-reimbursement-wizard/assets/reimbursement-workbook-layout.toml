@@ -1,0 +1,108 @@
+[sheet]
+name = "工作表1"
+show_grid_lines = true
+
+[columns]
+count = 13
+
+[columns.widths]
+A = 14.832
+B = 10.7109
+C = 30.7109
+D = 15.7109
+E = 15.7109
+F = 21.7109
+G = 9.71094
+H = 13
+I = 13
+J = 13
+K = 13
+L = 13
+M = 13
+
+[rows]
+instruction_height = 90
+header_height = 48.75
+detail_height = 19.5
+subtotal_height = 19.5
+summary_height = 19.5
+
+[fonts]
+cjk = "Microsoft YaHei"
+latin = "Arial"
+size = 9
+
+[formats]
+general = "General"
+text = "@"
+integer = "0"
+money = '#,##0.00;[Red](#,##0.00);"-"'
+
+[colors]
+instruction_fill = "FFDDEBF7"
+subtotal_fill = "FFBFBFBF"
+date_header_font = "FFFF0000"
+
+[styles]
+amount_columns = [7, 8, 9, 10, 11, 12]
+text_columns = [1, 2, 3, 4, 5, 6]
+proof_no_column = 13
+latin_instruction_columns = [4]
+cjk_detail_columns = [2, 3, 5, 6]
+left_aligned_detail_columns = [3, 6]
+wrapped_detail_columns = [3, 6, 7, 8, 9, 10, 11, 12, 13]
+date_header_column = 1
+subtotal_label_column = 4
+subtotal_formula_column = 6
+subtotal_bold_columns = [4, 5, 6]
+summary_label_column = 5
+summary_formula_column = 6
+
+[sample_rows]
+detail = 3
+subtotal = 6
+column_summary = 20
+total = 21
+grand = 22
+status = 23
+
+[labels]
+project_subtotal = "汇总"
+total = "Total: (RMB)"
+grand_total = "Grand Total: (RMB)"
+status = "Status"
+initial_status = "TRUE"
+
+[instruction_row]
+values = [
+  "每个项目内，日期按时间顺序排列",
+  "自己的姓名",
+  "按项目分类汇总\n\n若是项目，则写客户名称\n\n若是调研，则写客户名称+调研类别（如：XXXX 基金调研",
+  "项目编码，若没有，则写CORP-2026-BD\n\n 调研写CORP-2026-BD",
+  "客运服务费按发生地划分“本地”和“出差”，在上海打车为“本地”，其他地区为“出差”\n\n其他费用(餐费等）按事由划分“本地”和“出差”，如：加班晚餐为“本地”，在机场或上海以外的地区用餐为“出差”",
+  "产生的费用类型及描述，尽可能细化，如：标明餐次，和谁一起用餐；住宿几天；打车的起点和终点等\n\n 若为抵用发票，需在此栏注明“（抵）”",
+  "出差产生的酒店费用",
+  "除酒店外，在出差中产生的其他费用（包括餐费、打车费等）",
+  "在上海产生的打车费",
+  "在上海产生的餐费",
+  "通讯费",
+  "其他",
+  "对应的发票编号",
+]
+
+[header_row]
+values = [
+  "Date (YYYYMMDD)",
+  "Requester",
+  "Client",
+  "Client Charge Code",
+  "Expenses Nature",
+  "Note",
+  " hotel ",
+  " travel ",
+  " taxi ",
+  " meal ",
+  " mobile ",
+  " other ",
+  "No.",
+]

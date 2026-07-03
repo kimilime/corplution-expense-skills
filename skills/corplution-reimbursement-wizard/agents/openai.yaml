@@ -1,0 +1,4 @@
+interface:
+  display_name: "Corplution Reimbursement Wizard"
+  short_description: "Run Corplution expense reimbursement workflows."
+  default_prompt: "Use $corplution-reimbursement-wizard to start a guided Corplution reimbursement session: collect invoices, trip reports, and project notes; confirm unclear items in chat; then write the reimbursement workbook and package final files."
