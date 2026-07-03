@@ -48,6 +48,7 @@ ALLOWED_UNIT_FIELDS = {
     "expenses_nature",
     "final_note",
     "final_template_column",
+    "invoice_amount",
     "is_substitute_invoice",
     "issues",
     "match_reason",
@@ -58,6 +59,7 @@ ALLOWED_UNIT_FIELDS = {
     "place_type_confidence",
     "place_type_needs_confirmation",
     "project_context_id",
+    "reimbursable_amount",
     "route",
     "source_note",
     "status",
@@ -309,15 +311,16 @@ def build_markdown(payload: dict[str, Any]) -> str:
         "",
         "## Allocation Draft",
         "",
-        "| User No | Unit ID | Source File | Source | Date | City/Route | Amount | Category | Suggested Project | Code | Final Column | Confidence | Status |",
-        "| ---: | --- | --- | --- | --- | --- | ---: | --- | --- | --- | --- | --- | --- |",
+        "| User No | Unit ID | Source File | Source | Date | City/Route | Invoice Amount | Reimbursable Amount | Category | Suggested Project | Code | Final Column | Confidence | Status |",
+        "| ---: | --- | --- | --- | --- | --- | ---: | ---: | --- | --- | --- | --- | --- | --- |",
     ]
     for unit in payload["allocation_units"]:
         city_route = unit.get("city") or unit.get("route") or unit.get("source_note", "")
         lines.append(
             f"| {unit_no(unit)} | {unit['unit_id']} | {unit.get('source_filename','')} | "
             f"{unit.get('source_document_id','')} {unit.get('source_item_id') or ''} | "
-            f"{unit.get('expense_date','')} | {city_route} | {unit.get('amount','')} | {unit.get('source_category','')} | "
+            f"{unit.get('expense_date','')} | {city_route} | {unit.get('invoice_amount') or unit.get('amount','')} | "
+            f"{unit.get('reimbursable_amount') or unit.get('amount','')} | {unit.get('source_category','')} | "
             f"{unit.get('client_name','')} | {unit.get('client_charge_code','')} | {unit.get('final_template_column','')} | "
             f"{unit.get('confidence','')} | {unit.get('status','')} |"
         )

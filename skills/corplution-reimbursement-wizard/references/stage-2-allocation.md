@@ -182,6 +182,7 @@ Create a meal review list unless the user already provided clear meal details. A
 - attendees or dining counterparties
 - whether it is local Shanghai meal or out-of-town trip meal
 - whether it is a substitute invoice
+- whether actual reimbursable amount differs from invoice amount, when the user says a meal should be partially reimbursed to meet the daily standard
 
 Final template column:
 
@@ -195,6 +196,8 @@ Final note:
 - Overtime meal: `加班餐费`
 
 Carry attendee details in a separate `attendees` field for downstream use. Include attendees in the final note only if the user explicitly wants that style.
+
+If the user says only part of a meal invoice should be reimbursed, keep `amount` / `invoice_amount` as the invoice amount and write the amount to claim in `reimbursable_amount`. Do not overwrite the recognized invoice amount just to meet the meal cap.
 
 ### Mobile
 
@@ -382,6 +385,7 @@ Answers JSON shape:
       "city": "",
       "final_template_column": "travel",
       "final_note": "",
+      "reimbursable_amount": "",
       "origin_place_type": "",
       "destination_place_type": "",
       "attendees": "",
@@ -475,6 +479,8 @@ Write `process/expense-allocation.json`:
       "supporting_schedule_filename": "",
       "invoice_no": "",
       "amount": "0.00",
+      "invoice_amount": "0.00",
+      "reimbursable_amount": "",
       "expense_date": "YYYY-MM-DD",
       "source_category": "meal",
       "final_template_column": "travel",

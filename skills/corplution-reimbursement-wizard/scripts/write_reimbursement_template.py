@@ -28,7 +28,19 @@ C = {
     "local": "\u672c\u5730",
     "trip": "\u51fa\u5dee",
     "substitute": "\uff08\u62b5\uff09",
+    "trip_meal": "\u51fa\u5dee\u9910\u8d39",
+    "overtime_meal": "\u52a0\u73ed\u9910\u8d39",
+    "business_trip_meal_policy": "\u51fa\u5dee\u9910\u8d39",
+    "local_overtime_meal_policy": "\u672c\u5730\u52a0\u73ed\u9910\u8d39",
+    "invoice_amount": "\u53d1\u7968\u91d1\u989d",
+    "reimbursable_amount": "\u5b9e\u9645\u62a5\u9500",
+    "meal_cap_ok": "\u672a\u8d85\u6807",
+    "meal_cap_over_with_attendees": "\u8d85\u6807\uff0c\u5df2\u6709\u591a\u4eba\u4fe1\u606f\uff0c\u4ec5\u63d0\u793a\u590d\u6838",
+    "meal_cap_over_needs_confirmation": "\u8d85\u6807\uff0c\u9700\u786e\u8ba4\u65e5\u671f/\u591a\u4eba/\u5b9e\u62a5\u91d1\u989d",
 }
+
+BUSINESS_TRIP_MEAL_DAILY_CAP = Decimal("150.00")
+LOCAL_OVERTIME_MEAL_DAILY_CAP = Decimal("60.00")
 
 
 AMOUNT_COLUMNS = {
@@ -146,6 +158,14 @@ def money(value: Any) -> str:
         return f"{Decimal(match.group(0)):.2f}" if match else "0.00"
 
 
+def invoice_amount(unit: dict[str, Any]) -> str:
+    return money(unit.get("invoice_amount") or unit.get("amount"))
+
+
+def reimbursable_amount(unit: dict[str, Any]) -> str:
+    return money(unit.get("reimbursable_amount") or unit.get("amount"))
+
+
 def date_yyyymmdd(value: str) -> str:
     match = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", value or "")
     if not match:
@@ -176,7 +196,7 @@ def included_units(allocation: dict[str, Any]) -> list[dict[str, Any]]:
     for unit in allocation.get("allocation_units", []):
         if unit.get("status") in {"dropped", "excluded", "non_reimbursable"}:
             continue
-        if Decimal(money(unit.get("amount"))) == 0:
+        if Decimal(reimbursable_amount(unit)) == 0:
             continue
         out.append(dict(unit))
     return out
@@ -232,7 +252,7 @@ def assign_proof_numbers(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "units": [],
         })
         group["units"].append(unit["unit_id"])
-        group["amount_total"] += Decimal(money(unit.get("amount")))
+        group["amount_total"] += Decimal(reimbursable_amount(unit))
         group["min_date"] = min([d for d in [group["min_date"], unit.get("expense_date", "")] if d] or [""])
         for field, target in [
             ("supporting_invoice_document_id", "source_document_ids"),
@@ -265,6 +285,10 @@ def final_note(unit: dict[str, Any]) -> str:
     note = clean(unit.get("final_note") or unit.get("expense_note") or unit.get("source_note"))
     if unit.get("is_substitute_invoice") and C["substitute"] not in note:
         note += C["substitute"]
+    invoice = Decimal(invoice_amount(unit))
+    reimbursable = Decimal(reimbursable_amount(unit))
+    if reimbursable != invoice and C["invoice_amount"] not in note:
+        note += f"\uff08{C['invoice_amount']}{money(invoice)}/{C['reimbursable_amount']}{money(reimbursable)}\uff09"
     return note
 
 
@@ -297,11 +321,20 @@ def make_rows(units: list[dict[str, Any]], requester: str) -> list[dict[str, Any
             "expenses_nature": expense_nature(unit),
             "note": final_note(unit),
             "amount_column": amount_col,
-            "amount": money(unit.get("amount")),
+            "amount": reimbursable_amount(unit),
+            "invoice_amount": invoice_amount(unit),
+            "reimbursable_amount": reimbursable_amount(unit),
             "proof_no": unit.get("proof_no"),
+            "user_no": unit.get("user_no", ""),
             "source_unit_id": unit.get("unit_id"),
             "source_document_id": unit.get("source_document_id", ""),
             "source_item_id": unit.get("source_item_id", ""),
+            "source_category": unit.get("source_category", ""),
+            "source_filename": unit.get("source_filename", ""),
+            "supporting_invoice_filename": unit.get("supporting_invoice_filename", ""),
+            "seller_name": unit.get("seller_name", ""),
+            "attendees": unit.get("attendees", ""),
+            "meal_context": unit.get("meal_context", ""),
             "is_substitute_invoice": bool(unit.get("is_substitute_invoice")),
             "substitute_for": unit.get("substitute_for", ""),
             "approval_required": unit.get("approval_required", ""),
@@ -314,6 +347,149 @@ def make_rows(units: list[dict[str, Any]], requester: str) -> list[dict[str, Any
             "expense_date": unit.get("expense_date", ""),
         })
     return rows
+
+
+def meal_cap_policy(row: dict[str, Any]) -> dict[str, Any] | None:
+    if row.get("source_category") != "meal":
+        return None
+    note = clean(row.get("note"))
+    meal_context = clean(row.get("meal_context"))
+    is_trip_meal = (
+        row.get("amount_column") == "travel"
+        or note.startswith(C["trip_meal"])
+        or meal_context in {"travel", "business_trip", "station_airport"}
+    )
+    if is_trip_meal:
+        return {
+            "policy": "business_trip_meal",
+            "policy_name": C["business_trip_meal_policy"],
+            "cap": BUSINESS_TRIP_MEAL_DAILY_CAP,
+        }
+    is_local_overtime_meal = meal_context == "overtime" or note.startswith(C["overtime_meal"])
+    if is_local_overtime_meal:
+        return {
+            "policy": "local_overtime_meal",
+            "policy_name": C["local_overtime_meal_policy"],
+            "cap": LOCAL_OVERTIME_MEAL_DAILY_CAP,
+        }
+    return None
+
+
+def meal_item(row: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "user_no": row.get("user_no", ""),
+        "proof_no": row.get("proof_no", ""),
+        "source_unit_id": row.get("source_unit_id", ""),
+        "source_filename": row.get("source_filename") or row.get("supporting_invoice_filename") or "",
+        "seller_name": row.get("seller_name", ""),
+        "invoice_amount": row.get("invoice_amount", "0.00"),
+        "reimbursable_amount": row.get("reimbursable_amount", row.get("amount", "0.00")),
+        "attendees": row.get("attendees", ""),
+        "note": row.get("note", ""),
+    }
+
+
+def suggest_meal_adjustments(day_rows: list[dict[str, Any]], over_by: Decimal) -> list[dict[str, Any]]:
+    remaining = over_by
+    adjustments: list[dict[str, Any]] = []
+    candidates = sorted(
+        day_rows,
+        key=lambda row: (Decimal(money(row.get("amount"))), clean(row.get("source_unit_id"))),
+        reverse=True,
+    )
+    for row in candidates:
+        if remaining <= 0:
+            break
+        current = Decimal(money(row.get("amount")))
+        if current <= 0:
+            continue
+        reduction = min(current, remaining)
+        suggested = current - reduction
+        adjustments.append({
+            "user_no": row.get("user_no", ""),
+            "proof_no": row.get("proof_no", ""),
+            "source_unit_id": row.get("source_unit_id", ""),
+            "source_filename": row.get("source_filename") or row.get("supporting_invoice_filename") or "",
+            "current_reimbursable_amount": money(current),
+            "suggested_reimbursable_amount": money(suggested),
+            "reduce_by": money(reduction),
+        })
+        remaining -= reduction
+    return adjustments
+
+
+def meal_daily_cap_checks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    by_policy_date: dict[tuple[str, str], list[dict[str, Any]]] = defaultdict(list)
+    policies: dict[tuple[str, str], dict[str, Any]] = {}
+    for row in rows:
+        policy = meal_cap_policy(row)
+        if not policy:
+            continue
+        date_value = row.get("date") or date_yyyymmdd(row.get("expense_date", ""))
+        key = (policy["policy"], date_value)
+        by_policy_date[key].append(row)
+        policies[key] = policy
+
+    checks: list[dict[str, Any]] = []
+    for key, day_rows in sorted(by_policy_date.items(), key=lambda item: (item[0][1], item[0][0])):
+        policy = policies[key]
+        date_value = key[1]
+        cap = policy["cap"]
+        total = sum((Decimal(money(row.get("amount"))) for row in day_rows), Decimal("0.00"))
+        over_by = total - cap
+        has_attendees = any(clean(row.get("attendees")) for row in day_rows)
+        status = C["meal_cap_ok"]
+        requires_confirmation = False
+        suggestions: list[dict[str, Any]] = []
+        if over_by > 0:
+            if has_attendees:
+                status = C["meal_cap_over_with_attendees"]
+            else:
+                status = C["meal_cap_over_needs_confirmation"]
+                requires_confirmation = True
+                suggestions = suggest_meal_adjustments(day_rows, over_by)
+        checks.append({
+            "policy": policy["policy"],
+            "policy_name": policy["policy_name"],
+            "date": date_value,
+            "cap": money(cap),
+            "total": money(total),
+            "over_by": money(over_by) if over_by > 0 else "0.00",
+            "status": status,
+            "has_attendees": has_attendees,
+            "requires_user_confirmation": requires_confirmation,
+            "items": [meal_item(row) for row in day_rows],
+            "suggested_adjustments": suggestions,
+        })
+    return checks
+
+
+def print_meal_cap_check(checks: list[dict[str, Any]]) -> None:
+    print("\nMEAL DAILY CAP CHECK TO SHOW IN CHAT")
+    print("Copy or summarize this check in the conversation before final submission.")
+    if not checks:
+        print("No meal rows requiring daily cap checks found.")
+        return
+    for check in checks:
+        print(
+            f"- {check['date']} [{check.get('policy_name', '')}]: total {check['total']} / cap {check['cap']} / "
+            f"over {check['over_by']} / {check['status']}"
+        )
+        for item in check["items"]:
+            print(
+                f"  item {item.get('user_no') or '-'} | proof {item.get('proof_no') or '-'} | "
+                f"{item.get('source_filename') or '-'} | invoice {item['invoice_amount']} | "
+                f"reimburse {item['reimbursable_amount']} | attendees {item.get('attendees') or '-'}"
+            )
+        if check["suggested_adjustments"]:
+            print("  suggested adjustment to fit cap:")
+            for adjustment in check["suggested_adjustments"]:
+                print(
+                    f"  item {adjustment.get('user_no') or '-'} "
+                    f"{adjustment['current_reimbursable_amount']} -> "
+                    f"{adjustment['suggested_reimbursable_amount']} "
+                    f"(reduce {adjustment['reduce_by']})"
+                )
 
 
 def copy_row_style(ws: Any, source_row: int, target_row: int) -> None:
@@ -678,6 +854,18 @@ def build_markdown(payload: dict[str, Any], workbook: Path) -> str:
             f"| {block['project_key']} | {block['first_detail_row']}:{block['last_detail_row']} | "
             f"{block['subtotal_row']} | {block['subtotal_formula']} |"
         )
+    lines += [
+        "",
+        "## Meal Daily Cap Checks",
+        "",
+        "| Policy | Date | Total | Cap | Over By | Status | Needs Confirmation |",
+        "| --- | --- | ---: | ---: | ---: | --- | --- |",
+    ]
+    for check in payload.get("meal_daily_cap_checks", []):
+        lines.append(
+            f"| {check.get('policy_name', '')} | {check['date']} | {check['total']} | {check['cap']} | {check['over_by']} | "
+            f"{check['status']} | {check['requires_user_confirmation']} |"
+        )
     return "\n".join(lines) + "\n"
 
 
@@ -727,7 +915,9 @@ def main(argv: list[str] | None = None) -> int:
     proof_groups = assign_proof_numbers(units)
     rows = make_rows(units, args.requester)
     rows.sort(key=lambda r: (r["client"], r["client_charge_code"], ROW_ORDER.get(r["row_order_type"], 99), r["expense_date"], r["proof_no"]))
+    meal_checks = meal_daily_cap_checks(rows)
     project_blocks, summary_rows = write_workbook(Path(args.output), rows, template_path, layout)
+    meal_check_status = "needs_confirmation" if any(check["requires_user_confirmation"] for check in meal_checks) else "ok"
 
     payload = {
         "schema_version": "final_expense_rows.v1",
@@ -742,7 +932,19 @@ def main(argv: list[str] | None = None) -> int:
         "rows": rows,
         "project_blocks": project_blocks,
         "summary_rows": summary_rows,
-        "checks": [],
+        "meal_daily_cap_checks": meal_checks,
+        "checks": [
+            {
+                "name": "meal_daily_caps",
+                "caps": {
+                    "business_trip_meal": money(BUSINESS_TRIP_MEAL_DAILY_CAP),
+                    "local_overtime_meal": money(LOCAL_OVERTIME_MEAL_DAILY_CAP),
+                },
+                "status": meal_check_status,
+                "days_checked": len(meal_checks),
+                "days_requiring_confirmation": sum(1 for check in meal_checks if check["requires_user_confirmation"]),
+            }
+        ],
     }
     process_dir = Path(args.process_dir)
     write_json(process_dir / "final-expense-rows.json", payload)
@@ -750,6 +952,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote {args.output}")
     print(f"Wrote {process_dir / 'final-expense-rows.json'}")
     print(f"Wrote {process_dir / 'final-expense-rows.md'}")
+    print_meal_cap_check(meal_checks)
     return 0
 
 

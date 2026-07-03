@@ -45,7 +45,8 @@ The agent should not ask the applicant to open `process/*.md` or write JSON manu
 4. Paste or summarize the allocation review list in chat before asking project/allocation questions, including item number, source filename, date, amount, category, and suggested project.
 5. Ask grouped questions by item number when something is uncertain.
 6. Accept corrections such as "第9项金额不对" and trace the item back to its source filename before updating.
-7. End with a package summary: workbook, invoice count, support-document count, and unresolved issues.
+7. After writing the workbook, paste or summarize the meal daily cap check. Business-trip meals are capped at RMB 150/day and local overtime meals at RMB 60/day; if a day exceeds the relevant cap without attendee details, ask whether the date, attendees, or `reimbursable_amount` should be corrected.
+8. End with a package summary: workbook, invoice count, support-document count, and unresolved issues.
 
 ## Dependencies and OCR
 

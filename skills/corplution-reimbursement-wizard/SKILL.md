@@ -165,6 +165,7 @@ Read `references/stage-3-excel-output.md` before writing the reimbursement workb
 - Set `Expense Nature` by formal invoice/location city: Shanghai means local; otherwise business trip.
 - Use the confirmed stage-2 `final_note` for `Note`.
 - Put each amount in exactly one template amount column: hotel, travel, taxi, meal, mobile, or other.
+- For meal expenses with daily standards, apply the cap after rows are built: business-trip meals are RMB 150/day, local overtime meals are RMB 60/day. Show `meal_daily_cap_checks` in chat. If a date exceeds the relevant cap without attendee details, ask whether the meal date is wrong, attendees are missing, or one item should use a lower `reimbursable_amount`; if reimbursable amount differs from invoice amount, the final note must state `发票金额XX/实际报销XX`.
 - Assign overall proof numbers by substantive proof order: flight/rail, hotel, taxi/Didi, Gaode, meal, mobile, other.
 - Split Didi/Gaode trip reports into one row per ride, but reuse the same overall proof number for all rides supported by the same invoice.
 - Write rows as project blocks; each block gets a subtotal row, then workbook-level column totals, Total, Grand Total, and Status formulas.
@@ -193,6 +194,6 @@ Before declaring the workflow complete:
 - Markdown and JSON outputs contain the same documents, amounts, categories, links, and review issues.
 - Stage 1 extraction review list has been shown or summarized in chat when there are recognized files or items needing review.
 - Stage 2 allocation has either a confirmed project/context assignment or a user-facing question for every allocation unit.
-- Stage 3 output has a requester, no unconfirmed blocking items, one amount column per row, no duplicate Didi/Gaode summary rows, and totals reconcile to confirmed allocation units.
+- Stage 3 output has a requester, no unconfirmed blocking items, one amount column per row, no duplicate Didi/Gaode summary rows, meal daily cap checks shown in chat, and totals reconcile to confirmed allocation units.
 - Substitute invoice metadata and approval screenshot paths remain in `final-expense-rows.json` even though they are not written into the visible Excel rows.
 - Stage 4 package contains the workbook at root plus separate invoice and support-document folders, with filenames matching final proof numbers.
