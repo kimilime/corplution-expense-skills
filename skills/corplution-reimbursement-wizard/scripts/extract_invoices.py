@@ -484,7 +484,8 @@ def railway_note(text: str) -> str:
         route_match = re.search(r"([\u4e00-\u9fffA-Za-z]{2,30})\s+" + re.escape(train) + r"\s+([\u4e00-\u9fffA-Za-z]{2,30})", compact_text)
         if route_match:
             route = f"{clean(route_match.group(1))} -> {clean(route_match.group(2))}"
-    parts = [part for part in [train, route, f"{travel_dt} {time_part}".strip(), seat] if part]
+    refund = "\u9000\u7968" in compact_text or "refund" in compact_text.lower()
+    parts = [part for part in [train, route, f"{travel_dt} {time_part}".strip(), seat, "\u9000\u7968\u8d39" if refund else ""] if part]
     return clean(", ".join(parts))
 
 

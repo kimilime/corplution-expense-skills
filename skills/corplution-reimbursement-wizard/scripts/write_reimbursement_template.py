@@ -9,7 +9,7 @@ import json
 import re
 import sys
 from collections import OrderedDict, defaultdict
-from datetime import datetime
+from datetime import date, datetime, timedelta
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
@@ -180,6 +180,26 @@ def normalized_client_name(unit: dict[str, Any]) -> str:
     return ADMIN_FALLBACK_CLIENT if placeholder else client
 
 
+def mobile_accounting_errors(unit: dict[str, Any]) -> list[str]:
+    source_category = clean(unit.get("source_category"))
+    final_column = clean(unit.get("final_template_column"))
+    client = clean(unit.get("client_name"))
+    note = clean(unit.get("final_note") or unit.get("expense_note") or unit.get("source_note"))
+    errors: list[str] = []
+    if source_category != "mobile":
+        if final_column == "mobile":
+            errors.append("non-mobile expense cannot use the mobile amount column")
+        if client == MOBILE_CLIENT:
+            errors.append("non-mobile expense cannot use Client = 通讯费")
+        if MOBILE_CLIENT in note:
+            errors.append("non-mobile expense cannot use a 通讯费 note")
+    project_expense_categories = {"hotel", "meal", "taxi", "travel"}
+    if source_category in project_expense_categories or final_column in project_expense_categories:
+        if clean(unit.get("client_charge_code")).upper() == ADMIN_CODE:
+            errors.append("project expenses cannot be assigned to CORP-2026-ADMIN")
+    return errors
+
+
 def money(value: Any) -> str:
     if value in (None, ""):
         return "0.00"
@@ -206,8 +226,69 @@ def date_yyyymmdd(value: str) -> str:
     return f"{int(match.group(1)):04d}{int(match.group(2)):02d}{int(match.group(3)):02d}"
 
 
+def parse_date(value: Any) -> date | None:
+    match = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", clean(value))
+    if not match:
+        return None
+    try:
+        return datetime(int(match.group(1)), int(match.group(2)), int(match.group(3))).date()
+    except ValueError:
+        return None
+
+
+def date_in_context(unit_date: Any, ctx: dict[str, Any]) -> bool:
+    d = parse_date(unit_date)
+    start = parse_date(ctx.get("date_start", ""))
+    end = parse_date(ctx.get("date_end", ""))
+    if not d or not start or not end:
+        return False
+    buffer = int(ctx.get("travel_buffer_days") or 0)
+    return start - timedelta(days=buffer) <= d <= end + timedelta(days=buffer)
+
+
+def route_endpoints(unit: dict[str, Any]) -> tuple[str, str]:
+    route = clean(unit.get("route") or unit.get("source_note") or unit.get("expense_note") or unit.get("final_note"))
+    if not route:
+        return "", ""
+    match = re.search(r"（([^（）]+)）", route)
+    if match:
+        route = match.group(1)
+    parts = re.split(r"\s*(?:->|-|—|~|至|到)\s*", route, maxsplit=1)
+    if len(parts) == 2:
+        return clean(parts[0]), clean(parts[1])
+    return "", ""
+
+
+def assignment_matches_context(unit: dict[str, Any], ctx: dict[str, Any]) -> bool:
+    if clean(unit.get("project_context_id")) and clean(unit.get("project_context_id")) == clean(ctx.get("context_id")):
+        return True
+    return (
+        clean(unit.get("client_name")) == clean(ctx.get("client_name"))
+        and clean(unit.get("client_charge_code")) == clean(ctx.get("client_charge_code"))
+    )
+
+
+def travel_destination_context(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    if clean(unit.get("source_category")) != "travel" and clean(unit.get("document_subtype")) != "railway_e_ticket":
+        return None
+    _, destination = route_endpoints(unit)
+    if not destination:
+        return None
+    candidates = [
+        ctx for ctx in contexts
+        if date_in_context(unit.get("expense_date", ""), ctx)
+        and clean(ctx.get("city"))
+        and clean(ctx.get("city")) in destination
+    ]
+    context_ids = {clean(ctx.get("context_id")) for ctx in candidates}
+    if len(context_ids) == 1:
+        return candidates[0]
+    return None
+
+
 def require_ready(allocation: dict[str, Any], allow_unconfirmed: bool) -> list[str]:
     errors: list[str] = []
+    contexts = allocation.get("project_contexts", [])
     open_questions = [q for q in allocation.get("questions", []) if q.get("status", "open") == "open"]
     if open_questions and not allow_unconfirmed:
         errors.append(f"{len(open_questions)} open allocation question(s) remain.")
@@ -225,6 +306,15 @@ def require_ready(allocation: dict[str, Any], allow_unconfirmed: bool) -> list[s
             and unit.get("source_category") != "other"
         ):
             errors.append(f"{unit.get('unit_id')} has a provisional date but is not an other expense.")
+        for accounting_error in mobile_accounting_errors(unit):
+            errors.append(f"{unit.get('unit_id')} accounting conflict: {accounting_error}.")
+        destination_ctx = travel_destination_context(unit, contexts)
+        if destination_ctx and not assignment_matches_context(unit, destination_ctx):
+            errors.append(
+                f"{unit.get('unit_id')} travel route destination points to "
+                f"{destination_ctx.get('client_name', '')}/{destination_ctx.get('client_charge_code', '')}; "
+                "travel between project cities should belong to the project being traveled to."
+            )
         for field in ["client_name", "client_charge_code", "final_template_column", "amount", "expense_date"]:
             if field == "client_name" and clean(unit.get("client_charge_code")).upper() == ADMIN_CODE:
                 continue
@@ -569,7 +659,7 @@ def parse_positive_int(value: Any) -> int | None:
     return parsed if parsed > 0 else None
 
 
-def parse_date_object(value: Any) -> datetime.date | None:
+def parse_date_object(value: Any) -> date | None:
     match = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})", clean(value))
     if not match:
         return None

@@ -51,6 +51,7 @@ ALLOWED_UNIT_FIELDS = {
     "date_is_provisional",
     "date_required",
     "date_source",
+    "document_subtype",
     "expense_date",
     "expense_note",
     "expenses_nature",
@@ -78,6 +79,7 @@ ALLOWED_UNIT_FIELDS = {
     "room_shared_with",
     "shared_room",
     "route",
+    "source_category",
     "source_note",
     "status",
     "substitute_for",
@@ -105,12 +107,39 @@ def clean(value: Any) -> str:
     return "" if value is None else str(value).strip()
 
 
+def list_text(value: Any) -> str:
+    if isinstance(value, list):
+        parts = [clean(item) for item in value]
+        return "、".join(part for part in parts if part)
+    return clean(value)
+
+
 def is_admin_code(value: Any) -> bool:
     return clean(value).upper() == ADMIN_CODE
 
 
 def is_mobile_admin_unit(unit: dict[str, Any]) -> bool:
     return unit.get("source_category") == "mobile" or unit.get("final_template_column") == "mobile"
+
+
+def mobile_accounting_errors(unit: dict[str, Any]) -> list[str]:
+    source_category = clean(unit.get("source_category"))
+    final_column = clean(unit.get("final_template_column"))
+    client = clean(unit.get("client_name"))
+    note = clean(unit.get("final_note") or unit.get("expense_note") or unit.get("source_note"))
+    errors: list[str] = []
+    if source_category != "mobile":
+        if final_column == "mobile":
+            errors.append("non-mobile expense cannot use the mobile amount column")
+        if client == MOBILE_CLIENT:
+            errors.append("non-mobile expense cannot use Client = 通讯费")
+        if MOBILE_CLIENT in note:
+            errors.append("non-mobile expense cannot use a 通讯费 note")
+    project_expense_categories = {"hotel", "meal", "taxi", "travel"}
+    if source_category in project_expense_categories or final_column in project_expense_categories:
+        if is_admin_code(unit.get("client_charge_code")):
+            errors.append("project expenses cannot be assigned to CORP-2026-ADMIN")
+    return errors
 
 
 def normalize_admin_client(unit: dict[str, Any]) -> None:
@@ -127,6 +156,9 @@ def normalize_admin_client(unit: dict[str, Any]) -> None:
         unit["client_name"] = ADMIN_FALLBACK_CLIENT
         unit["admin_client_review_needed"] = True
     elif client == ADMIN_FALLBACK_CLIENT:
+        unit["admin_client_review_needed"] = True
+    elif client == MOBILE_CLIENT and not is_mobile_admin_unit(unit):
+        unit["client_name"] = ADMIN_FALLBACK_CLIENT
         unit["admin_client_review_needed"] = True
     else:
         unit["admin_client_review_needed"] = False
@@ -254,6 +286,8 @@ def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: boo
             continue
         if field in {"date_is_provisional", "date_required", "is_substitute_invoice", "place_type_needs_confirmation", "shared_room"}:
             value = as_bool(value)
+        if field == "attendees":
+            value = list_text(value)
         unit[field] = value
 
     if "expense_date" in update and clean(unit.get("expense_date")):
@@ -279,6 +313,9 @@ def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: boo
         unit["place_type_confidence"] = unit.get("place_type_confidence") or "confirmed"
 
     normalize_admin_client(unit)
+    accounting_errors = mobile_accounting_errors(unit)
+    if accounting_errors:
+        raise ValueError(f"{unit.get('unit_id')} accounting conflict: " + "; ".join(accounting_errors))
 
     after = {field: unit.get(field) for field in ALLOWED_UNIT_FIELDS if field in update}
     changed_fields = [

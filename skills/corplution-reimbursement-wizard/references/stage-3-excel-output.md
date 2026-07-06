@@ -25,6 +25,9 @@ Do not write the final workbook until:
 - Every included allocation unit is confirmed or fixed.
 - Open questions that affect client, charge code, final template column, amount, date, note, or proof number are resolved.
 - No included unit has `date_required: true`, and no included unit has a blank `expense_date`. Pure `other` rows may use a provisional invoice-date `expense_date` when `date_is_provisional: true`; this is advisory, not blocking.
+- No non-mobile row uses Client `通讯费`, final column `mobile`, or a note containing `通讯费`.
+- No taxi/travel row is assigned to `CORP-2026-ADMIN`. Admin is not a fallback for unmatched transport.
+- If a flight/rail route destination uniquely matches a project context, the row is assigned to that destination project, not the origin project.
 - Substitute invoices either have approval screenshot paths or explicit missing-screenshot issues.
 - Didi/Gaode summary invoices linked to trip reports are not duplicated as standalone expense rows.
 
@@ -215,7 +218,9 @@ Recommended city source by expense type:
 Use `final_note` from stage 2. It should already follow these templates:
 
 - `高铁（出发地-目的地）`
+- `高铁退票费（出发地-目的地）`
 - `飞机（出发地-目的地）`
+- `飞机退票费（出发地-目的地）`
 - `打车（出发地类型-目的地类型）`
 - `打车（出发地类型-目的地类型）（加班）`
 - `出差餐费`
@@ -527,6 +532,8 @@ Before delivering the workbook:
 - `Status` evaluates to `TRUE` only when Total equals Grand Total.
 - Didi/Gaode rides are split into ride rows and share the linked invoice proof number.
 - No Didi/Gaode summary invoice is also written as a duplicate row.
+- No taxi/travel/meal/hotel row falls back to Client `通讯费`, mobile column, or `CORP-2026-ADMIN`.
+- Flight/rail between two project cities belongs to the destination/project being traveled to.
 - `Expense Nature` follows the formal Shanghai/non-Shanghai rule.
 - All substitute invoice notes include `（抵）`.
 - Meal daily cap checks are present and have been shown in chat. Any over-cap day with attendees is advisory only; any over-cap day without attendees must be resolved or explicitly acknowledged before final submission.

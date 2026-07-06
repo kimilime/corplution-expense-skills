@@ -30,11 +30,13 @@ Ask the user to provide, in natural language:
   - client charge code
   - project or event description
   - optional specific fee notes
+  - optional structured `meal_hints` / `expense_hints` parsed by the agent from the user's natural-language notes
 - For meals when known:
   - actual meal date
   - client/project
   - attendees or dining counterparties
   - whether it was local Shanghai meal or out-of-town trip meal
+  - any "with X", "和X一起", "同事X", or similar companion/counterparty note, even if the meal is under the daily cap
 - Substitute invoice notes:
   - which invoice/item is a substitute invoice
   - what it substitutes for
@@ -70,6 +72,41 @@ client_name + city + date_start/date_end + client_charge_code + project_descript
 ```
 
 Never use `client_charge_code` alone as the project key. Multiple distinct projects may share `CORP-2026-BD` while belonging to different clients.
+
+When the user provides concrete meal or expense notes, translate them into structured hints inside the relevant project context whenever possible:
+
+```json
+{
+  "meal_hints": [
+    {
+      "date": "YYYY-MM-DD",
+      "amount": "117.00",
+      "merchant": "德克士",
+      "merchant_aliases": ["Dicos"],
+      "attendees": "姚",
+      "meal_context": "business_trip",
+      "final_template_column": "travel"
+    }
+  ],
+  "expense_hints": [
+    {
+      "source_category": "meal",
+      "date": "YYYY-MM-DD",
+      "amount": "117.00",
+      "attendees": "姚"
+    }
+  ]
+}
+```
+
+The allocation script scores these hints against extracted units using amount, date, merchant text, and optional city. Treat these fields as evidence, not strict filters:
+
+- Amount can be exact or approximate. A small difference may come from delivery fees, platform discounts, rounding, or a user memory error.
+- Merchant can be brand/store text supplied by the applicant even when the invoice seller is a franchisee, platform merchant, or individual business.
+- Date is the actual meal/expense date from the applicant's note. For ordinary meal invoices, invoice issue date is only weak evidence and must not replace the actual meal date.
+- Auto-apply a hint only when one extracted unit is the unique high-confidence match. If several units have similar evidence, show the candidates in the chat and ask the user to confirm by item number.
+
+Use hints to preserve attendee details even when a meal does not exceed the cap.
 
 ## Allocation Units
 
@@ -108,6 +145,7 @@ For ordinary meal, taxi summary, hotel-without-stay-date, and `unknown` invoices
 
 For each allocation unit, score candidate project contexts using:
 
+- Candidate filter: for hotel, meal, taxi, Didi/Gaode, railway, and flight auto-matching, exclude `CORP-2026-ADMIN` contexts before city/date scoring. Admin is not a Shanghai project.
 - Date fit: inside project date range, or within the allowed travel buffer for airport/station transfer.
 - City fit: exact city match, destination city match, route endpoint match, or strong textual city evidence.
 - Expense-type logic: taxi, travel, hotel, meal, mobile, other.
@@ -127,6 +165,8 @@ Use type-specific pre-allocation rules. Do not apply one generic city/date rule 
 - Meal: invoice date is unreliable. Use explicit user-provided meal details when available; otherwise pre-allocate only when a non-Shanghai meal city maps to exactly one project context. The project inference may be advisory, but the actual meal date remains blocking unless the user already provided it.
 - Taxi/Didi: allocate to the project journey the ride supports. Ordinary city rides match by city/date. Airport/station transfers belong to the upcoming destination project when the next project starts within the travel buffer. Transfers from one project city to a station/airport for the next city belong to the project being traveled to.
 - Flight/rail: match by route destination and travel date, allowing a reasonable +/- 1 day project buffer.
+- For taxi/ride transfers, do not require the ride city to equal the project city when the ride is clearly to/from an airport or railway station. A Shanghai ride to Hongqiao station/airport can belong to the out-of-town destination project if it supports that journey.
+- Never assign unmatched taxi/travel/hotel/meal to `CORP-2026-ADMIN`, Client `通讯费`, or the mobile amount column. If transfer logic does not identify a project, ask the user.
 - Other and unknown: do not pre-match by invoice city. Ask the user for accounting note and project/admin matter because issuer city can be misleading for SaaS, online meeting, association, platform, or generic service expenses. For pure `other`, temporarily use the invoice issue date as Date and advise the user to confirm/correct it; for `unknown`, ask for the actual date until reclassified.
 
 Record deterministic pre-allocation in `auto_project_match` with values such as `hotel_stay_dates`, `hotel_unique_city`, `unique_non_shanghai_city`, `taxi_transfer_to_next_project`, `taxi_city_date`, `travel_destination_date`, or `travel_route_date`, and explain the basis in `match_reason`.
@@ -152,6 +192,8 @@ For airport/station transfer rides, prefer the project being traveled to:
 - Shanghai taxi to airport/station on the day before an out-of-town project -> upcoming destination project.
 - Taxi from a project city to airport/station when another city project starts within the next day -> the next/destination project.
 - Arrival-side taxi in the destination city from airport/station to hotel/client -> the destination project.
+- If there is a matched flight/rail item within +/- 1 day of an airport/station taxi, inherit that travel item's project when unique.
+- If no travel document is available, but the ride is an airport/station transfer and exactly one non-local/out-of-city project context is active or within the travel buffer, assign the taxi to that project even if the ride city is Shanghai and the project city is elsewhere.
 - If there is no travel document and two projects can both explain the ride, mark medium confidence and ask in the batch taxi question.
 
 If a ride city/date does not match any provided trip/project, ask the user. The answer may be a local overtime taxi, a missing project context, personal/non-reimbursable, or another business reason.
@@ -172,7 +214,7 @@ Determine `origin_place_type` and `destination_place_type` before finalizing the
 
 Match by route, destination city, and travel date. Travel is usually high-confidence when the destination city and travel date align with a project city/date range, allowing a reasonable +/- 1 day buffer.
 
-When travel connects two project cities, assign it to the project being traveled to. Return travel without a following project usually belongs to the project just completed. If route direction is unclear, ask in the travel batch question.
+When travel connects two project cities, assign it to the project being traveled to. Return travel without a following project usually belongs to the project just completed. If route direction is unclear, ask in the travel batch question. Do not assign a train/flight to the origin project merely because the departure station city matches it.
 
 Final template column: `travel`.
 
@@ -180,8 +222,10 @@ Final note:
 
 - High-speed rail or train: `高铁（出发地-目的地）`
 - Flight: `飞机（出发地-目的地）`
+- High-speed rail/train refund or cancellation fee: `高铁退票费（出发地-目的地）`
+- Flight refund or cancellation fee: `飞机退票费（出发地-目的地）`
 
-Use city or station/airport names from the route. Do not include train number, flight number, or seat in the final note unless the user asks; keep those details in evidence fields if needed.
+Use city or station/airport names from the route. Do not include train number, flight number, or seat in the final note unless the user asks; keep those details in evidence fields if needed. If the invoice text, line item, or remarks include `退票`, `退票费`, `退款`, `refund`, or cancellation wording, use the refund-fee note template.
 
 ### Hotel
 
@@ -249,6 +293,8 @@ Final note:
 
 Carry attendee details in a separate `attendees` field for downstream use. Include attendees in the final note only if the user explicitly wants that style.
 
+If the user already provided attendee/counterparty details in the project notes, preserve them in `attendees` even when the daily cap is not exceeded. The cap check is not the only trigger for recording attendees.
+
 If the user says only part of a meal invoice should be reimbursed, keep `amount` / `invoice_amount` as the invoice amount and write the amount to claim in `reimbursable_amount`. Do not overwrite the recognized invoice amount just to meet the meal cap.
 
 ### Mobile
@@ -277,6 +323,8 @@ Never use `Admin` as the final `client_name` for `CORP-2026-ADMIN` rows. The Cli
 
 This prompt is advisory only. Do not block stage 3 Excel output merely because the admin matter name is still the default.
 
+`CORP-2026-ADMIN` is not a fallback bucket. Taxi, Didi/Gaode, railway, flight, hotel, and meal expenses must not be assigned to `CORP-2026-ADMIN` or Client `通讯费` unless the source category is genuinely mobile/telecom. If a transport item cannot be matched, keep it in the blocking question queue.
+
 ### Other
 
 Ask the user by default. Do not invent a project assignment and do not pre-match by invoice issuer city. The issuer's city is often misleading for online meetings, SaaS, platform services, industry associations, and generic service providers.
@@ -296,7 +344,9 @@ The downstream Excel `Note` field must use these exact Chinese templates after a
 | Expense Type | Final Note Template |
 | --- | --- |
 | High-speed rail / train | `高铁（出发地-目的地）` |
+| High-speed rail refund/cancellation fee | `高铁退票费（出发地-目的地）` |
 | Flight | `飞机（出发地-目的地）` |
+| Flight refund/cancellation fee | `飞机退票费（出发地-目的地）` |
 | Taxi / Didi | `打车（出发地类型-目的地类型）` |
 | Overtime taxi | `打车（出发地类型-目的地类型）（加班）` |
 | Out-of-town meal | `出差餐费` |

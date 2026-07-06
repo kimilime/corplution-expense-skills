@@ -35,6 +35,8 @@ C = {
     "taxi": "\u6253\u8f66",
     "flight": "\u98de\u673a",
     "rail": "\u9ad8\u94c1",
+    "flight_refund": "\u98de\u673a\u9000\u7968\u8d39",
+    "rail_refund": "\u9ad8\u94c1\u9000\u7968\u8d39",
     "hotel_note": "\u51fa\u5dee\u9152\u5e97",
     "mobile": "\u901a\u8baf\u8d39",
     "substitute": "\uff08\u62b5\uff09",
@@ -74,8 +76,32 @@ def is_admin_code(value: Any) -> bool:
     return clean(value).upper() == C["admin_code"]
 
 
+def non_admin_contexts(contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    return [ctx for ctx in contexts if not is_admin_code(ctx.get("client_charge_code"))]
+
+
 def is_mobile_admin_unit(unit: dict[str, Any]) -> bool:
     return unit.get("source_category") == "mobile" or unit.get("final_template_column") == "mobile"
+
+
+def mobile_accounting_errors(unit: dict[str, Any]) -> list[str]:
+    source_category = clean(unit.get("source_category"))
+    final_column = clean(unit.get("final_template_column"))
+    client = clean(unit.get("client_name"))
+    note = clean(unit.get("final_note") or unit.get("expense_note") or unit.get("source_note"))
+    errors: list[str] = []
+    if source_category != "mobile":
+        if final_column == "mobile":
+            errors.append("non-mobile expense cannot use the mobile amount column")
+        if client == C["mobile"]:
+            errors.append("non-mobile expense cannot use Client = 通讯费")
+        if C["mobile"] in note:
+            errors.append("non-mobile expense cannot use a 通讯费 note")
+    project_expense_categories = {"hotel", "meal", "taxi", "travel"}
+    if source_category in project_expense_categories or final_column in project_expense_categories:
+        if is_admin_code(unit.get("client_charge_code")):
+            errors.append("project expenses cannot be assigned to CORP-2026-ADMIN")
+    return errors
 
 
 def normalize_admin_client(unit: dict[str, Any]) -> None:
@@ -92,6 +118,9 @@ def normalize_admin_client(unit: dict[str, Any]) -> None:
         unit["client_name"] = C["admin_fallback_client"]
         unit["admin_client_review_needed"] = True
     elif client == C["admin_fallback_client"]:
+        unit["admin_client_review_needed"] = True
+    elif client == C["mobile"] and not is_mobile_admin_unit(unit):
+        unit["client_name"] = C["admin_fallback_client"]
         unit["admin_client_review_needed"] = True
     else:
         unit["admin_client_review_needed"] = False
@@ -326,13 +355,25 @@ def route_from_note(note: str) -> str:
     return f"{clean(match.group(1))}-{clean(match.group(2))}" if match else ""
 
 
+def is_refund_fee(unit: dict[str, Any]) -> bool:
+    text = clean(" ".join([
+        unit.get("source_note", ""),
+        unit.get("expense_note", ""),
+        unit.get("raw_remarks", ""),
+        unit.get("line_item_name", ""),
+        unit.get("seller_name", ""),
+    ]))
+    return any(keyword in text for keyword in ["退票费", "退票", "退款", "refund", "Refund", "cancellation"])
+
+
 def normal_note(unit: dict[str, Any]) -> str:
     category = unit.get("source_category", "")
     subtype = unit.get("document_subtype", "")
     source = clean(unit.get("source_note"))
     if subtype == "railway_e_ticket" or "G" in source[:12]:
         route = route_from_note(source) or clean(unit.get("route"))
-        return f"{C['rail']}\uff08{route}\uff09" if route else C["rail"]
+        note_type = C["rail_refund"] if is_refund_fee(unit) else C["rail"]
+        return f"{note_type}\uff08{route}\uff09" if route else note_type
     if category == "hotel":
         nights = unit.get("hotel_nights") or "X"
         checkin = unit.get("check_in_date") or "\u5165\u4f4f\u65e5"
@@ -508,6 +549,8 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
                 "place_type_confidence": "",
                 "place_type_needs_confirmation": False,
                 "seller_name": invoice.get("seller_name", ""),
+                "line_item_name": invoice.get("line_item_name", ""),
+                "raw_remarks": invoice.get("raw_remarks", ""),
                 "project_context_id": "",
                 "client_name": "",
                 "client_charge_code": "",
@@ -651,6 +694,18 @@ def score_context(unit: dict[str, Any], ctx: dict[str, Any]) -> int:
     return score
 
 
+def project_score_contexts(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> list[tuple[int, dict[str, Any]]]:
+    category = clean(unit.get("source_category"))
+    candidates = contexts
+    if category in {"hotel", "meal", "taxi", "travel"}:
+        candidates = non_admin_contexts(contexts)
+    return sorted(
+        [(score_context(unit, ctx), ctx) for ctx in candidates],
+        key=lambda item: (item[0], clean(item[1].get("context_id"))),
+        reverse=True,
+    )
+
+
 def route_endpoints(unit: dict[str, Any]) -> tuple[str, str]:
     route = clean(unit.get("route"))
     if not route:
@@ -690,6 +745,7 @@ def apply_context_match(
 
 
 def match_hotel(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    contexts = non_admin_contexts(contexts)
     city = clean(unit.get("hotel_city") or unit.get("city"))
     if not city:
         return None
@@ -718,6 +774,7 @@ def match_hotel(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[st
 
 
 def match_meal(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    contexts = non_admin_contexts(contexts)
     unique_city_ctx = unique_non_shanghai_context_for_unit(unit, contexts)
     if unique_city_ctx:
         return {
@@ -762,6 +819,24 @@ def next_project_for_transfer(unit: dict[str, Any], contexts: list[dict[str, Any
     return None
 
 
+def transfer_project_by_period(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    ride_date = parse_date(unit.get("expense_date", ""))
+    if not ride_date or not is_transfer_endpoint(unit):
+        return None
+    unit_city = clean(unit.get("city"))
+    candidates: list[dict[str, Any]] = []
+    for ctx in contexts:
+        ctx_city = clean(ctx.get("city"))
+        if not ctx_city or (unit_city and city_key(ctx_city) == city_key(unit_city)):
+            continue
+        if date_in_context(unit.get("expense_date", ""), ctx):
+            candidates.append(ctx)
+    context_ids = {clean(ctx.get("context_id")) for ctx in candidates}
+    if len(context_ids) == 1:
+        return candidates[0]
+    return None
+
+
 def city_date_context(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
     candidates = [
         ctx for ctx in contexts
@@ -774,12 +849,20 @@ def city_date_context(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> d
 
 
 def match_taxi(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    contexts = non_admin_contexts(contexts)
     next_ctx = next_project_for_transfer(unit, contexts)
     if next_ctx:
         return {
             "ctx": next_ctx,
             "auto": "taxi_transfer_to_next_project",
             "reason": f"Taxi appears to be an airport/station transfer to next project context {next_ctx.get('context_id', '')}.",
+        }
+    period_ctx = transfer_project_by_period(unit, contexts)
+    if period_ctx:
+        return {
+            "ctx": period_ctx,
+            "auto": "taxi_transfer_unique_active_project",
+            "reason": f"Taxi appears to be an airport/station transfer during a unique active out-of-city project context {period_ctx.get('context_id', '')}.",
         }
     ctx = city_date_context(unit, contexts)
     if ctx:
@@ -792,6 +875,7 @@ def match_taxi(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str
 
 
 def match_travel(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    contexts = non_admin_contexts(contexts)
     origin, destination = route_endpoints(unit)
     dated_contexts = [ctx for ctx in contexts if date_in_context(unit.get("expense_date", ""), ctx)]
     if destination:
@@ -829,7 +913,355 @@ def typed_project_match(unit: dict[str, Any], contexts: list[dict[str, Any]]) ->
     return None
 
 
+def taxi_transfer_matches_travel_unit(
+    taxi_unit: dict[str, Any],
+    units: list[dict[str, Any]],
+    contexts_by_id: dict[str, dict[str, Any]],
+) -> dict[str, Any] | None:
+    ride_date = parse_date(taxi_unit.get("expense_date", ""))
+    if not ride_date or not is_transfer_endpoint(taxi_unit):
+        return None
+    candidates: list[dict[str, Any]] = []
+    for travel_unit in units:
+        if travel_unit is taxi_unit:
+            continue
+        if clean(travel_unit.get("source_category")) != "travel" and clean(travel_unit.get("document_subtype")) != "railway_e_ticket":
+            continue
+        ctx_id = clean(travel_unit.get("project_context_id"))
+        if not ctx_id or ctx_id not in contexts_by_id:
+            continue
+        if is_admin_code(contexts_by_id[ctx_id].get("client_charge_code")):
+            continue
+        travel_date = parse_date(travel_unit.get("expense_date", ""))
+        if not travel_date:
+            continue
+        if timedelta(days=-1) <= travel_date - ride_date <= timedelta(days=1):
+            candidates.append(contexts_by_id[ctx_id])
+    context_ids = {clean(ctx.get("context_id")) for ctx in candidates}
+    if len(context_ids) == 1:
+        return candidates[0]
+    return None
+
+
+def list_value(value: Any) -> list[Any]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        return value
+    return [value]
+
+
+def list_text(value: Any) -> str:
+    if isinstance(value, list):
+        parts = [clean(item) for item in value]
+        return "、".join(part for part in parts if part)
+    return clean(value)
+
+
+def decimal_amount(value: Any) -> Decimal | None:
+    amount = money(value)
+    if not amount:
+        return None
+    try:
+        return Decimal(amount)
+    except InvalidOperation:
+        return None
+
+
+def expense_hints_from_contexts(contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    hints: list[dict[str, Any]] = []
+    for ctx in contexts:
+        for field, default_category in [("meal_hints", "meal"), ("expense_hints", "")]:
+            for index, raw_hint in enumerate(list_value(ctx.get(field)), start=1):
+                if not isinstance(raw_hint, dict):
+                    continue
+                hint = dict(raw_hint)
+                hint.setdefault("hint_id", f"{clean(ctx.get('context_id')) or 'CTX'}:{field}:{index}")
+                if default_category and not hint.get("source_category") and not hint.get("category"):
+                    hint["source_category"] = default_category
+                hint.setdefault("project_context_id", ctx.get("context_id", ""))
+                hint.setdefault("client_name", ctx.get("client_name", ""))
+                hint.setdefault("client_charge_code", ctx.get("client_charge_code", ""))
+                hint.setdefault("city", ctx.get("city", ""))
+                hints.append(hint)
+    return hints
+
+
+def hint_hard_mismatch(hint: dict[str, Any], unit: dict[str, Any]) -> bool:
+    category = clean(hint.get("source_category") or hint.get("category"))
+    if category and category != clean(unit.get("source_category")):
+        return True
+    hint_no = clean(hint.get("unit_no") or hint.get("user_no"))
+    if hint_no and hint_no != clean(unit.get("user_no")):
+        return True
+    invoice_no = clean(hint.get("invoice_no"))
+    if invoice_no and invoice_no != clean(unit.get("invoice_no")):
+        return True
+    return False
+
+
+def merchant_terms(hint: dict[str, Any]) -> list[str]:
+    raw_terms: list[Any] = []
+    for field in ["seller_contains", "seller", "merchant", "restaurant", "vendor"]:
+        raw_terms.extend(list_value(hint.get(field)))
+    raw_terms.extend(list_value(hint.get("merchant_aliases")))
+    out: list[str] = []
+    for term in raw_terms:
+        text = clean(term)
+        if text and text not in out:
+            out.append(text)
+    return out
+
+
+def compact_merchant_text(value: Any) -> str:
+    text = clean(value).lower()
+    text = re.sub(r"[（）()\[\]【】,，.。·\-\s]", "", text)
+    for word in [
+        "有限责任公司",
+        "股份有限公司",
+        "有限公司",
+        "分公司",
+        "个体工商户",
+        "餐饮管理",
+        "餐饮服务",
+        "餐饮",
+        "管理",
+        "服务",
+        "店",
+    ]:
+        text = text.replace(word, "")
+    return text
+
+
+def unit_hint_text(unit: dict[str, Any]) -> str:
+    return clean(" ".join([
+        unit.get("seller_name", ""),
+        unit.get("line_item_name", ""),
+        unit.get("raw_remarks", ""),
+        unit.get("source_note", ""),
+        unit.get("expense_note", ""),
+        unit.get("source_filename", ""),
+        unit.get("supporting_invoice_filename", ""),
+    ]))
+
+
+def amount_hint_score(hint: dict[str, Any], unit: dict[str, Any]) -> tuple[int, str]:
+    hint_amount = decimal_amount(hint.get("amount") or hint.get("recorded_amount"))
+    if hint_amount is None:
+        return 0, ""
+    unit_amount = decimal_amount(unit.get("amount"))
+    if unit_amount is None:
+        return 0, ""
+    delta = abs(unit_amount - hint_amount)
+    base = max(abs(hint_amount), Decimal("1.00"))
+    pct = delta / base
+    abs_tolerance = decimal_amount(hint.get("amount_tolerance_abs")) or Decimal("8.00")
+    pct_tolerance = decimal_amount(hint.get("amount_tolerance_pct")) or Decimal("0.12")
+    if delta == 0:
+        return 5, f"amount exact {unit_amount}"
+    if delta <= Decimal("1.00"):
+        return 4, f"amount within 1 yuan: hint {hint_amount}, invoice {unit_amount}"
+    if delta <= Decimal("3.00") or pct <= Decimal("0.05"):
+        return 3, f"amount close: hint {hint_amount}, invoice {unit_amount}"
+    if delta <= abs_tolerance or pct <= pct_tolerance:
+        return 2, f"amount approximate: hint {hint_amount}, invoice {unit_amount}"
+    return -2, f"amount differs: hint {hint_amount}, invoice {unit_amount}"
+
+
+def date_hint_value(hint: dict[str, Any]) -> str:
+    return date_key(clean(hint.get("expense_date") or hint.get("date") or hint.get("meal_date") or ""))
+
+
+def date_hint_score(hint: dict[str, Any], unit: dict[str, Any]) -> tuple[int, str]:
+    hint_date = parse_date(date_hint_value(hint))
+    if not hint_date:
+        return 0, ""
+    reliable_date = parse_date(clean(unit.get("expense_date")))
+    if reliable_date:
+        diff = abs((reliable_date - hint_date).days)
+        if diff == 0:
+            return 4, f"reliable date matches {hint_date.isoformat()}"
+        if diff <= 1:
+            return 2, f"reliable date within 1 day of hint {hint_date.isoformat()}"
+    issue_date = parse_date(clean(unit.get("issue_date")))
+    if issue_date:
+        diff = abs((issue_date - hint_date).days)
+        if diff <= 1:
+            return 2, f"invoice issue date is within 1 day of hint {hint_date.isoformat()}"
+        if diff <= 3:
+            return 1, f"invoice issue date is near hint {hint_date.isoformat()}"
+    return 0, ""
+
+
+def merchant_hint_score(hint: dict[str, Any], unit: dict[str, Any]) -> tuple[int, str]:
+    terms = merchant_terms(hint)
+    if not terms:
+        return 0, ""
+    haystack = unit_hint_text(unit)
+    compact_haystack = compact_merchant_text(haystack)
+    for term in terms:
+        compact_term = compact_merchant_text(term)
+        if not compact_term:
+            continue
+        if term in haystack or compact_term in compact_haystack:
+            return 4, f"merchant text matches {term}"
+    return 0, ""
+
+
+def city_hint_score(hint: dict[str, Any], unit: dict[str, Any]) -> tuple[int, str]:
+    city = clean(hint.get("city"))
+    if not city:
+        return 0, ""
+    text = unit_hint_text(unit) + clean(unit.get("city"))
+    if city in text:
+        return 1, f"city matches {city}"
+    return 0, ""
+
+
+def hint_match_score(hint: dict[str, Any], unit: dict[str, Any]) -> tuple[int, list[str], set[str]]:
+    if hint_hard_mismatch(hint, unit):
+        return -999, [], set()
+    if clean(hint.get("unit_no") or hint.get("user_no") or hint.get("invoice_no")):
+        return 100, ["explicit unit or invoice identifier"], {"direct"}
+    score = 0
+    reasons: list[str] = []
+    dimensions: set[str] = set()
+    for dimension, scorer in [
+        ("amount", amount_hint_score),
+        ("date", date_hint_score),
+        ("merchant", merchant_hint_score),
+        ("city", city_hint_score),
+    ]:
+        points, reason = scorer(hint, unit)
+        score += points
+        if points > 0:
+            dimensions.add(dimension)
+            reasons.append(reason)
+        elif points < 0 and reason:
+            reasons.append(reason)
+    return score, reasons, dimensions
+
+
+def hint_summary(hint: dict[str, Any]) -> str:
+    parts = []
+    hint_date = date_hint_value(hint)
+    if hint_date:
+        parts.append(hint_date)
+    merchants = merchant_terms(hint)
+    if merchants:
+        parts.append("/".join(merchants[:2]))
+    amount = money(hint.get("amount") or hint.get("recorded_amount"))
+    if amount:
+        parts.append(f"RMB {amount}")
+    attendees = list_text(hint.get("attendees"))
+    if attendees:
+        parts.append(f"with {attendees}")
+    return " ".join(parts) or clean(hint.get("hint_id")) or "user expense hint"
+
+
+def hint_auto_match_allowed(score: int, dimensions: set[str]) -> bool:
+    if "direct" in dimensions:
+        return True
+    return score >= 7 and len(dimensions) >= 2
+
+
+def add_hint_candidate(unit: dict[str, Any], hint: dict[str, Any], score: int, reasons: list[str]) -> None:
+    candidates = unit.setdefault("hint_candidates", [])
+    candidates.append({
+        "hint_id": hint.get("hint_id", ""),
+        "summary": hint_summary(hint),
+        "score": score,
+        "reasons": reasons[:4],
+    })
+    candidates.sort(key=lambda item: item.get("score", 0), reverse=True)
+    del candidates[3:]
+
+
+def apply_hint_to_unit(unit: dict[str, Any], hint: dict[str, Any], score: int, reasons: list[str]) -> None:
+    if hint.get("attendees"):
+        unit["attendees"] = list_text(hint.get("attendees"))
+    if hint.get("meal_context"):
+        unit["meal_context"] = clean(hint.get("meal_context"))
+    hint_date = date_hint_value(hint)
+    if hint_date:
+        unit["expense_date"] = hint_date
+        unit["date_source"] = "user_context_hint"
+        unit["date_required"] = False
+        unit["date_is_provisional"] = False
+    if hint.get("project_context_id"):
+        unit["project_context_id"] = clean(hint.get("project_context_id"))
+    if hint.get("client_name"):
+        unit["client_name"] = clean(hint.get("client_name"))
+    if hint.get("client_charge_code"):
+        unit["client_charge_code"] = clean(hint.get("client_charge_code"))
+    if hint.get("final_template_column"):
+        unit["final_template_column"] = clean(hint.get("final_template_column"))
+    if hint.get("final_note"):
+        unit["final_note"] = clean(hint.get("final_note"))
+    elif clean(unit.get("source_category")) == "meal":
+        unit["final_note"] = normal_note(unit)
+    unit["hint_match_score"] = score
+    unit["hint_match_summary"] = hint_summary(hint)
+    unit["hint_match_reasons"] = reasons[:6]
+    if unit.get("client_charge_code") and (unit.get("expense_date") or clean(unit.get("source_category")) != "meal"):
+        unit["confidence"] = "high"
+        unit["status"] = "confirmed"
+        unit["auto_project_match"] = "user_context_expense_hint"
+        unit["match_reason"] = "Matched by user-provided expense hint: " + "; ".join(reasons[:3])
+
+
+def scored_hint_candidates(
+    hint: dict[str, Any],
+    units: list[dict[str, Any]],
+    assigned_units: set[str],
+) -> list[tuple[int, dict[str, Any], list[str], set[str]]]:
+    candidates: list[tuple[int, dict[str, Any], list[str], set[str]]] = []
+    for unit in units:
+        if unit.get("unit_id") in assigned_units:
+            continue
+        score, reasons, dimensions = hint_match_score(hint, unit)
+        if score >= 4:
+            candidates.append((score, unit, reasons, dimensions))
+    candidates.sort(key=lambda item: (item[0], clean(item[1].get("unit_id"))), reverse=True)
+    return candidates
+
+
+def apply_expense_hints(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -> None:
+    hints = expense_hints_from_contexts(contexts)
+    if not hints:
+        return
+    for unit in units:
+        unit.pop("hint_candidates", None)
+    assigned_units: set[str] = set()
+    pending = list(hints)
+    while pending:
+        changed = False
+        next_pending: list[dict[str, Any]] = []
+        for hint in pending:
+            candidates = scored_hint_candidates(hint, units, assigned_units)
+            if not candidates:
+                continue
+            top_score = candidates[0][0]
+            top = [item for item in candidates if item[0] == top_score]
+            if len(top) == 1 and hint_auto_match_allowed(top_score, top[0][3]):
+                _, unit, reasons, _ = top[0]
+                apply_hint_to_unit(unit, hint, top_score, reasons)
+                assigned_units.add(unit["unit_id"])
+                changed = True
+            else:
+                next_pending.append(hint)
+        if not changed:
+            pending = next_pending
+            break
+        pending = next_pending
+    for hint in pending:
+        for score, unit, reasons, _ in scored_hint_candidates(hint, units, assigned_units)[:3]:
+            add_hint_candidate(unit, hint, score, reasons)
+
+
 def apply_matches(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    contexts_by_id = {clean(ctx.get("context_id")): ctx for ctx in contexts if clean(ctx.get("context_id"))}
+    apply_expense_hints(units, contexts)
     for unit in units:
         if unit.get("source_category") == "mobile":
             unit.update({
@@ -840,6 +1272,9 @@ def apply_matches(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -
                 "status": "confirmed",
                 "match_reason": "Mobile/telecom expenses are assigned to CORP-2026-ADMIN with Client = 通讯费.",
             })
+            normalize_admin_client(unit)
+            continue
+        if unit.get("auto_project_match") == "user_context_expense_hint" and unit.get("client_charge_code"):
             normalize_admin_client(unit)
             continue
         if unit.get("source_category") in {"other", "unknown"}:
@@ -855,26 +1290,38 @@ def apply_matches(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -
                 reason=typed_match["reason"],
             )
             continue
-        scored = sorted(
-            [(score_context(unit, ctx), ctx) for ctx in contexts],
-            key=lambda item: item[0],
-            reverse=True,
-        )
-        if scored and scored[0][0] >= 5:
+        scored = project_score_contexts(unit, contexts)
+        top_score = scored[0][0] if scored else 0
+        top_is_unique = bool(scored) and sum(1 for score, _ in scored if score == top_score) == 1
+        if top_is_unique and top_score >= 5:
             ctx = scored[0][1]
             matched_status = "needs_confirmation"
-            if scored[0][0] >= 7:
+            if top_score >= 7:
                 if unit.get("source_category") not in {"meal", "hotel", "taxi", "travel", "other", "unknown"}:
                     matched_status = "confirmed"
             unit.update({
                 "project_context_id": ctx.get("context_id", ""),
                 "client_name": ctx.get("client_name", ""),
                 "client_charge_code": ctx.get("client_charge_code", ""),
-                "confidence": "high" if scored[0][0] >= 7 else "medium",
+                "confidence": "high" if top_score >= 7 else "medium",
                 "status": matched_status,
-                "match_reason": f"Matched by date/city/context score {scored[0][0]}.",
+                "match_reason": f"Matched by date/city/context score {top_score}.",
             })
         normalize_admin_client(unit)
+    for unit in units:
+        if unit.get("client_charge_code") or clean(unit.get("source_category")) != "taxi":
+            continue
+        ctx = taxi_transfer_matches_travel_unit(unit, units, contexts_by_id)
+        if not ctx:
+            continue
+        apply_context_match(
+            unit,
+            ctx,
+            confidence="high",
+            status="confirmed",
+            auto_project_match="taxi_transfer_matches_travel_unit",
+            reason=f"Taxi airport/station transfer is within one day of a travel item assigned to project context {ctx.get('context_id', '')}.",
+        )
     return units
 
 
@@ -998,6 +1445,13 @@ def unit_brief(unit: dict[str, Any]) -> str:
         parts.append("暂未匹配项目")
     if unit.get("match_reason"):
         parts.append(f"判断依据 {unit.get('match_reason')}")
+    hint_candidates = unit.get("hint_candidates") or []
+    if hint_candidates:
+        top = hint_candidates[0]
+        parts.append(
+            f"可能对应用户记录 {top.get('summary', '')} "
+            f"(score {top.get('score', '')}: {'; '.join(top.get('reasons', []))})"
+        )
     return "；".join(part for part in parts if part)
 
 
@@ -1098,6 +1552,13 @@ def batch_item_line(unit: dict[str, Any]) -> str:
     note = clean(unit.get("source_note") or unit.get("expense_note"))
     if note:
         parts.append(f"备注 {note}")
+    hint_candidates = unit.get("hint_candidates") or []
+    if hint_candidates:
+        top = hint_candidates[0]
+        parts.append(
+            f"用户记录候选 {top.get('summary', '')} "
+            f"(score {top.get('score', '')}: {'; '.join(top.get('reasons', []))})"
+        )
     return "- " + " | ".join(parts)
 
 
@@ -1267,6 +1728,14 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
         source_category = unit.get("source_category")
         has_project = bool(unit.get("client_charge_code"))
         prompts: list[tuple[str, str]] = []
+        accounting_errors = mobile_accounting_errors(unit)
+        if accounting_errors:
+            prompts.append(
+                (
+                    "这项费用的会计归属存在明显冲突：非通讯费不能写“通讯费”、不能进 mobile 列；打车/交通费也不能归入 CORP-2026-ADMIN。请按实际项目重新确认 Client、Client Charge Code、金额列和 Note。",
+                    "这是硬性防呆规则，用于防止未匹配交通费被错误丢进通讯费/Admin。",
+                )
+            )
         date_prompt = date_prompt_for_unit(unit)
         if date_prompt:
             prompts.append(date_prompt)
