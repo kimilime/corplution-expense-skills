@@ -73,6 +73,8 @@ AMOUNT_COLUMNS = {
     "other": "L",
 }
 
+ALLOWED_SOURCE_CATEGORIES = {"hotel", "travel", "taxi", "meal", "mobile", "other"}
+
 
 PROOF_ORDER = {
     "flight": 1,
@@ -157,7 +159,7 @@ def load_layout(path: Path) -> dict[str, Any]:
 
 
 def load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -193,6 +195,11 @@ def mobile_accounting_errors(unit: dict[str, Any]) -> list[str]:
             errors.append("non-mobile expense cannot use Client = 通讯费")
         if MOBILE_CLIENT in note:
             errors.append("non-mobile expense cannot use a 通讯费 note")
+    else:
+        if final_column != "mobile":
+            errors.append("mobile expense must use the mobile amount column")
+        if clean(unit.get("client_charge_code")).upper() != ADMIN_CODE:
+            errors.append("mobile expense must be assigned to CORP-2026-ADMIN")
     project_expense_categories = {"hotel", "meal", "taxi", "travel"}
     if source_category in project_expense_categories or final_column in project_expense_categories:
         if clean(unit.get("client_charge_code")).upper() == ADMIN_CODE:
@@ -211,9 +218,197 @@ def formal_meal_column(unit: dict[str, Any]) -> str:
     return clean(unit.get("final_template_column")) or "meal"
 
 
+def is_shanghai_city(value: Any) -> bool:
+    text = clean(value).lower()
+    return "上海" in text or "shanghai" in text
+
+
+def is_ride_unit(unit: dict[str, Any]) -> bool:
+    return bool(
+        clean(unit.get("origin"))
+        or clean(unit.get("destination"))
+        or clean(unit.get("source_item_id"))
+        or clean(unit.get("document_subtype")) in {"didi_trip_report", "gaode_trip_report"}
+    )
+
+
+def formal_taxi_column(unit: dict[str, Any]) -> str:
+    if clean(unit.get("source_category")) not in {"taxi", "travel"} or not is_ride_unit(unit):
+        return clean(unit.get("final_template_column"))
+    city = clean(unit.get("city"))
+    if city and not is_shanghai_city(city):
+        return "travel"
+    if city:
+        return "taxi"
+    return clean(unit.get("final_template_column")) or ("taxi" if clean(unit.get("source_category")) == "taxi" else "travel")
+
+
+def formal_amount_column(unit: dict[str, Any]) -> str:
+    if clean(unit.get("source_category")) == "meal":
+        return formal_meal_column(unit)
+    if is_ride_unit(unit):
+        return formal_taxi_column(unit)
+    return clean(unit.get("final_template_column"))
+
+
 def contains_place_type_placeholder(note: Any) -> bool:
     text = clean(note)
     return "出发地类型" in text or "目的地类型" in text
+
+
+def strip_route_place(value: Any) -> str:
+    text = clean(value)
+    text = re.sub(r"^[A-Z]{0,3}\d{1,5}\s*[,，]?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^(高铁|动车|火车|铁路|飞机|航班|机票)\s*", "", text)
+    text = re.sub(r"\s*(二等座|一等座|商务座|硬座|软座|硬卧|软卧|经济舱|公务舱|头等舱).*$", "", text)
+    return text.strip(" ,，;；。()（）")
+
+
+def route_from_text(value: Any) -> str:
+    text = clean(value)
+    if not text:
+        return ""
+    match = re.search(r"（([^（）]+)）", text)
+    if match:
+        text = match.group(1)
+    for piece in re.split(r"[,，;；]", text):
+        match = re.search(r"(.+?)\s*(?:->|—|~|至|到|-)\s*(.+)", piece)
+        if match:
+            origin = strip_route_place(match.group(1))
+            destination = strip_route_place(match.group(2))
+            if origin and destination:
+                return f"{origin}-{destination}"
+    match = re.search(r"(.+?)\s*(?:->|—|~|至|到|-)\s*(.+)", text)
+    if match:
+        origin = strip_route_place(match.group(1))
+        destination = strip_route_place(match.group(2))
+        if origin and destination:
+            return f"{origin}-{destination}"
+    return ""
+
+
+def is_refund_fee(unit: dict[str, Any]) -> bool:
+    text = clean(" ".join([
+        unit.get("final_note", ""),
+        unit.get("source_note", ""),
+        unit.get("expense_note", ""),
+        unit.get("raw_remarks", ""),
+        unit.get("line_item_name", ""),
+        unit.get("seller_name", ""),
+    ]))
+    return any(keyword in text for keyword in ["退票费", "退票", "退款", "refund", "Refund", "cancellation"])
+
+
+def is_rail_ticket(unit: dict[str, Any]) -> bool:
+    subtype = clean(unit.get("document_subtype"))
+    text = clean(" ".join([unit.get("source_note", ""), unit.get("expense_note", ""), unit.get("final_note", "")]))
+    return subtype == "railway_e_ticket" or bool(re.match(r"^[GCDKZT]\d{1,5}\b", text, flags=re.IGNORECASE))
+
+
+def is_flight_ticket(unit: dict[str, Any]) -> bool:
+    text = clean(" ".join([
+        unit.get("document_subtype", ""),
+        unit.get("source_note", ""),
+        unit.get("expense_note", ""),
+        unit.get("final_note", ""),
+        unit.get("raw_remarks", ""),
+    ])).lower()
+    return any(keyword in text for keyword in ["飞机", "机票", "航班", "flight"])
+
+
+def ticket_note(unit: dict[str, Any]) -> str:
+    if clean(unit.get("origin")):
+        return ""
+    route = (
+        route_from_text(unit.get("route"))
+        or route_from_text(unit.get("source_note"))
+        or route_from_text(unit.get("expense_note"))
+        or route_from_text(unit.get("final_note"))
+    )
+    if not route:
+        return ""
+    if is_rail_ticket(unit):
+        prefix = "高铁退票费" if is_refund_fee(unit) else "高铁"
+    elif is_flight_ticket(unit):
+        prefix = "飞机退票费" if is_refund_fee(unit) else "飞机"
+    else:
+        return ""
+    return f"{prefix}（{route}）"
+
+
+def contains_raw_ticket_evidence(note: Any) -> bool:
+    text = clean(note)
+    return bool(
+        "->" in text
+        or re.search(r"\b[GCDKZT]\d{1,5}\b", text, flags=re.IGNORECASE)
+        or any(keyword in text for keyword in ["二等座", "一等座", "商务座", "经济舱", "公务舱", "头等舱"])
+    )
+
+
+def taxi_template_note(unit: dict[str, Any]) -> str:
+    if clean(unit.get("source_category")) not in {"taxi", "travel"} or not clean(unit.get("origin")):
+        return ""
+    origin_type = clean(unit.get("origin_place_type"))
+    dest_type = clean(unit.get("destination_place_type"))
+    if not origin_type or not dest_type:
+        return ""
+    suffix = "（加班）" if clean(unit.get("business_reason")) == "overtime" else ""
+    return f"打车（{origin_type}-{dest_type}）{suffix}"
+
+
+def meal_template_note(unit: dict[str, Any]) -> str:
+    if clean(unit.get("source_category")) != "meal":
+        return ""
+    note = clean(unit.get("final_note") or unit.get("expense_note") or unit.get("source_note"))
+    allowed_prefixes = (C["trip_meal"], "出差餐费（高铁站/机场）", C["overtime_meal"])
+    if note.startswith(allowed_prefixes):
+        return note
+    context = clean(unit.get("meal_context"))
+    if context == "overtime":
+        return C["overtime_meal"]
+    if context == "station_airport":
+        return "出差餐费（高铁站/机场）"
+    return C["trip_meal"]
+
+
+def hotel_template_note(unit: dict[str, Any]) -> str:
+    if clean(unit.get("source_category")) != "hotel":
+        return ""
+    note = clean(unit.get("final_note") or unit.get("expense_note") or unit.get("source_note"))
+    if note.startswith("出差酒店") and "晚" in note:
+        return note
+    nights = clean(unit.get("hotel_nights")) or "X"
+    checkin = clean(unit.get("check_in_date")) or "入住日"
+    checkout = clean(unit.get("check_out_date")) or "离店日"
+    return f"出差酒店（{nights}晚，{checkin}-{checkout}）"
+
+
+def mobile_template_note(unit: dict[str, Any]) -> str:
+    if clean(unit.get("source_category")) != "mobile":
+        return ""
+    note = clean(unit.get("final_note") or unit.get("expense_note") or unit.get("source_note"))
+    if "通讯费" in note:
+        return note
+    period = clean(unit.get("billing_period"))
+    if period and len(period) >= 6 and period[:4].isdigit() and period[4:6].isdigit():
+        return f"{int(period[4:6])}月通讯费"
+    return "X月通讯费"
+
+
+def normalized_note_base(unit: dict[str, Any]) -> str:
+    note = clean(unit.get("final_note") or unit.get("expense_note") or unit.get("source_note"))
+    template_note = ticket_note(unit)
+    source_note = clean(unit.get("source_note") or unit.get("expense_note"))
+    if template_note and (not note or note == source_note or contains_raw_ticket_evidence(note)):
+        return template_note
+    taxi_note = taxi_template_note(unit)
+    if taxi_note and (not note or note == source_note or "->" in note or contains_place_type_placeholder(note)):
+        return taxi_note
+    for note_builder in (meal_template_note, hotel_template_note, mobile_template_note):
+        built = note_builder(unit)
+        if built:
+            return built
+    return note
 
 
 def note_placeholder_errors(unit: dict[str, Any]) -> list[str]:
@@ -227,6 +422,35 @@ def note_placeholder_errors(unit: dict[str, Any]) -> list[str]:
         and (not clean(unit.get("origin_place_type")) or not clean(unit.get("destination_place_type")))
     ):
         errors.append("confirmed taxi/travel item requires origin_place_type and destination_place_type")
+    if clean(unit.get("status")) in {"confirmed", "fixed"} and (is_rail_ticket(unit) or is_flight_ticket(unit)):
+        if not ticket_note(unit):
+            errors.append("rail/flight item requires route evidence for the final note template")
+        elif contains_raw_ticket_evidence(unit.get("final_note")):
+            unit["final_note"] = ticket_note(unit)
+    return errors
+
+
+def stage3_rule_errors(unit: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    category = clean(unit.get("source_category"))
+    if category not in ALLOWED_SOURCE_CATEGORIES:
+        errors.append(f"unsupported source_category: {category or '<blank>'}")
+
+    visible_column = formal_amount_column(unit)
+    if visible_column not in AMOUNT_COLUMNS:
+        errors.append(f"invalid final amount column: {visible_column or '<blank>'}")
+    if (is_rail_ticket(unit) or is_flight_ticket(unit)) and visible_column != "travel":
+        errors.append("rail/flight items must use the travel amount column")
+    if category == "hotel" and visible_column != "hotel":
+        errors.append("hotel expenses must use the hotel amount column")
+    if category == "mobile" and visible_column != "mobile":
+        errors.append("mobile expenses must use the mobile amount column")
+
+    if not normalized_note_base(unit) and category != "other":
+        errors.append("final note cannot be derived from the confirmed allocation")
+    if parse_date(unit.get("expense_date")) is None:
+        errors.append("expense_date must be a valid YYYY-MM-DD date before writing the workbook")
+
     return errors
 
 
@@ -277,13 +501,15 @@ def date_in_context(unit_date: Any, ctx: dict[str, Any]) -> bool:
 
 
 def route_endpoints(unit: dict[str, Any]) -> tuple[str, str]:
-    route = clean(unit.get("route") or unit.get("source_note") or unit.get("expense_note") or unit.get("final_note"))
+    route = (
+        route_from_text(unit.get("route"))
+        or route_from_text(unit.get("source_note"))
+        or route_from_text(unit.get("expense_note"))
+        or route_from_text(unit.get("final_note"))
+    )
     if not route:
         return "", ""
-    match = re.search(r"（([^（）]+)）", route)
-    if match:
-        route = match.group(1)
-    parts = re.split(r"\s*(?:->|-|—|~|至|到)\s*", route, maxsplit=1)
+    parts = route.split("-", 1)
     if len(parts) == 2:
         return clean(parts[0]), clean(parts[1])
     return "", ""
@@ -340,6 +566,8 @@ def require_ready(allocation: dict[str, Any], allow_unconfirmed: bool) -> list[s
             errors.append(f"{unit.get('unit_id')} accounting conflict: {accounting_error}.")
         for note_error in note_placeholder_errors(unit):
             errors.append(f"{unit.get('unit_id')} note conflict: {note_error}.")
+        for rule_error in stage3_rule_errors(unit):
+            errors.append(f"{unit.get('unit_id')} stage-3 rule conflict: {rule_error}.")
         destination_ctx = travel_destination_context(unit, contexts)
         if destination_ctx and not assignment_matches_context(unit, destination_ctx):
             errors.append(
@@ -353,6 +581,24 @@ def require_ready(allocation: dict[str, Any], allow_unconfirmed: bool) -> list[s
             if not unit.get(field):
                 errors.append(f"{unit.get('unit_id')} missing {field}.")
     return errors
+
+
+def print_stage3_preflight_summary(allocation: dict[str, Any], errors: list[str]) -> None:
+    included = [
+        unit for unit in allocation.get("allocation_units", [])
+        if unit.get("status") not in {"dropped", "excluded", "non_reimbursable"}
+    ]
+    open_questions = [q for q in allocation.get("questions", []) if q.get("status", "open") == "open"]
+    print("\nSTAGE 3 PREFLIGHT CHECK TO SHOW IN CHAT")
+    print(f"units={len(included)} open_questions={len(open_questions)} blocking_errors={len(errors)}")
+    if errors:
+        print("ACTION REQUIRED: Do not write the initial reimbursement workbook until these allocation issues are fixed.")
+        for error in errors[:20]:
+            print(f"- {error}")
+        if len(errors) > 20:
+            print(f"- ... {len(errors) - 20} more error(s)")
+        return
+    print("OK: allocation is structurally ready for initial workbook generation.")
 
 
 def included_units(allocation: dict[str, Any]) -> list[dict[str, Any]]:
@@ -371,11 +617,13 @@ def proof_type(unit: dict[str, Any]) -> str:
     source = unit.get("source_category", "")
     seller = clean(unit.get("seller_name", ""))
     source_doc = clean(unit.get("source_note", ""))
-    if subtype == "railway_e_ticket" or source == "rail" or "高铁" in source_doc:
+    if is_flight_ticket(unit) or source == "flight":
+        return "flight"
+    if is_rail_ticket(unit) or subtype == "railway_e_ticket" or source == "rail" or "高铁" in source_doc:
         return "rail"
     if source == "hotel":
         return "hotel"
-    if "高德" in seller or "高德" in source_doc:
+    if subtype == "gaode_trip_report" or "高德" in seller or "高德" in source_doc:
         return "gaode"
     if unit.get("source_item_id") or "滴滴" in seller or "Didi" in source_doc:
         return "taxi_didi"
@@ -446,7 +694,7 @@ def assign_proof_numbers(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 
 def final_note(unit: dict[str, Any]) -> str:
-    note = clean(unit.get("final_note") or unit.get("expense_note") or unit.get("source_note"))
+    note = normalized_note_base(unit)
     if unit.get("is_substitute_invoice") and C["substitute"] not in note:
         note += C["substitute"]
     invoice = Decimal(invoice_amount(unit))
@@ -458,7 +706,7 @@ def final_note(unit: dict[str, Any]) -> str:
 
 def expense_nature(unit: dict[str, Any]) -> str:
     city = clean(unit.get("city"))
-    amount_column = formal_meal_column(unit) if unit.get("source_category") == "meal" else unit.get("final_template_column", "")
+    amount_column = formal_amount_column(unit)
     if amount_column == "mobile":
         return C["local"]
     if amount_column in {"hotel", "travel"}:
@@ -474,7 +722,7 @@ def expense_nature(unit: dict[str, Any]) -> str:
 def make_rows(units: list[dict[str, Any]], requester: str) -> list[dict[str, Any]]:
     rows = []
     for unit in units:
-        amount_col = formal_meal_column(unit) if unit.get("source_category") == "meal" else unit.get("final_template_column")
+        amount_col = formal_amount_column(unit)
         amount_col = amount_col or "other"
         if amount_col not in AMOUNT_COLUMNS:
             amount_col = "other"
@@ -1264,6 +1512,67 @@ def aggregate_check_status(checks: list[dict[str, Any]]) -> str:
     return "ok"
 
 
+def checks_requiring_confirmation(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = []
+    checks.extend(check for check in payload.get("meal_daily_cap_checks", []) if check.get("requires_user_confirmation"))
+    checks.extend(check for check in payload.get("hotel_cap_checks", []) if check.get("requires_user_confirmation"))
+    return checks
+
+
+def advisory_checks(payload: dict[str, Any]) -> list[dict[str, Any]]:
+    checks: list[dict[str, Any]] = []
+    checks.extend(
+        check for check in payload.get("meal_daily_cap_checks", [])
+        if check.get("severity") == "advisory" or check.get("advisory")
+    )
+    checks.extend(
+        check for check in payload.get("hotel_cap_checks", [])
+        if check.get("severity") == "advisory" or check.get("advisory")
+    )
+    return checks
+
+
+def print_stage3_review_summary(payload: dict[str, Any]) -> None:
+    blocking = checks_requiring_confirmation(payload)
+    advisory = advisory_checks(payload)
+    print("\nSTAGE 3 REVIEW SUMMARY TO SHOW IN CHAT")
+    print(
+        "meal_daily_caps="
+        f"{payload['checks'][0]['status']} "
+        f"({payload['checks'][0]['days_requiring_confirmation']} requiring confirmation, "
+        f"{payload['checks'][0]['days_with_advisory']} advisory)"
+    )
+    print(
+        "hotel_caps="
+        f"{payload['checks'][1]['status']} "
+        f"({payload['checks'][1]['items_requiring_confirmation']} requiring confirmation, "
+        f"{payload['checks'][1]['items_with_advisory']} advisory)"
+    )
+    if blocking:
+        print("ACTION REQUIRED: The workbook was written, but final submission is blocked until these checks are confirmed in chat.")
+        for check in blocking:
+            label = check.get("policy_name") or check.get("policy") or "policy_check"
+            date_or_item = check.get("date") or (check.get("items") or [{}])[0].get("user_no") or "-"
+            print(
+                f"- {label} {date_or_item}: total {check.get('total')} / "
+                f"cap {check.get('cap') or check.get('cap_total') or '?'} / "
+                f"over {check.get('over_by')} / {check.get('status')}"
+            )
+        return
+    if advisory:
+        print("ADVISORY: No blocking cap issue, but the following checks should still be summarized for the applicant.")
+        for check in advisory:
+            label = check.get("policy_name") or check.get("policy") or "policy_check"
+            date_or_item = check.get("date") or (check.get("items") or [{}])[0].get("user_no") or "-"
+            print(
+                f"- {label} {date_or_item}: total {check.get('total')} / "
+                f"cap {check.get('cap') or check.get('cap_total') or '?'} / "
+                f"over {check.get('over_by')} / {check.get('status')}"
+            )
+        return
+    print("OK: No meal or hotel cap issue requiring applicant attention.")
+
+
 def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Write reimbursement workbook from stage-2 allocation JSON.")
     parser.add_argument("--allocation", required=True, help="Path to process/expense-allocation.json.")
@@ -1301,6 +1610,7 @@ def main(argv: list[str] | None = None) -> int:
 
     allocation = load_json(allocation_path)
     errors = require_ready(allocation, args.allow_unconfirmed)
+    print_stage3_preflight_summary(allocation, errors)
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
@@ -1364,6 +1674,10 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote {process_dir / 'final-expense-rows.md'}")
     print_meal_cap_check(meal_checks)
     print_hotel_cap_check(hotel_checks)
+    print_stage3_review_summary(payload)
+    if checks_requiring_confirmation(payload):
+        print("ERROR: Stage 3 policy checks require applicant confirmation before final submission.", file=sys.stderr)
+        return 3
     return 0
 
 

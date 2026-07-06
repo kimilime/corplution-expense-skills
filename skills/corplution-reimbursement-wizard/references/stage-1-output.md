@@ -7,7 +7,7 @@ Use this reference when generating or revising `process/invoice-extraction.md` a
 - PDF invoices with selectable text.
 - Scan-only PDFs.
 - Image invoices such as PNG, JPG, JPEG, HEIC, TIFF.
-- Support documents, especially Didi trip reports.
+- Support documents, especially Didi/Gaode trip reports.
 - Optional user hints such as requester, reimbursement period, client, project, or known trip context.
 
 ## Output Folder
@@ -26,7 +26,7 @@ The list must identify each source file with:
 
 - simple item number, such as `第1张`; do not expose `DOC-001` as the primary user handle
 - original source filename
-- document role and type, such as invoice, railway e-ticket, Didi trip report, or unknown
+- document role and type, such as invoice, railway e-ticket, Didi/Gaode trip report, or unknown
 - invoice number when available
 - seller/service provider when available
 - date, amount, first-pass category, and review status
@@ -90,7 +90,7 @@ Classification fields:
 
 Keep `invoice.issue_date` as the formal invoice date. Do not copy it into `classification.expense_date` for ordinary invoices, meal invoices, taxi summary invoices, hotel invoices without stay dates, or `other`/`unknown` invoices. Stage 2 will ask the applicant for the actual date when it is not reliable.
 
-Didi trip reports additionally need:
+Didi/Gaode trip reports additionally need:
 
 - `report_date`
 - `traveler_phone`
@@ -100,7 +100,7 @@ Didi trip reports additionally need:
 - `item_count`
 - `supporting_items`
 
-Each Didi trip item should include:
+Each Didi/Gaode trip item should include:
 
 - `item_id`
 - `ride_datetime`
@@ -209,11 +209,12 @@ Documents needing review: N
 Create `document_links` for:
 
 - `invoice_total_matches_didi_trip_report`
+- `invoice_total_matches_gaode_trip_report`
 - `invoice_supports_schedule`
 - `duplicate_source_file`
 - `possible_duplicate_invoice_no`
 
-For Didi, link summary invoice and trip report when total amounts match. Generate later reimbursement rows from the trip items, not from the summary invoice, when a matching trip report exists.
+For Didi/Gaode, link summary invoice and trip report when total amounts match. Generate later reimbursement rows from the trip items, not from the summary invoice, when a matching trip report exists.
 
 ## Completion Criteria
 
@@ -221,8 +222,8 @@ Stage 1 is complete only when:
 
 - Every input file appears in the document index.
 - Every invoice-like file has extracted fields or review issues.
-- Every Didi trip report has parsed trip items and a reported total when available.
-- Didi summary invoices are linked to matching trip reports when possible.
+- Every Didi/Gaode trip report has parsed trip items and a reported total when available.
+- Didi/Gaode summary invoices are linked to matching trip reports when possible.
 - All amounts and dates are normalized.
 - Markdown and JSON outputs agree.
 - The applicant-facing extraction review list has been printed or summarized in chat.

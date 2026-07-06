@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import re
 import shutil
 from datetime import datetime
 from pathlib import Path
@@ -95,7 +96,7 @@ CORRECTION_META_FIELDS = {
 
 
 def load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -122,6 +123,11 @@ def is_mobile_admin_unit(unit: dict[str, Any]) -> bool:
     return unit.get("source_category") == "mobile" or unit.get("final_template_column") == "mobile"
 
 
+def is_shanghai_city(value: Any) -> bool:
+    text = clean(value).lower()
+    return "上海" in text or "shanghai" in text
+
+
 def formal_meal_column(unit: dict[str, Any]) -> str:
     if clean(unit.get("source_category")) != "meal":
         return clean(unit.get("final_template_column"))
@@ -138,9 +144,139 @@ def normalize_meal_column(unit: dict[str, Any]) -> None:
         unit["final_template_column"] = formal_meal_column(unit)
 
 
+def is_ride_unit(unit: dict[str, Any]) -> bool:
+    return bool(
+        clean(unit.get("origin"))
+        or clean(unit.get("destination"))
+        or clean(unit.get("source_item_id"))
+        or clean(unit.get("document_subtype")) in {"didi_trip_report", "gaode_trip_report"}
+    )
+
+
+def formal_taxi_column(unit: dict[str, Any]) -> str:
+    source_category = clean(unit.get("source_category"))
+    if source_category not in {"taxi", "travel"} or not is_ride_unit(unit):
+        return clean(unit.get("final_template_column"))
+    city = clean(unit.get("city"))
+    if city and not is_shanghai_city(city):
+        return "travel"
+    if city:
+        return "taxi"
+    return clean(unit.get("final_template_column")) or ("taxi" if source_category == "taxi" else "travel")
+
+
+def normalize_taxi_column(unit: dict[str, Any]) -> None:
+    if clean(unit.get("source_category")) in {"taxi", "travel"} and is_ride_unit(unit):
+        unit["final_template_column"] = formal_taxi_column(unit)
+
+
 def contains_place_type_placeholder(note: Any) -> bool:
     text = clean(note)
     return "出发地类型" in text or "目的地类型" in text
+
+
+def strip_route_place(value: Any) -> str:
+    text = clean(value)
+    text = re.sub(r"^[A-Z]{0,3}\d{1,5}\s*[,，]?\s*", "", text, flags=re.IGNORECASE)
+    text = re.sub(r"^(高铁|动车|火车|铁路|飞机|航班|机票)\s*", "", text)
+    text = re.sub(r"\s*(二等座|一等座|商务座|硬座|软座|硬卧|软卧|经济舱|公务舱|头等舱).*$", "", text)
+    return text.strip(" ,，;；。()（）")
+
+
+def route_from_text(value: Any) -> str:
+    text = clean(value)
+    if not text:
+        return ""
+    match = re.search(r"（([^（）]+)）", text)
+    if match:
+        text = match.group(1)
+    for piece in re.split(r"[,，;；]", text):
+        match = re.search(r"(.+?)\s*(?:->|—|~|至|到|-)\s*(.+)", piece)
+        if match:
+            origin = strip_route_place(match.group(1))
+            destination = strip_route_place(match.group(2))
+            if origin and destination:
+                return f"{origin}-{destination}"
+    match = re.search(r"(.+?)\s*(?:->|—|~|至|到|-)\s*(.+)", text)
+    if match:
+        origin = strip_route_place(match.group(1))
+        destination = strip_route_place(match.group(2))
+        if origin and destination:
+            return f"{origin}-{destination}"
+    return ""
+
+
+def is_refund_fee(unit: dict[str, Any]) -> bool:
+    text = clean(" ".join([
+        unit.get("final_note", ""),
+        unit.get("source_note", ""),
+        unit.get("expense_note", ""),
+        unit.get("raw_remarks", ""),
+        unit.get("line_item_name", ""),
+        unit.get("seller_name", ""),
+    ]))
+    return any(keyword in text for keyword in ["退票费", "退票", "退款", "refund", "Refund", "cancellation"])
+
+
+def is_rail_ticket(unit: dict[str, Any]) -> bool:
+    subtype = clean(unit.get("document_subtype"))
+    text = clean(" ".join([unit.get("source_note", ""), unit.get("expense_note", ""), unit.get("final_note", "")]))
+    return subtype == "railway_e_ticket" or bool(re.match(r"^[GCDKZT]\d{1,5}\b", text, flags=re.IGNORECASE))
+
+
+def is_flight_ticket(unit: dict[str, Any]) -> bool:
+    text = clean(" ".join([
+        unit.get("document_subtype", ""),
+        unit.get("source_note", ""),
+        unit.get("expense_note", ""),
+        unit.get("final_note", ""),
+        unit.get("raw_remarks", ""),
+    ])).lower()
+    return any(keyword in text for keyword in ["飞机", "机票", "航班", "flight"])
+
+
+def ticket_note(unit: dict[str, Any]) -> str:
+    if clean(unit.get("origin")):
+        return ""
+    route = (
+        route_from_text(unit.get("route"))
+        or route_from_text(unit.get("source_note"))
+        or route_from_text(unit.get("expense_note"))
+        or route_from_text(unit.get("final_note"))
+    )
+    if not route:
+        return ""
+    if is_rail_ticket(unit):
+        prefix = "高铁退票费" if is_refund_fee(unit) else "高铁"
+    elif is_flight_ticket(unit):
+        prefix = "飞机退票费" if is_refund_fee(unit) else "飞机"
+    else:
+        return ""
+    return f"{prefix}（{route}）"
+
+
+def contains_raw_ticket_evidence(note: Any) -> bool:
+    text = clean(note)
+    return bool(
+        "->" in text
+        or re.search(r"\b[GCDKZT]\d{1,5}\b", text, flags=re.IGNORECASE)
+        or any(keyword in text for keyword in ["二等座", "一等座", "商务座", "经济舱", "公务舱", "头等舱"])
+    )
+
+
+def refresh_ticket_note(unit: dict[str, Any], update: dict[str, Any]) -> None:
+    note = ticket_note(unit)
+    if not note:
+        return
+    current = clean(unit.get("final_note"))
+    source_note = clean(unit.get("source_note") or unit.get("expense_note"))
+    if (
+        "final_note" not in update
+        or not current
+        or current == source_note
+        or contains_raw_ticket_evidence(current)
+    ):
+        unit["final_note"] = note
 
 
 def taxi_note(unit: dict[str, Any]) -> str:
@@ -181,6 +317,11 @@ def note_placeholder_errors(unit: dict[str, Any]) -> list[str]:
         and (not clean(unit.get("origin_place_type")) or not clean(unit.get("destination_place_type")))
     ):
         errors.append("confirmed taxi/travel item requires origin_place_type and destination_place_type")
+    if clean(unit.get("status")) in {"confirmed", "fixed"} and (is_rail_ticket(unit) or is_flight_ticket(unit)):
+        if not ticket_note(unit):
+            errors.append("rail/flight item requires route evidence for the final note template")
+        elif contains_raw_ticket_evidence(unit.get("final_note")):
+            errors.append("rail/flight final_note must use the finance template, not raw ticket evidence")
     return errors
 
 
@@ -353,7 +494,9 @@ def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: boo
         unit[field] = value
 
     normalize_meal_column(unit)
+    normalize_taxi_column(unit)
     refresh_taxi_note(unit, update)
+    refresh_ticket_note(unit, update)
 
     if "expense_date" in update and clean(unit.get("expense_date")):
         unit["date_required"] = False

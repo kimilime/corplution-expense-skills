@@ -33,6 +33,7 @@ C = {
     "lower": "\u5c0f\u5199",
     "remarks": "\u5907\u6ce8",
     "didi": "\u6ef4\u6ef4",
+    "gaode": "\u9ad8\u5fb7",
     "didi_trip_title": "\u6ef4\u6ef4\u51fa\u884c-\u884c\u7a0b\u5355",
     "trip_table": "DIDI TRAVEL - TRIP TABLE",
     "trip_count": "\u7b14\u884c\u7a0b",
@@ -65,6 +66,7 @@ ROLE_LABELS = {
 
 SUBTYPE_LABELS = {
     "didi_trip_report": C["didi"] + "\u884c\u7a0b\u5355",
+    "gaode_trip_report": C["gaode"] + "\u884c\u7a0b\u5355",
     "railway_e_ticket": C["railway_ticket"],
     "vat_special_invoice": C["vat_special_invoice"],
     "invoice_unknown_subtype": C["ordinary_invoice"],
@@ -340,6 +342,11 @@ def parse_invoice_type(text: str) -> str:
 def classify_role_and_subtype(text: str, tables: list[list[list[str]]]) -> tuple[str, str]:
     normalized = clean(text)
     if (
+        C["gaode"] in normalized
+        and ("\u884c\u7a0b\u5355" in normalized or "\u884c\u7a0b\u62a5\u9500" in normalized or "\u884c\u7a0b\u660e\u7ec6" in normalized)
+    ):
+        return "supporting_schedule", "gaode_trip_report"
+    if (
         C["didi_trip_title"] in normalized
         or C["trip_table"] in normalized
         or (C["trip_count"] in normalized and C["boarding_time"] in normalized and C["origin"] in normalized)
@@ -434,6 +441,8 @@ def classify_expense(text: str, seller_name: str, line_item: str, subtype: str) 
         return "travel", "Railway e-ticket invoice."
     if C["didi"] in haystack and (C["passenger_transport"] in haystack or C["travel_service"] in haystack):
         return "taxi", "Didi passenger transport summary invoice."
+    if C["gaode"] in haystack and (C["passenger_transport"] in haystack or C["travel_service"] in haystack):
+        return "taxi", "Gaode passenger transport summary invoice."
     if C["lodging_service"] in haystack or C["hotel"] in seller_name:
         return "hotel", "Lodging or hotel service."
     if C["meal_service"] in haystack:
@@ -470,6 +479,8 @@ def note_for_invoice(text: str, invoice: dict[str, str], category: str, subtype:
         return clean(", ".join(parts))
     if C["didi"] in (seller + text):
         return "Didi passenger transport summary invoice"
+    if C["gaode"] in (seller + text):
+        return "Gaode passenger transport summary invoice"
     return clean(seller or line_item)
 
 
@@ -532,7 +543,19 @@ def parse_invoice(text: str, tables: list[list[list[str]]], subtype: str) -> dic
     return invoice
 
 
-def parse_didi_report(text: str, tables: list[list[list[str]]], document_id: str) -> tuple[dict[str, str], list[dict[str, Any]]]:
+def column_index(header: list[str], candidates: list[str]) -> int | None:
+    for idx, cell in enumerate(header):
+        if any(candidate in cell for candidate in candidates):
+            return idx
+    return None
+
+
+def parse_ride_report(
+    text: str,
+    tables: list[list[list[str]]],
+    document_id: str,
+    provider: str,
+) -> tuple[dict[str, str], list[dict[str, Any]]]:
     report_date = date_from_dash(regex_first(r"\u7533\u8bf7\u65e5\u671f\s*[:\uff1a]\s*([0-9]{4}-[0-9]{1,2}-[0-9]{1,2})", text))
     period_match = re.search(r"\u884c\u7a0b\u8d77\u6b62\u65e5\u671f\s*[:\uff1a]\s*([0-9]{4}-[0-9]{1,2}-[0-9]{1,2})\s*\u81f3\s*([0-9]{4}-[0-9]{1,2}-[0-9]{1,2})", text or "")
     period_start = date_from_dash(period_match.group(1)) if period_match else ""
@@ -546,24 +569,33 @@ def parse_didi_report(text: str, tables: list[list[list[str]]], document_id: str
         if not table:
             continue
         header = [compact(cell) for cell in table[0]]
-        if not any(C["boarding_time"] in cell for cell in header):
+        time_idx = column_index(header, [C["boarding_time"], "\u7528\u8f66\u65f6\u95f4", "\u884c\u7a0b\u65f6\u95f4", "\u5f00\u59cb\u65f6\u95f4"])
+        city_idx = column_index(header, ["\u57ce\u5e02", "\u7528\u8f66\u57ce\u5e02"])
+        origin_idx = column_index(header, [C["origin"], "\u4e0a\u8f66\u5730\u70b9", "\u51fa\u53d1\u5730"])
+        dest_idx = column_index(header, [C["destination"], "\u4e0b\u8f66\u5730\u70b9", "\u76ee\u7684\u5730"])
+        distance_idx = column_index(header, ["\u91cc\u7a0b", "\u8ddd\u79bb"])
+        amount_idx = column_index(header, [C["amount_yuan"], "\u91d1\u989d", "\u8d39\u7528", "\u5b9e\u4ed8"])
+        vehicle_idx = column_index(header, ["\u8f66\u578b", "\u7528\u8f66\u7c7b\u578b", "\u670d\u52a1\u7c7b\u578b"])
+        if time_idx is None or origin_idx is None or dest_idx is None or amount_idx is None:
             continue
-        for row in table[1:]:
-            if len(row) < 8:
+        for row_number, row in enumerate(table[1:], start=1):
+            if len(row) <= max(idx for idx in [time_idx, origin_idx, dest_idx, amount_idx] if idx is not None):
                 continue
             seq = clean(row[0])
             if not seq or not seq.isdigit():
+                seq = str(row_number)
+            vehicle_type = clean(row[vehicle_idx]) if vehicle_idx is not None and len(row) > vehicle_idx else ""
+            ride_time_raw = clean(row[time_idx])
+            city = compact(clean(row[city_idx])) if city_idx is not None and len(row) > city_idx else ""
+            origin = clean(row[origin_idx])
+            destination = clean(row[dest_idx])
+            distance = money(row[distance_idx]) if distance_idx is not None and len(row) > distance_idx else ""
+            amount = money(row[amount_idx])
+            if not amount:
                 continue
-            vehicle_type = clean(row[1])
-            ride_time_raw = clean(row[2])
-            city = compact(clean(row[3]))
-            origin = clean(row[4])
-            destination = clean(row[5])
-            distance = money(row[6])
-            amount = money(row[7])
             ride_datetime = didi_datetime(ride_time_raw, period_start, period_end)
             category = "taxi" if C["shanghai"] in city else "travel"
-            note = clean(f"Didi {city}: {origin} -> {destination}")
+            note = clean(f"{provider} {city}: {origin} -> {destination}")
             items.append({
                 "item_id": f"{document_id}-ITEM-{int(seq):03d}",
                 "ride_datetime": ride_datetime,
@@ -586,6 +618,14 @@ def parse_didi_report(text: str, tables: list[list[list[str]]], document_id: str
         "item_count": int(count_text) if count_text.isdigit() else len(items),
     }
     return schedule, items
+
+
+def parse_didi_report(text: str, tables: list[list[list[str]]], document_id: str) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    return parse_ride_report(text, tables, document_id, "Didi")
+
+
+def parse_gaode_report(text: str, tables: list[list[list[str]]], document_id: str) -> tuple[dict[str, str], list[dict[str, Any]]]:
+    return parse_ride_report(text, tables, document_id, C["gaode"])
 
 
 def didi_datetime(raw: str, period_start: str, period_end: str) -> str:
@@ -643,22 +683,27 @@ def extract_document(document_id: str, path: Path) -> dict[str, Any]:
     if source.method == "manual_review":
         doc["needs_review"] = True
 
-    if role == "supporting_schedule" and subtype == "didi_trip_report":
-        schedule, items = parse_didi_report(text, source.tables, document_id)
+    if role == "supporting_schedule" and subtype in {"didi_trip_report", "gaode_trip_report"}:
+        provider = C["gaode"] if subtype == "gaode_trip_report" else C["didi"]
+        schedule, items = (
+            parse_gaode_report(text, source.tables, document_id)
+            if subtype == "gaode_trip_report"
+            else parse_didi_report(text, source.tables, document_id)
+        )
         doc["supporting_schedule"] = schedule
         doc["supporting_items"] = items
         doc["classification"] = {
             "expense_category": "travel" if any(item.get("expense_category") == "travel" for item in items) else "taxi",
             "expense_date": schedule.get("period_start", ""),
             "expense_date_source": "trip_report_period_start" if schedule.get("period_start") else "",
-            "expense_note": "Didi trip report",
+            "expense_note": f"{provider} trip report",
             "reason": "Trip report parsed into ride-level support items.",
         }
         if schedule.get("item_count") and schedule.get("item_count") != len(items):
             doc["issues"].append({
                 "field": "supporting_items",
                 "problem": f"Reported item count is {schedule.get('item_count')} but parsed {len(items)} rows.",
-                "suggested_action": "Inspect the Didi trip table manually.",
+                "suggested_action": f"Inspect the {provider} trip table manually.",
             })
         if schedule.get("reported_total_amount"):
             parsed_total = sum(Decimal(item["amount"]) for item in items if item.get("amount"))
@@ -666,7 +711,7 @@ def extract_document(document_id: str, path: Path) -> dict[str, Any]:
                 doc["issues"].append({
                     "field": "reported_total_amount",
                     "problem": f"Reported total {schedule['reported_total_amount']} does not equal parsed total {parsed_total:.2f}.",
-                    "suggested_action": "Verify all Didi rows were parsed.",
+                    "suggested_action": f"Verify all {provider} rows were parsed.",
                 })
         doc["confidence"] = 0.95 if items else 0.65
 
@@ -749,31 +794,35 @@ def build_links_and_reviews(documents: list[dict[str, Any]]) -> tuple[list[dict[
             else:
                 seen_invoice_numbers[invoice_no] = doc["document_id"]
 
-    didi_invoices = [
-        doc for doc in documents
-        if doc.get("document_role") == "invoice"
-        and doc.get("invoice")
-        and (C["didi"] in ((doc["invoice"].get("seller_name") or "") + (doc["classification"].get("expense_note") or "")) or "Didi" in (doc["classification"].get("expense_note") or ""))
-    ]
-    didi_schedules = [
-        doc for doc in documents
-        if doc.get("document_subtype") == "didi_trip_report" and doc.get("supporting_schedule")
-    ]
-    for invoice_doc in didi_invoices:
-        amount = (invoice_doc.get("invoice") or {}).get("total_amount")
-        for schedule_doc in didi_schedules:
-            schedule_amount = (schedule_doc.get("supporting_schedule") or {}).get("reported_total_amount")
-            if amount and schedule_amount and amount == schedule_amount:
-                links.append({
-                    "source_document_id": invoice_doc["document_id"],
-                    "target_document_id": schedule_doc["document_id"],
-                    "relation": "invoice_total_matches_didi_trip_report",
-                    "check": {
-                        "source_amount": amount,
-                        "target_amount": schedule_amount,
-                        "matched": True,
-                    },
-                })
+    for provider_key, provider_name in [("didi", C["didi"]), ("gaode", C["gaode"])]:
+        provider_invoices = [
+            doc for doc in documents
+            if doc.get("document_role") == "invoice"
+            and doc.get("invoice")
+            and (
+                provider_name in ((doc["invoice"].get("seller_name") or "") + (doc["classification"].get("expense_note") or ""))
+                or provider_key.title() in (doc["classification"].get("expense_note") or "")
+            )
+        ]
+        provider_schedules = [
+            doc for doc in documents
+            if doc.get("document_subtype") == f"{provider_key}_trip_report" and doc.get("supporting_schedule")
+        ]
+        for invoice_doc in provider_invoices:
+            amount = (invoice_doc.get("invoice") or {}).get("total_amount")
+            for schedule_doc in provider_schedules:
+                schedule_amount = (schedule_doc.get("supporting_schedule") or {}).get("reported_total_amount")
+                if amount and schedule_amount and amount == schedule_amount:
+                    links.append({
+                        "source_document_id": invoice_doc["document_id"],
+                        "target_document_id": schedule_doc["document_id"],
+                        "relation": f"invoice_total_matches_{provider_key}_trip_report",
+                        "check": {
+                            "source_amount": amount,
+                            "target_amount": schedule_amount,
+                            "matched": True,
+                        },
+                    })
 
     for doc in documents:
         for issue in doc.get("issues", []):
@@ -854,6 +903,8 @@ def document_seller(doc: dict[str, Any]) -> str:
         return invoice["seller_name"]
     if doc.get("document_subtype") == "didi_trip_report":
         return C["didi"]
+    if doc.get("document_subtype") == "gaode_trip_report":
+        return C["gaode"]
     return ""
 
 

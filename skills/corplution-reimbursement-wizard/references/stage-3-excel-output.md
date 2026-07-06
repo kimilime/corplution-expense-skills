@@ -2,6 +2,8 @@
 
 Use this reference after stage 2 has produced `process/expense-allocation.json`. Stage 3 converts confirmed allocation units into rows in the reimbursement Excel workbook.
 
+Before writing the workbook, `scripts/write_reimbursement_template.py` runs `STAGE 3 PREFLIGHT CHECK TO SHOW IN CHAT`. This is the hard connection-point validation between allocation and the initial reimbursement table. If it exits with code `2`, no workbook was written; fix the listed allocation issues first, such as open questions, unconfirmed units, invalid categories/columns, missing dates/client/code/amount, admin/mobile conflicts, raw rail/flight evidence in final notes, or missing taxi place types.
+
 ## Inputs
 
 Required:
@@ -57,12 +59,19 @@ Amounts must be numeric values. Each row must have exactly one populated amount 
 
 Use `reimbursable_amount` for the visible Excel amount when it is present; otherwise use `amount`. Preserve `invoice_amount` in `final-expense-rows.json`. If the reimbursable amount differs from the invoice amount, append `（发票金额XX/实际报销XX）` to the final note.
 
+Treat project allocation and visible amount-column classification as two separate layers. `client_name`, `client_charge_code`, and the project block come from the confirmed project allocation. `meal`/`taxi` versus `travel`, and the matching `Expenses Nature`, come from formal evidence only. Do not move a Shanghai meal or Shanghai ride into `travel` merely because it belongs to an out-of-town project; do not move a non-Shanghai meal or non-Shanghai ride into `meal`/`taxi` merely because it belongs to a Shanghai/admin context.
+
 For meal rows, choose the visible amount column by formal invoice/restaurant city, not by project substance:
 
 - Shanghai formal city -> `meal`.
 - Non-Shanghai formal city -> `travel`.
 
 A Shanghai meal invoice assigned to an out-of-town project can still use note `出差餐费`, but its amount must stay in the `meal` column and `Expense Nature` must stay local.
+
+For taxi/Didi/Gaode ride rows, choose the visible amount column by ride city, not by assigned project:
+
+- Shanghai ride city -> `taxi`, even when the ride supports an out-of-town project transfer.
+- Non-Shanghai ride city -> `travel`.
 
 Date must come from Stage 2:
 
@@ -133,6 +142,8 @@ For each hotel item:
 - Apply user-confirmed partial reimbursement with `scripts/apply_allocation_answers.py`, then regenerate the workbook. The final note should show the invoice/reimbursable difference automatically.
 
 Always copy or summarize the script's `HOTEL CAP CHECK TO SHOW IN CHAT` output in the conversation. Do not leave this only in `final-expense-rows.json/md`.
+
+If `scripts/write_reimbursement_template.py` exits with code `3`, treat it as a policy-confirmation stop, not as a missing-output failure. The workbook and `process/final-expense-rows.*` have been written, but the `STAGE 3 REVIEW SUMMARY TO SHOW IN CHAT` block contains blocking meal/hotel cap checks that must be shown to the applicant and resolved before final submission.
 
 ## Workbook Format
 
@@ -241,7 +252,7 @@ If `is_substitute_invoice: true`, append `（抵）` after the normal final note
 
 If `reimbursable_amount` differs from `invoice_amount`, append `（发票金额XX/实际报销XX）` after the normal final note, preserving any `（抵）` marker.
 
-Do not write literal placeholders such as `出发地类型` or `目的地类型` into the workbook. If a taxi/Didi row still has those words, or if a confirmed taxi row has missing `origin_place_type` or `destination_place_type`, stop and ask the applicant to confirm the place types.
+Do not write literal placeholders such as `出发地类型` or `目的地类型` into the workbook. If a taxi/Didi/Gaode row still has those words, or if a confirmed ride row has missing `origin_place_type` or `destination_place_type`, stop and ask the applicant to confirm the place types.
 
 ## Overall Proof Numbering
 
@@ -270,7 +281,7 @@ Use sequential numbers starting from `1` unless the user asks for another format
 
 - Flight/rail: one proof number per ticket/invoice.
 - Hotel: one proof number per hotel invoice.
-- Taxi/Didi: if a Didi trip report is linked to a Didi summary invoice, assign one proof number to the summary invoice and reuse that number for every ride row supported by that invoice.
+- Taxi/Didi/Gaode: if a trip report is linked to a summary invoice, assign one proof number to the summary invoice and reuse that number for every ride row supported by that invoice.
 - Gaode: split to one row per ride when a trip report exists, but reuse the same proof number for every ride supported by the same Gaode invoice.
 - Meal: one proof number per meal invoice unless the user explicitly groups substitute invoices.
 - Mobile: one proof number per mobile invoice.
@@ -543,7 +554,8 @@ Before delivering the workbook:
 - No Didi/Gaode summary invoice is also written as a duplicate row.
 - No taxi/travel/meal/hotel row falls back to Client `通讯费`, mobile column, or `CORP-2026-ADMIN`.
 - Meal amount columns follow the formal invoice/restaurant city rule: Shanghai -> `meal`; non-Shanghai -> `travel`.
-- Taxi/Didi final notes do not contain literal `出发地类型` or `目的地类型` placeholders.
+- Taxi/Didi/Gaode amount columns follow the ride city rule: Shanghai -> `taxi`; non-Shanghai -> `travel`.
+- Taxi/Didi/Gaode final notes do not contain literal `出发地类型` or `目的地类型` placeholders.
 - Flight/rail between two project cities belongs to the destination/project being traveled to.
 - `Expense Nature` follows the formal Shanghai/non-Shanghai rule.
 - All substitute invoice notes include `（抵）`.

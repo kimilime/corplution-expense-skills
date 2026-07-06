@@ -114,9 +114,9 @@ Do not let a meal hint override the formal amount column or `Expense Nature`. Fo
 Create allocation units from stage-1 data:
 
 - For ordinary invoices, hotel invoices, railway e-ticket invoices, meal invoices, mobile invoices, and other single-document invoices: one allocation unit per invoice.
-- For Didi trip reports: one allocation unit per `supporting_items[]` ride.
-- For Didi summary invoices linked to trip reports: use them as supporting evidence, but do not create duplicate allocation units from the summary invoice.
-- For unmatched Didi summary invoices without trip reports: create one allocation unit, mark it `needs_user_confirmation: true`, and ask for trip details or whether to use summary-level allocation.
+- For Didi/Gaode trip reports: one allocation unit per `supporting_items[]` ride.
+- For Didi/Gaode summary invoices linked to trip reports: use them as supporting evidence, but do not create duplicate allocation units from the summary invoice.
+- For unmatched Didi/Gaode summary invoices without trip reports: create one allocation unit, mark it `needs_user_confirmation: true`, and ask for trip details or whether to use summary-level allocation.
 
 Each allocation unit should carry:
 
@@ -165,19 +165,20 @@ Use type-specific pre-allocation rules. Do not apply one generic city/date rule 
 - Hotel: prioritize hotel city plus stay dates. If stay dates or project dates are missing, pre-allocate only when the hotel city maps to exactly one project context; still ask for missing nights/check-in/check-out for cap checks.
 - Meal: invoice date is unreliable. Use explicit user-provided meal details when available; otherwise pre-allocate only when a non-Shanghai meal city maps to exactly one project context. The project inference may be advisory, but the actual meal date remains blocking unless the user already provided it.
 - Meal amount column and `Expense Nature` are form-over-substance: decide `meal`/local versus `travel`/business trip by the invoice/restaurant city, not by the assigned project. Shanghai meal invoices go to `meal`/local even when allocated to a business-trip project; non-Shanghai meal invoices go to `travel`/business trip.
-- Taxi/Didi: allocate to the project journey the ride supports. Ordinary city rides match by city/date. Airport/station transfers belong to the upcoming destination project when the next project starts within the travel buffer. Transfers from one project city to a station/airport for the next city belong to the project being traveled to.
+- Taxi/Didi/Gaode: allocate to the project journey the ride supports. Ordinary non-local city rides may match by city/date. Shanghai/base-city rides must not be auto-assigned to a Shanghai local project merely because city and date match; require explicit client/project evidence in the ride endpoint, route note, user note, or context keyword. Airport/station transfers belong to the upcoming destination project when the next project starts within the travel buffer. Transfers from one project city to a station/airport for the next city belong to the project being traveled to.
+- Taxi/Didi/Gaode amount column and `Expense Nature` are also form-over-substance: decide `taxi`/local versus `travel`/business trip by ride city, not by the assigned project. A Shanghai ride to an airport or railway station can belong to an out-of-town project while staying in the `taxi` column.
 - Flight/rail: match by route destination and travel date, allowing a reasonable +/- 1 day project buffer.
 - For taxi/ride transfers, do not require the ride city to equal the project city when the ride is clearly to/from an airport or railway station. A Shanghai ride to Hongqiao station/airport can belong to the out-of-town destination project if it supports that journey.
 - Never assign unmatched taxi/travel/hotel/meal to `CORP-2026-ADMIN`, Client `通讯费`, or the mobile amount column. If transfer logic does not identify a project, ask the user.
 - Other and unknown: do not pre-match by invoice city. Ask the user for accounting note and project/admin matter because issuer city can be misleading for SaaS, online meeting, association, platform, or generic service expenses. For pure `other`, temporarily use the invoice issue date as Date and advise the user to confirm/correct it; for `unknown`, ask for the actual date until reclassified.
 
-Record deterministic pre-allocation in `auto_project_match` with values such as `hotel_stay_dates`, `hotel_unique_city`, `unique_non_shanghai_city`, `taxi_transfer_to_next_project`, `taxi_city_date`, `travel_destination_date`, or `travel_route_date`, and explain the basis in `match_reason`.
+Record deterministic pre-allocation in `auto_project_match` with values such as `hotel_stay_dates`, `hotel_unique_city`, `unique_non_shanghai_city`, `taxi_explicit_project_evidence`, `taxi_transfer_to_next_project`, `taxi_transfer_matches_travel_unit`, `taxi_city_date`, `travel_destination_date`, or `travel_route_date`, and explain the basis in `match_reason`.
 
 ## Expense-Type Rules
 
-### Taxi And Didi
+### Taxi, Didi, And Gaode
 
-Use ride-level rows when Didi trip reports exist.
+Use ride-level rows when Didi/Gaode trip reports exist.
 
 Match by:
 
@@ -198,12 +199,19 @@ For airport/station transfer rides, prefer the project being traveled to:
 - If no travel document is available, but the ride is an airport/station transfer and exactly one non-local/out-of-city project context is active or within the travel buffer, assign the taxi to that project even if the ride city is Shanghai and the project city is elsewhere.
 - If there is no travel document and two projects can both explain the ride, mark medium confidence and ask in the batch taxi question.
 
+For Shanghai/local projects such as KEEWAY:
+
+- Do not treat a Shanghai project as a default bucket for Shanghai taxi or travel items.
+- Auto-assign to the local project only when the ride endpoint, source note, user note, `client_name`, alias, or `local_match_keywords` explicitly names that project/client, such as `家 -> KEEWAY集团` or `KEEWAY -> 虹桥机场`.
+- Do not auto-assign `家/公司 -> 虹桥站/机场` to the local project unless the local client is explicitly named. These rides usually support an out-of-town project; inherit the adjacent flight/rail project when unique, otherwise ask.
+- A train/flight returning to Shanghai is not automatically a Shanghai local project cost. It usually belongs to the out-of-town project just completed unless the user explicitly says it is for the local project.
+
 If a ride city/date does not match any provided trip/project, ask the user. The answer may be a local overtime taxi, a missing project context, personal/non-reimbursable, or another business reason.
 
-Final template column:
+Final template column is form-over-substance by ride city, not by assigned project:
 
-- Shanghai/local taxi -> `taxi`
-- Out-of-town trip taxi -> `travel`
+- Shanghai ride city -> `taxi`, even when the ride is assigned to an out-of-town project as an airport/station transfer.
+- Non-Shanghai ride city -> `travel`.
 
 Final note:
 
@@ -351,7 +359,7 @@ The downstream Excel `Note` field must use these exact Chinese templates after a
 | High-speed rail refund/cancellation fee | `高铁退票费（出发地-目的地）` |
 | Flight | `飞机（出发地-目的地）` |
 | Flight refund/cancellation fee | `飞机退票费（出发地-目的地）` |
-| Taxi / Didi | `打车（<confirmed origin place type>-<confirmed destination place type>）` |
+| Taxi / Didi / Gaode | `打车（<confirmed origin place type>-<confirmed destination place type>）` |
 | Overtime taxi | `打车（<confirmed origin place type>-<confirmed destination place type>）（加班）` |
 | Out-of-town meal | `出差餐费` |
 | Shanghai station/airport meal | `出差餐费（高铁站/机场）` |
@@ -364,7 +372,7 @@ Do not use the verbose evidence note from stage 1 as the final reimbursement not
 
 ## Place Type Classification For Taxi Notes
 
-Classify taxi/Didi origin and destination into place types:
+Classify taxi/Didi/Gaode origin and destination into place types:
 
 | Evidence | Place Type |
 | --- | --- |

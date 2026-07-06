@@ -60,7 +60,7 @@ EXPENSE_ORDER = {
 
 
 def load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8"))
+    return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -265,7 +265,7 @@ def load_context(path: Path | None) -> tuple[list[dict[str, Any]], str, list[dic
             "why_it_matters": "没有项目上下文时，只能生成费用清单，不能可靠匹配 Client 和 Client Charge Code。",
             "status": "open",
         }]
-    text = path.read_text(encoding="utf-8")
+    text = path.read_text(encoding="utf-8-sig")
     if path.suffix.lower() == ".json":
         payload = json.loads(text)
         contexts = payload.get("project_contexts", payload if isinstance(payload, list) else [])
@@ -294,11 +294,11 @@ def doc_by_id(extraction: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {doc["document_id"]: doc for doc in extraction.get("documents", [])}
 
 
-def didi_links(extraction: dict[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
+def ride_schedule_links(extraction: dict[str, Any]) -> tuple[dict[str, str], dict[str, str]]:
     invoice_to_schedule: dict[str, str] = {}
     schedule_to_invoice: dict[str, str] = {}
     for link in extraction.get("document_links", []):
-        if link.get("relation") == "invoice_total_matches_didi_trip_report":
+        if link.get("relation") in {"invoice_total_matches_didi_trip_report", "invoice_total_matches_gaode_trip_report"}:
             invoice_to_schedule[link.get("source_document_id", "")] = link.get("target_document_id", "")
             schedule_to_invoice[link.get("target_document_id", "")] = link.get("source_document_id", "")
     return invoice_to_schedule, schedule_to_invoice
@@ -332,7 +332,9 @@ def final_column(source_category: str, city: str = "") -> str:
     if source_category == "meal":
         return "travel" if city and "\u4e0a\u6d77" not in city else "meal"
     if source_category == "taxi":
-        return "taxi" if city and "\u4e0a\u6d77" in city else "travel"
+        if not city or "\u4e0a\u6d77" in city:
+            return "taxi"
+        return "travel"
     if source_category == "travel":
         return "travel"
     if source_category in {"other", "unknown"}:
@@ -354,6 +356,32 @@ def formal_meal_column(unit: dict[str, Any]) -> str:
 def normalize_meal_column(unit: dict[str, Any]) -> None:
     if clean(unit.get("source_category")) == "meal":
         unit["final_template_column"] = formal_meal_column(unit)
+
+
+def is_ride_unit(unit: dict[str, Any]) -> bool:
+    return bool(
+        clean(unit.get("origin"))
+        or clean(unit.get("destination"))
+        or clean(unit.get("source_item_id"))
+        or clean(unit.get("document_subtype")) in {"didi_trip_report", "gaode_trip_report"}
+    )
+
+
+def formal_taxi_column(unit: dict[str, Any]) -> str:
+    source_category = clean(unit.get("source_category"))
+    if source_category not in {"taxi", "travel"} or not is_ride_unit(unit):
+        return clean(unit.get("final_template_column"))
+    city = clean(unit.get("city"))
+    if city and not is_shanghai_city(city):
+        return "travel"
+    if city:
+        return "taxi"
+    return clean(unit.get("final_template_column")) or ("taxi" if source_category == "taxi" else "travel")
+
+
+def normalize_taxi_column(unit: dict[str, Any]) -> None:
+    if clean(unit.get("source_category")) in {"taxi", "travel"} and is_ride_unit(unit):
+        unit["final_template_column"] = formal_taxi_column(unit)
 
 
 def classify_place_type(place: str, contexts: list[dict[str, Any]]) -> tuple[str, str, bool]:
@@ -429,7 +457,7 @@ def normal_note(unit: dict[str, Any]) -> str:
 
 def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     docs = doc_by_id(extraction)
-    invoice_to_schedule, schedule_to_invoice = didi_links(extraction)
+    invoice_to_schedule, schedule_to_invoice = ride_schedule_links(extraction)
     units: list[dict[str, Any]] = []
     questions: list[dict[str, Any]] = []
     unit_idx = 1
@@ -444,14 +472,15 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
         if role == "invoice" and doc_id in invoice_to_schedule:
             continue
 
-        if subtype == "didi_trip_report":
+        if subtype in {"didi_trip_report", "gaode_trip_report"}:
+            provider = C["gaode"] if subtype == "gaode_trip_report" else C["didi"]
             linked_invoice_id = schedule_to_invoice.get(doc_id, "")
             linked_invoice_doc = docs.get(linked_invoice_id, {})
             if not linked_invoice_id:
                 questions.append({
                     "question_id": f"Q-LINK-{doc_id}",
                     "unit_ids": [],
-                    "question": f"{doc_id} 是滴滴行程单，但没有匹配到发票。请补发票，或确认这份行程单不报销/删除。",
+                    "question": f"{doc_id} 是{provider}行程单，但没有匹配到发票。请补发票，或确认这份行程单不报销/删除。",
                     "why_it_matters": "拆行程需要对应发票作为财务凭证。",
                     "status": "open",
                 })
@@ -494,7 +523,7 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
                     "destination_place_type": dest_type,
                     "place_type_confidence": "low" if origin_need or dest_need else "high",
                     "place_type_needs_confirmation": bool(origin_need or dest_need),
-                    "seller_name": C["didi"],
+                    "seller_name": provider,
                     "project_context_id": "",
                     "client_name": "",
                     "client_charge_code": "",
@@ -514,6 +543,7 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
                     "issues": [],
                 }
                 normalize_meal_column(unit)
+                normalize_taxi_column(unit)
                 unit["final_note"] = normal_note(unit)
                 units.append(unit)
                 unit_idx += 1
@@ -609,6 +639,7 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
                 "issues": [],
             }
             normalize_meal_column(unit)
+            normalize_taxi_column(unit)
             unit["final_note"] = normal_note(unit)
             units.append(unit)
             unit_idx += 1
@@ -664,8 +695,12 @@ def unit_match_text(unit: dict[str, Any]) -> str:
     return clean(" ".join([
         clean(unit.get("city")),
         clean(unit.get("route")),
+        clean(unit.get("origin")),
+        clean(unit.get("destination")),
         clean(unit.get("source_note")),
         clean(unit.get("expense_note")),
+        clean(unit.get("final_note")),
+        clean(unit.get("raw_remarks")),
         clean(unit.get("seller_name")),
     ]))
 
@@ -675,6 +710,68 @@ def city_matches_unit(unit: dict[str, Any], ctx: dict[str, Any]) -> bool:
     if not ctx_city:
         return False
     return contains_text(unit_match_text(unit), ctx_city)
+
+
+def list_context_terms(value: Any) -> list[str]:
+    if value is None:
+        return []
+    if isinstance(value, list):
+        raw_terms = value
+    else:
+        raw_terms = re.split(r"[,，、;/；\s]+", clean(value))
+    terms: list[str] = []
+    stop_terms = {
+        "admin", "corp", "bd", "project", "local",
+        "上海", "上海市", "本地", "本地项目", "项目", "客户",
+    }
+    for raw in raw_terms:
+        term = clean(raw)
+        if len(term) >= 2 and term.lower() not in stop_terms and term not in stop_terms:
+            terms.append(term)
+    return terms
+
+
+def is_local_context(ctx: dict[str, Any]) -> bool:
+    marker = clean(ctx.get("project_scope") or ctx.get("scope") or ctx.get("project_type")).lower()
+    if marker in {"local", "local_project", "本地", "本地项目"}:
+        return True
+    return is_shanghai_city(ctx.get("city"))
+
+
+def context_match_terms(ctx: dict[str, Any]) -> list[str]:
+    terms: list[str] = []
+    for field in ["client_name", "project_name", "project_description", "context_id"]:
+        terms.extend(list_context_terms(ctx.get(field)))
+    for field in ["aliases", "match_keywords", "local_match_keywords"]:
+        terms.extend(list_context_terms(ctx.get(field)))
+    deduped: list[str] = []
+    for term in terms:
+        if term not in deduped:
+            deduped.append(term)
+    return deduped
+
+
+def has_explicit_project_evidence(unit: dict[str, Any], ctx: dict[str, Any]) -> bool:
+    text = unit_match_text(unit)
+    return any(contains_text(text, term) for term in context_match_terms(ctx))
+
+
+def local_context_allowed_for_auto_match(unit: dict[str, Any], ctx: dict[str, Any]) -> bool:
+    if not is_local_context(ctx):
+        return True
+    return has_explicit_project_evidence(unit, ctx)
+
+
+def explicit_project_context(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
+    candidates = [
+        ctx for ctx in contexts
+        if date_in_context(unit.get("expense_date", ""), ctx)
+        and has_explicit_project_evidence(unit, ctx)
+    ]
+    context_ids = {clean(ctx.get("context_id")) for ctx in candidates}
+    if len(context_ids) == 1:
+        return candidates[0]
+    return None
 
 
 def city_contexts_for_unit(
@@ -711,6 +808,10 @@ def unique_non_shanghai_context_for_unit(
 
 
 def score_context(unit: dict[str, Any], ctx: dict[str, Any]) -> int:
+    category = clean(unit.get("source_category"))
+    explicit = has_explicit_project_evidence(unit, ctx)
+    if category in {"taxi", "travel"} and is_local_context(ctx) and not explicit:
+        return 0
     score = 0
     if date_in_context(unit.get("expense_date", ""), ctx):
         score += 3
@@ -722,6 +823,8 @@ def score_context(unit: dict[str, Any], ctx: dict[str, Any]) -> int:
     client = clean(ctx.get("client_name"))
     if client and client in clean(unit.get("source_note")):
         score += 2
+    if explicit:
+        score += 6
     return score
 
 
@@ -772,7 +875,14 @@ def apply_context_match(
         "auto_project_match": auto_project_match,
         "match_reason": reason,
     })
+    normalize_taxi_column_for_context(unit, ctx, auto_project_match)
     normalize_admin_client(unit)
+
+
+def normalize_taxi_column_for_context(unit: dict[str, Any], ctx: dict[str, Any], auto_project_match: str) -> None:
+    if clean(unit.get("source_category")) not in {"taxi", "travel"} or not is_ride_unit(unit):
+        return
+    normalize_taxi_column(unit)
 
 
 def match_hotel(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -838,6 +948,8 @@ def next_project_for_transfer(unit: dict[str, Any], contexts: list[dict[str, Any
         return None
     candidates: list[tuple[date, dict[str, Any]]] = []
     for ctx in contexts:
+        if is_local_context(ctx):
+            continue
         start = context_start(ctx)
         if not start:
             continue
@@ -872,6 +984,7 @@ def city_date_context(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> d
     candidates = [
         ctx for ctx in contexts
         if city_matches_unit(unit, ctx) and date_in_context(unit.get("expense_date", ""), ctx)
+        and local_context_allowed_for_auto_match(unit, ctx)
     ]
     context_ids = {clean(ctx.get("context_id")) for ctx in candidates}
     if len(context_ids) == 1:
@@ -881,6 +994,13 @@ def city_date_context(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> d
 
 def match_taxi(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
     contexts = non_admin_contexts(contexts)
+    explicit_ctx = explicit_project_context(unit, contexts)
+    if explicit_ctx:
+        return {
+            "ctx": explicit_ctx,
+            "auto": "taxi_explicit_project_evidence",
+            "reason": f"Taxi endpoints or notes explicitly mention project context {explicit_ctx.get('context_id', '')}.",
+        }
     next_ctx = next_project_for_transfer(unit, contexts)
     if next_ctx:
         return {
@@ -895,6 +1015,8 @@ def match_taxi(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str
             "auto": "taxi_transfer_unique_active_project",
             "reason": f"Taxi appears to be an airport/station transfer during a unique active out-of-city project context {period_ctx.get('context_id', '')}.",
         }
+    if is_transfer_endpoint(unit):
+        return None
     ctx = city_date_context(unit, contexts)
     if ctx:
         return {
@@ -910,7 +1032,11 @@ def match_travel(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[s
     origin, destination = route_endpoints(unit)
     dated_contexts = [ctx for ctx in contexts if date_in_context(unit.get("expense_date", ""), ctx)]
     if destination:
-        dest_matches = [ctx for ctx in dated_contexts if context_city_in_text(ctx, destination)]
+        dest_matches = [
+            ctx for ctx in dated_contexts
+            if context_city_in_text(ctx, destination)
+            and local_context_allowed_for_auto_match(unit, ctx)
+        ]
         if len({clean(ctx.get("context_id")) for ctx in dest_matches}) == 1:
             ctx = dest_matches[0]
             return {
@@ -919,7 +1045,11 @@ def match_travel(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[s
                 "reason": f"Travel destination and date match project context {ctx.get('context_id', '')}.",
             }
     route_text = clean(f"{origin} {destination} {unit.get('route', '')} {unit.get('source_note', '')}")
-    route_matches = [ctx for ctx in dated_contexts if context_city_in_text(ctx, route_text)]
+    route_matches = [
+        ctx for ctx in dated_contexts
+        if context_city_in_text(ctx, route_text)
+        and local_context_allowed_for_auto_match(unit, ctx)
+    ]
     if len({clean(ctx.get("context_id")) for ctx in route_matches}) == 1:
         ctx = route_matches[0]
         return {
@@ -972,6 +1102,19 @@ def taxi_transfer_matches_travel_unit(
     if len(context_ids) == 1:
         return candidates[0]
     return None
+
+
+def assigned_local_transfer_without_explicit_evidence(
+    unit: dict[str, Any],
+    contexts_by_id: dict[str, dict[str, Any]],
+) -> bool:
+    if clean(unit.get("source_category")) != "taxi" or not is_transfer_endpoint(unit):
+        return False
+    ctx_id = clean(unit.get("project_context_id"))
+    ctx = contexts_by_id.get(ctx_id)
+    if not ctx or not is_local_context(ctx):
+        return False
+    return not has_explicit_project_evidence(unit, ctx)
 
 
 def list_value(value: Any) -> list[Any]:
@@ -1341,7 +1484,9 @@ def apply_matches(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -
             })
         normalize_admin_client(unit)
     for unit in units:
-        if unit.get("client_charge_code") or clean(unit.get("source_category")) != "taxi":
+        if clean(unit.get("source_category")) != "taxi":
+            continue
+        if unit.get("client_charge_code") and not assigned_local_transfer_without_explicit_evidence(unit, contexts_by_id):
             continue
         ctx = taxi_transfer_matches_travel_unit(unit, units, contexts_by_id)
         if not ctx:
