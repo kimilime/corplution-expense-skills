@@ -7,6 +7,7 @@ import argparse
 import json
 import re
 import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -46,6 +47,15 @@ def load_json(path: Path) -> dict[str, Any]:
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
 
 
 def safe_name(value: str) -> str:
@@ -286,6 +296,7 @@ def print_final_summary(manifest: dict[str, Any]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_stdio()
     parser = argparse.ArgumentParser(description="Package reimbursement workbook, invoices, and support files.")
     parser.add_argument("--final-rows", required=True, help="Path to process/final-expense-rows.json.")
     parser.add_argument("--extraction", required=True, help="Path to process/invoice-extraction.json.")

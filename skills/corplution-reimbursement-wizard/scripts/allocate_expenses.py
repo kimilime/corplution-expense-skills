@@ -72,6 +72,15 @@ def clean(value: Any) -> str:
     return re.sub(r"\s+", " ", "" if value is None else str(value)).strip()
 
 
+def configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
+
 def is_admin_code(value: Any) -> bool:
     return clean(value).upper() == C["admin_code"]
 
@@ -2151,6 +2160,7 @@ def build_markdown(payload: dict[str, Any]) -> str:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_stdio()
     parser = argparse.ArgumentParser(description="Build stage-2 expense allocation scaffold.")
     parser.add_argument("--extraction", required=True, help="Path to process/invoice-extraction.json.")
     parser.add_argument("--context", help="Optional project context JSON or text file.")

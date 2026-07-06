@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import sys
 from pathlib import Path
 from typing import Any
 
@@ -15,6 +16,15 @@ def load_json(path: Path) -> dict[str, Any]:
 
 def clean(value: Any) -> str:
     return "" if value is None else str(value).strip()
+
+
+def configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
 
 
 def unit_no(unit: dict[str, Any]) -> str:
@@ -167,6 +177,7 @@ def print_text(payload: dict[str, Any]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_stdio()
     parser = argparse.ArgumentParser(description="Trace an allocation item back to its source evidence.")
     parser.add_argument("--allocation", required=True, help="Path to process/expense-allocation.json.")
     parser.add_argument("--extraction", required=True, help="Path to process/invoice-extraction.json.")

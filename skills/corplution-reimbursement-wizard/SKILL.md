@@ -53,16 +53,26 @@ python scripts/check_dependencies.py --strict-ocr
 python scripts/extract_invoices.py --output process <input-file-or-folder> [...]
 ```
 
-4. The extractor prints an extraction review list. Copy or summarize it directly in chat before moving to allocation, so the user can confirm recognized files by item number and source filename. Correct any `needs_review` items by inspecting the source document or rendered evidence; do not ask the user to open `process/invoice-extraction.md/json`.
+4. The extractor prints an extraction review list and writes the same review to `process/invoice-extraction.md` in UTF-8. Copy or summarize it directly in chat before moving to allocation, so the user can confirm recognized files by item number and source filename. If terminal output is garbled or truncated, read the UTF-8 Markdown process file instead of writing a one-off extraction helper script. Correct any `needs_review` items through the review/correction flow; do not silently patch `invoice-extraction.json` or ask the user to open `process/invoice-extraction.md/json`.
 5. For project allocation, read `references/stage-2-allocation.md`, then parse the user's natural-language project context and match it against `process/invoice-extraction.json`. Convert the user's natural-language project note into a temporary `project-context.json` yourself whenever enough information is present; do not ask the user to write JSON. Ask the user only for missing business facts such as date range, city, client name, or Client Charge Code.
 
 ```bash
 python scripts/allocate_expenses.py --extraction process/invoice-extraction.json --context project-context.json --output process
 ```
 
-The allocation script prints an applicant review list and a grouped question list. Copy or summarize both directly in the current conversation so the user can confirm or correct items by simple item number and source filename.
+The allocation script prints an applicant review list and a grouped question list, and writes the same information to `process/expense-allocation.md` in UTF-8. Copy or summarize both directly in the current conversation so the user can confirm or correct items by simple item number and source filename. If terminal output is garbled, read the Markdown process file instead of creating temporary print/extraction scripts.
 
-When the user answers allocation questions, summarize the answers into an answers JSON file and apply them with the bundled updater. Repeat until no blocking questions remain.
+Before translating the user's natural-language answers into JSON, generate a current-task answers template. Fill the generated canonical `unit_updates` entries; do not invent another schema such as `answers[].allocations`.
+
+```bash
+python scripts/build_allocation_answers_template.py --allocation process/expense-allocation.json --output process/allocation-answers.template.json
+```
+
+When the user answers allocation questions, fill the template into `process/allocation-answers.json`, validate it with the bundled updater, then apply it. Repeat until no blocking questions remain. Do not create ad hoc patch scripts to mutate `expense-allocation.json`; the updater refreshes notes, closes questions, preserves change history, and runs accounting checks.
+
+```bash
+python scripts/apply_allocation_answers.py --allocation process/expense-allocation.json --answers process/allocation-answers.json --dry-run
+```
 
 ```bash
 python scripts/apply_allocation_answers.py --allocation process/expense-allocation.json --answers process/allocation-answers.json
@@ -162,7 +172,8 @@ Read `references/stage-2-allocation.md` before allocating expenses. Keep these c
 - Use simple user-facing item numbers in conversation, such as item 1 or item 2, instead of internal IDs like `DOC-001` or `UNIT-001`. Keep internal IDs only in process JSON/Markdown for traceability.
 - When a user challenges an item, run `scripts/trace_expense_item.py` and identify the source filename, invoice number, seller, amount, date, and trip details before applying corrections.
 - Track substitute invoices separately, ask the user for the partner approval screenshot, append the substitute marker to the final note, and carry the substitute flag to the Excel stage.
-- After receiving user answers, use `scripts/apply_allocation_answers.py` to update `expense-allocation.json` instead of manually rewriting allocation files. This preserves question status, substitute approval links, and change history.
+- After receiving user answers, generate `allocation-answers.template.json` with `scripts/build_allocation_answers_template.py`, fill it into `allocation-answers.json`, and use `scripts/apply_allocation_answers.py` to update `expense-allocation.json` instead of manually rewriting allocation files. This preserves question status, substitute approval links, and change history.
+- Never create temporary patch scripts for bulk allocation edits. Convert batch natural-language answers into the generated canonical `unit_updates` template and run the updater even when the JSON is long.
 - Generate final reimbursement notes with the required Chinese templates from the stage-2 reference, including confirmed taxi origin/destination place types. Never write literal placeholders such as `出发地类型` or `目的地类型` into `final_note`; ask the user when either endpoint type is unclear.
 - Mark rail/flight cancellation or refund evidence in the final note as `高铁退票费（出发地-目的地）` or `飞机退票费（出发地-目的地）` instead of the ordinary travel note.
 
@@ -181,6 +192,7 @@ Read `references/stage-3-excel-output.md` before writing the reimbursement workb
 - For taxi/Didi/Gaode ride rows, recompute the visible amount column by ride city before writing: Shanghai -> `taxi`; non-Shanghai -> `travel`. Do not change this merely because the ride is allocated to an out-of-town project.
 - For meal expenses with daily standards, apply the cap after rows are built: business-trip meals are RMB 150/day, local overtime meals are RMB 60/day. Show `meal_daily_cap_checks` in chat. If a date exceeds the relevant cap without attendee details, ask whether the meal date is wrong, attendees are missing, or one item should use a lower `reimbursable_amount`; if attendee details exist, treat the over-cap result as advisory only. If reimbursable amount differs from invoice amount, the final note must state `发票金额XX/实际报销XX`.
 - For hotel expenses, apply the per-night cap after rows are built: Beijing/Shanghai/Guangzhou/Shenzhen are RMB 800/night, other cities are RMB 600/night. Show `hotel_cap_checks` in chat. If nights or city tier are missing, ask for check-in/check-out/nights/city. If a hotel exceeds the relevant cap with shared-room/co-occupant details, treat it as advisory only; otherwise ask whether one item should use a lower `reimbursable_amount`.
+- Hotel final notes must not keep placeholders such as `X晚`, `入住日`, or `离店日`. If hotel nights/check-in/check-out are known, the scripts regenerate `出差酒店（X晚，入住日-离店日）` with actual values; if those fields are missing, Stage 3 preflight blocks workbook generation.
 - Always show or summarize `STAGE 3 PREFLIGHT CHECK TO SHOW IN CHAT`. If the writer exits with code `2`, no workbook was written because allocation is not structurally ready: open questions, invalid categories/columns, missing dates/client/code/amount, admin/mobile conflicts, raw ticket notes, or missing taxi place types must be fixed first.
 - If `write_reimbursement_template.py` exits with code `3`, the workbook and final row files were written, but the `STAGE 3 REVIEW SUMMARY TO SHOW IN CHAT` block contains blocking meal/hotel policy checks that must be shown to the applicant and resolved before final submission.
 - Assign overall proof numbers by substantive proof order: flight/rail, hotel, taxi/Didi, Gaode, meal, mobile, other.

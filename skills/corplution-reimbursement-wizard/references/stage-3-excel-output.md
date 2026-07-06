@@ -254,6 +254,8 @@ If `reimbursable_amount` differs from `invoice_amount`, append `（发票金额X
 
 Do not write literal placeholders such as `出发地类型` or `目的地类型` into the workbook. If a taxi/Didi/Gaode row still has those words, or if a confirmed ride row has missing `origin_place_type` or `destination_place_type`, stop and ask the applicant to confirm the place types.
 
+Do not write hotel placeholders such as `X晚`, `入住日`, or `离店日` into the workbook. If `hotel_nights`, `check_in_date`, and `check_out_date` are present, regenerate the note as `出差酒店（X晚，入住日-离店日）` with actual values. If any of those fields are missing, stop before workbook generation and ask the applicant for the missing hotel stay details.
+
 ## Overall Proof Numbering
 
 Assign `No.` as an overall proof number by substantive proof groups, not simply by output row order and not necessarily by the tax invoice number.
@@ -556,6 +558,7 @@ Before delivering the workbook:
 - Meal amount columns follow the formal invoice/restaurant city rule: Shanghai -> `meal`; non-Shanghai -> `travel`.
 - Taxi/Didi/Gaode amount columns follow the ride city rule: Shanghai -> `taxi`; non-Shanghai -> `travel`.
 - Taxi/Didi/Gaode final notes do not contain literal `出发地类型` or `目的地类型` placeholders.
+- Hotel final notes do not contain literal `X晚`, `入住日`, or `离店日` placeholders.
 - Flight/rail between two project cities belongs to the destination/project being traveled to.
 - `Expense Nature` follows the formal Shanghai/non-Shanghai rule.
 - All substitute invoice notes include `（抵）`.

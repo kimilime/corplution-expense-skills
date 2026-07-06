@@ -438,7 +438,7 @@ Stage 2 is intentionally iterative:
 5. Create suggested assignments for medium-confidence items.
 6. Show an applicant review list in the current conversation before questions, so the user can identify each item by simple number and source filename.
 7. Ask targeted questions in the current conversation for low-confidence, medium-confidence, meal, other, conflicting, or substitute-invoice items. Batch repetitive questions by expense type whenever several items need the same kind of answer.
-8. Convert user answers into `allocation-answers.json`, apply them with `scripts/apply_allocation_answers.py`, and regenerate `expense-allocation.md/json`.
+8. Generate `allocation-answers.template.json`, fill it with the user's answers as canonical `unit_updates`, apply it with `scripts/apply_allocation_answers.py`, and regenerate `expense-allocation.md/json`.
 9. Repeat until every allocation unit is confirmed or explicitly left in the question queue.
 
 Group questions by expense type first, then list user-facing item numbers inside each group. If one item has multiple uncertainties, ask them together in that type group. For example, a single meal group can ask for actual meal date, project/client, attendees, and note type for items 1/3/5/7. A single hotel group can ask for check-in/check-out/nights for several hotels. A single taxi group can ask for unclear origin/destination place types for several rides.
@@ -483,7 +483,7 @@ python scripts/trace_expense_item.py --allocation process/expense-allocation.jso
 
 Then answer with the source filename(s), invoice number, seller/service provider, amount, date, and trip details so the user can confirm which file it is.
 
-After the user provides the corrected value, convert it into `allocation-answers.json` and apply it with `scripts/apply_allocation_answers.py`. Include `manual_correction: true` and a short `correction_note` when the correction changes recognized evidence such as amount, date, seller, invoice number, category, route, origin, or destination.
+After the user provides the corrected value, fill the generated answers template into `allocation-answers.json` and apply it with `scripts/apply_allocation_answers.py`. Include `manual_correction: true` and a short `correction_note` when the correction changes recognized evidence such as amount, date, seller, invoice number, category, route, origin, or destination.
 
 Example correction patch:
 
@@ -506,18 +506,35 @@ Example correction patch:
 
 ## Applying User Answers
 
-After the user answers in natural language, Codex should parse the answer into a small JSON patch and run:
+After the user answers in natural language, first generate a current-task answers template:
+
+```bash
+python scripts/build_allocation_answers_template.py --allocation process/expense-allocation.json --output process/allocation-answers.template.json
+```
+
+The template includes canonical `unit_updates` plus `review_context` so the model can fill item numbers, source filenames, current suggestions, and missing fields without guessing the JSON schema. Fill the template into `process/allocation-answers.json`; replace every `<...>` placeholder before applying. Do not create `answers[].allocations`, `patch_allocation.py`, or any other ad hoc shape.
+
+Validate the filled JSON before writing:
+
+```bash
+python scripts/apply_allocation_answers.py --allocation process/expense-allocation.json --answers process/allocation-answers.json --dry-run
+```
+
+Then apply:
 
 ```bash
 python scripts/apply_allocation_answers.py --allocation process/expense-allocation.json --answers process/allocation-answers.json
 ```
 
-Use this script instead of manually editing `expense-allocation.json`. It updates allocation units, closes answered questions, keeps a backup when overwriting, and appends a change-log entry.
+Use this script instead of manually editing `expense-allocation.json`. It updates allocation units, closes answered questions, keeps a backup when overwriting, and appends a change-log entry. The updater rejects noncanonical top-level keys such as `answers`, empty/no-op update files, and unfilled template placeholders so a failed answer translation cannot look like a successful apply.
 
-Answers JSON shape:
+Do not write one-off patch scripts for bulk allocation updates. Even if the user confirms many hotel dates, taxi place types, meal dates, or project assignments at once, create an `allocation-answers.json` with multiple `unit_updates` and run `scripts/apply_allocation_answers.py`. The updater also refreshes derived notes such as hotel, taxi, and rail/flight notes; direct JSON mutation can bypass these safeguards.
+
+Canonical answers JSON shape:
 
 ```json
 {
+  "schema_version": "allocation_answers.v1",
   "unit_updates": [
     {
       "unit_no": 1,

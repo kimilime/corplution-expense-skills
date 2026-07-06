@@ -107,6 +107,15 @@ def clean(value: Any) -> str:
     return re.sub(r"\s+", " ", text).strip()
 
 
+def configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
+
 def compact(value: str) -> str:
     return re.sub(r"\s+", "", value or "")
 
@@ -1096,6 +1105,7 @@ def build_payload(input_files: list[Path]) -> dict[str, Any]:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_stdio()
     parser = argparse.ArgumentParser(description="Extract reimbursement invoice evidence into process files.")
     parser.add_argument("inputs", nargs="+", help="Input PDF/image files or folders.")
     parser.add_argument("--output", "-o", default="process", help="Output process folder.")

@@ -171,6 +171,15 @@ def clean(value: Any) -> str:
     return re.sub(r"\s+", " ", "" if value is None else str(value)).strip()
 
 
+def configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
+
 def normalized_client_name(unit: dict[str, Any]) -> str:
     client = clean(unit.get("client_name"))
     code = clean(unit.get("client_charge_code")).upper()
@@ -254,6 +263,11 @@ def formal_amount_column(unit: dict[str, Any]) -> str:
 def contains_place_type_placeholder(note: Any) -> bool:
     text = clean(note)
     return "出发地类型" in text or "目的地类型" in text
+
+
+def contains_hotel_placeholder(note: Any) -> bool:
+    text = clean(note)
+    return any(token in text for token in ["X晚", "入住日", "离店日"])
 
 
 def strip_route_place(value: Any) -> str:
@@ -375,7 +389,7 @@ def hotel_template_note(unit: dict[str, Any]) -> str:
     if clean(unit.get("source_category")) != "hotel":
         return ""
     note = clean(unit.get("final_note") or unit.get("expense_note") or unit.get("source_note"))
-    if note.startswith("出差酒店") and "晚" in note:
+    if note.startswith("出差酒店") and "晚" in note and not contains_hotel_placeholder(note):
         return note
     nights = clean(unit.get("hotel_nights")) or "X"
     checkin = clean(unit.get("check_in_date")) or "入住日"
@@ -417,6 +431,13 @@ def note_placeholder_errors(unit: dict[str, Any]) -> list[str]:
         errors.append("taxi note still contains place-type placeholders")
     if (
         clean(unit.get("status")) in {"confirmed", "fixed"}
+        and clean(unit.get("source_category")) == "hotel"
+        and contains_hotel_placeholder(unit.get("final_note"))
+        and contains_hotel_placeholder(normalized_note_base(unit))
+    ):
+        errors.append("hotel final_note still contains night/date placeholders")
+    if (
+        clean(unit.get("status")) in {"confirmed", "fixed"}
         and clean(unit.get("source_category")) in {"taxi", "travel"}
         and clean(unit.get("origin"))
         and (not clean(unit.get("origin_place_type")) or not clean(unit.get("destination_place_type")))
@@ -443,6 +464,17 @@ def stage3_rule_errors(unit: dict[str, Any]) -> list[str]:
         errors.append("rail/flight items must use the travel amount column")
     if category == "hotel" and visible_column != "hotel":
         errors.append("hotel expenses must use the hotel amount column")
+    if category == "hotel":
+        missing_hotel_fields = [
+            field for field in ["hotel_nights", "check_in_date", "check_out_date"]
+            if not clean(unit.get(field))
+        ]
+        if missing_hotel_fields:
+            errors.append(
+                "hotel expenses require hotel_nights, check_in_date, and check_out_date before writing the workbook"
+            )
+        if contains_hotel_placeholder(normalized_note_base(unit)):
+            errors.append("hotel final note must use actual nights/check-in/check-out, not X晚/入住日/离店日 placeholders")
     if category == "mobile" and visible_column != "mobile":
         errors.append("mobile expenses must use the mobile amount column")
 
@@ -1574,6 +1606,7 @@ def print_stage3_review_summary(payload: dict[str, Any]) -> None:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_stdio()
     parser = argparse.ArgumentParser(description="Write reimbursement workbook from stage-2 allocation JSON.")
     parser.add_argument("--allocation", required=True, help="Path to process/expense-allocation.json.")
     parser.add_argument(

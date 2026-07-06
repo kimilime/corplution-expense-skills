@@ -7,6 +7,7 @@ import argparse
 import json
 import re
 import shutil
+import sys
 from datetime import datetime
 from pathlib import Path
 from typing import Any
@@ -15,9 +16,24 @@ from typing import Any
 ALLOWED_COLUMNS = {"hotel", "travel", "taxi", "meal", "mobile", "other"}
 OPEN_STATUSES = {"open", "needs_confirmation", "draft"}
 CLOSED_UNIT_STATUSES = {"confirmed", "fixed", "dropped", "excluded", "non_reimbursable"}
+ALLOWED_UNIT_STATUSES = OPEN_STATUSES | CLOSED_UNIT_STATUSES
 ADMIN_CODE = "CORP-2026-ADMIN"
 ADMIN_FALLBACK_CLIENT = "项目、调研以外的其他费用"
 MOBILE_CLIENT = "通讯费"
+
+ALLOWED_ROOT_FIELDS = {
+    "schema_version",
+    "generated_at",
+    "source_allocation_file",
+    "fill_instructions",
+    "review_context",
+    "unit_updates",
+    "question_updates",
+    "project_contexts",
+    "confirm_units",
+    "drop_units",
+    "exclude_units",
+}
 
 META_FIELDS = {
     "answer",
@@ -108,6 +124,15 @@ def clean(value: Any) -> str:
     return "" if value is None else str(value).strip()
 
 
+def configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(errors="replace")
+            except Exception:
+                pass
+
+
 def list_text(value: Any) -> str:
     if isinstance(value, list):
         parts = [clean(item) for item in value]
@@ -173,6 +198,11 @@ def normalize_taxi_column(unit: dict[str, Any]) -> None:
 def contains_place_type_placeholder(note: Any) -> bool:
     text = clean(note)
     return "出发地类型" in text or "目的地类型" in text
+
+
+def contains_hotel_placeholder(note: Any) -> bool:
+    text = clean(note)
+    return any(token in text for token in ["X晚", "入住日", "离店日"])
 
 
 def strip_route_place(value: Any) -> str:
@@ -306,10 +336,44 @@ def refresh_taxi_note(unit: dict[str, Any], update: dict[str, Any]) -> None:
         unit["final_note"] = taxi_note(unit)
 
 
+def hotel_note(unit: dict[str, Any]) -> str:
+    if clean(unit.get("source_category")) != "hotel":
+        return ""
+    nights = clean(unit.get("hotel_nights"))
+    checkin = clean(unit.get("check_in_date"))
+    checkout = clean(unit.get("check_out_date"))
+    if not nights or not checkin or not checkout:
+        return ""
+    return f"出差酒店（{nights}晚，{checkin}-{checkout}）"
+
+
+def refresh_hotel_note(unit: dict[str, Any], update: dict[str, Any]) -> None:
+    note = hotel_note(unit)
+    if not note:
+        return
+    current = clean(unit.get("final_note"))
+    source_note = clean(unit.get("source_note") or unit.get("expense_note"))
+    hotel_fields_updated = bool({"hotel_nights", "check_in_date", "check_out_date"} & set(update))
+    if (
+        "final_note" not in update
+        or hotel_fields_updated
+        or not current
+        or current == source_note
+        or contains_hotel_placeholder(current)
+    ):
+        unit["final_note"] = note
+
+
 def note_placeholder_errors(unit: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if contains_place_type_placeholder(unit.get("final_note")):
         errors.append("taxi note still contains place-type placeholders")
+    if (
+        clean(unit.get("status")) in {"confirmed", "fixed"}
+        and clean(unit.get("source_category")) == "hotel"
+        and contains_hotel_placeholder(unit.get("final_note"))
+    ):
+        errors.append("hotel note still contains night/date placeholders")
     if (
         clean(unit.get("status")) in {"confirmed", "fixed"}
         and clean(unit.get("source_category")) in {"taxi", "travel"}
@@ -391,6 +455,46 @@ def as_list(value: Any) -> list[Any]:
     return [value]
 
 
+def is_template_placeholder(value: Any) -> bool:
+    text = clean(value)
+    return bool(
+        (text.startswith("<") and text.endswith(">"))
+        or text in {"YYYY-MM-DD", "TODO", "TBD"}
+    )
+
+
+def placeholder_paths(value: Any, path: str = "$") -> list[str]:
+    paths: list[str] = []
+    if isinstance(value, dict):
+        for key, child in value.items():
+            paths.extend(placeholder_paths(child, f"{path}.{key}"))
+    elif isinstance(value, list):
+        for idx, child in enumerate(value):
+            paths.extend(placeholder_paths(child, f"{path}[{idx}]"))
+    elif is_template_placeholder(value):
+        paths.append(path)
+    return paths
+
+
+def validate_answers_root(answers: Any) -> None:
+    if isinstance(answers, list):
+        raise ValueError(
+            "Answers must be a JSON object with top-level unit_updates/question_updates/project_contexts. "
+            "Run build_allocation_answers_template.py and fill the generated template instead of passing a bare list."
+        )
+    if not isinstance(answers, dict):
+        raise ValueError("Answers must be a JSON object.")
+    if "answers" in answers:
+        raise ValueError(
+            "Unsupported top-level key 'answers'. Use the canonical schema with 'unit_updates'. "
+            "Run build_allocation_answers_template.py to create a fill-in template."
+        )
+    unknown = sorted(set(answers) - ALLOWED_ROOT_FIELDS)
+    if unknown:
+        allowed = ", ".join(sorted(ALLOWED_ROOT_FIELDS))
+        raise ValueError(f"Unknown top-level answers key(s): {', '.join(unknown)}. Allowed keys: {allowed}.")
+
+
 def units_by_id(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {unit["unit_id"]: unit for unit in payload.get("allocation_units", [])}
 
@@ -427,10 +531,7 @@ def resolve_unit_ref(ref: Any, by_id: dict[str, dict[str, Any]], by_no: dict[str
 
 
 def normalize_answers(answers: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
-    if isinstance(answers, list):
-        return [dict(item) for item in answers], [], []
-    if not isinstance(answers, dict):
-        raise ValueError("Answers must be a JSON object or a list of unit update objects.")
+    validate_answers_root(answers)
 
     unit_updates = [
         dict(item)
@@ -451,6 +552,19 @@ def normalize_answers(answers: Any) -> tuple[list[dict[str, Any]], list[dict[str
         dict(item)
         for item in answers.get("project_contexts", [])
     ]
+    if not unit_updates and not question_updates and not context_updates:
+        raise ValueError(
+            "Answers file contains no actionable updates. Fill a generated allocation-answers template "
+            "with unit_updates, or use confirm_units/drop_units/exclude_units."
+        )
+    for idx, update in enumerate(question_updates, start=1):
+        paths = placeholder_paths(update, f"question_updates[{idx}]")
+        if paths:
+            raise ValueError("Unfilled template placeholder(s): " + ", ".join(paths))
+    for idx, update in enumerate(context_updates, start=1):
+        paths = placeholder_paths(update, f"project_contexts[{idx}]")
+        if paths:
+            raise ValueError("Unfilled template placeholder(s): " + ", ".join(paths))
     return unit_updates, question_updates, context_updates
 
 
@@ -463,6 +577,8 @@ def add_issue(unit: dict[str, Any], field: str, problem: str) -> None:
 
 def validate_update(update: dict[str, Any], lenient: bool) -> list[str]:
     errors: list[str] = []
+    for path in placeholder_paths(update, "unit_update"):
+        errors.append(f"Unfilled template placeholder at {path}")
     for field in update:
         if field in META_FIELDS or field in ALLOWED_UNIT_FIELDS:
             continue
@@ -470,9 +586,14 @@ def validate_update(update: dict[str, Any], lenient: bool) -> list[str]:
         if lenient:
             continue
         errors.append(message)
+    if not any(field in ALLOWED_UNIT_FIELDS for field in update):
+        errors.append("Unit update has no fields to apply; fill or remove this template entry.")
     column = update.get("final_template_column")
     if column and column not in ALLOWED_COLUMNS:
         errors.append(f"Invalid final_template_column: {column}")
+    status = update.get("status")
+    if "status" in update and clean(status) not in ALLOWED_UNIT_STATUSES:
+        errors.append(f"Invalid status: {status}")
     return errors
 
 
@@ -497,6 +618,7 @@ def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: boo
     normalize_taxi_column(unit)
     refresh_taxi_note(unit, update)
     refresh_ticket_note(unit, update)
+    refresh_hotel_note(unit, update)
 
     if "expense_date" in update and clean(unit.get("expense_date")):
         unit["date_required"] = False
@@ -706,6 +828,7 @@ def apply_answers(
     output_path: Path,
     markdown_path: Path,
     lenient: bool,
+    write_output: bool = True,
 ) -> dict[str, Any]:
     payload = load_json(allocation_path)
     answers = load_json(answers_path)
@@ -744,35 +867,46 @@ def apply_answers(
         "changes": changes,
     })
 
-    if output_path.resolve() == allocation_path.resolve():
-        backup = allocation_path.with_suffix(allocation_path.suffix + ".bak")
-        shutil.copy2(allocation_path, backup)
-    write_json(output_path, payload)
-    markdown_path.write_text(build_markdown(payload), encoding="utf-8")
+    if write_output:
+        if output_path.resolve() == allocation_path.resolve():
+            backup = allocation_path.with_suffix(allocation_path.suffix + ".bak")
+            shutil.copy2(allocation_path, backup)
+        write_json(output_path, payload)
+        markdown_path.write_text(build_markdown(payload), encoding="utf-8")
     return payload
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_stdio()
     parser = argparse.ArgumentParser(description="Apply user answers to process/expense-allocation.json.")
     parser.add_argument("--allocation", required=True, help="Path to process/expense-allocation.json.")
     parser.add_argument("--answers", required=True, help="JSON file with unit_updates/question_updates.")
     parser.add_argument("--output", help="Output allocation JSON. Defaults to overwriting --allocation with a .bak backup.")
     parser.add_argument("--md-output", help="Output allocation Markdown. Defaults to output JSON sibling expense-allocation.md.")
     parser.add_argument("--lenient", action="store_true", help="Ignore unknown update fields instead of failing.")
+    parser.add_argument("--dry-run", action="store_true", help="Validate and apply in memory without writing files.")
     args = parser.parse_args(argv)
 
     allocation_path = Path(args.allocation)
     output_path = Path(args.output) if args.output else allocation_path
     markdown_path = Path(args.md_output) if args.md_output else output_path.with_name("expense-allocation.md")
-    payload = apply_answers(
-        allocation_path=allocation_path,
-        answers_path=Path(args.answers),
-        output_path=output_path,
-        markdown_path=markdown_path,
-        lenient=args.lenient,
-    )
-    print(f"Wrote {output_path}")
-    print(f"Wrote {markdown_path}")
+    try:
+        payload = apply_answers(
+            allocation_path=allocation_path,
+            answers_path=Path(args.answers),
+            output_path=output_path,
+            markdown_path=markdown_path,
+            lenient=args.lenient,
+            write_output=not args.dry_run,
+        )
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return 2
+    if args.dry_run:
+        print("Dry run OK. No files were written.")
+    else:
+        print(f"Wrote {output_path}")
+        print(f"Wrote {markdown_path}")
     print_open_questions(payload)
     print_advisory_questions(payload)
     return 0
