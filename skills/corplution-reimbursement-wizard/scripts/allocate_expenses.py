@@ -104,6 +104,17 @@ def mobile_accounting_errors(unit: dict[str, Any]) -> list[str]:
     return errors
 
 
+def note_placeholder_errors(unit: dict[str, Any]) -> list[str]:
+    note = clean(unit.get("final_note"))
+    errors: list[str] = []
+    if "\u51fa\u53d1\u5730\u7c7b\u578b" in note or "\u76ee\u7684\u5730\u7c7b\u578b" in note:
+        errors.append("taxi note still contains place-type placeholders")
+    if clean(unit.get("source_category")) in {"taxi", "travel"} and clean(unit.get("origin")):
+        if not clean(unit.get("origin_place_type")) or not clean(unit.get("destination_place_type")):
+            errors.append("taxi note requires confirmed origin and destination place types")
+    return errors
+
+
 def normalize_admin_client(unit: dict[str, Any]) -> None:
     if not is_admin_code(unit.get("client_charge_code")):
         return
@@ -329,6 +340,22 @@ def final_column(source_category: str, city: str = "") -> str:
     return source_category or "other"
 
 
+def formal_meal_column(unit: dict[str, Any]) -> str:
+    if clean(unit.get("source_category")) != "meal":
+        return clean(unit.get("final_template_column"))
+    city = clean(unit.get("city"))
+    if city and "\u4e0a\u6d77" in city:
+        return "meal"
+    if city:
+        return "travel"
+    return clean(unit.get("final_template_column")) or "meal"
+
+
+def normalize_meal_column(unit: dict[str, Any]) -> None:
+    if clean(unit.get("source_category")) == "meal":
+        unit["final_template_column"] = formal_meal_column(unit)
+
+
 def classify_place_type(place: str, contexts: list[dict[str, Any]]) -> tuple[str, str, bool]:
     text = clean(place)
     if not text:
@@ -389,10 +416,12 @@ def normal_note(unit: dict[str, Any]) -> str:
             return C["overtime_meal"]
         if unit.get("meal_context") == "station_airport":
             return C["station_meal"]
-        return C["travel_meal"] if unit.get("final_template_column") == "travel" else C["overtime_meal"]
+        return C["travel_meal"]
     if category in {"taxi", "travel"} and unit.get("origin"):
-        origin_type = unit.get("origin_place_type") or "\u51fa\u53d1\u5730\u7c7b\u578b"
-        dest_type = unit.get("destination_place_type") or "\u76ee\u7684\u5730\u7c7b\u578b"
+        origin_type = clean(unit.get("origin_place_type"))
+        dest_type = clean(unit.get("destination_place_type"))
+        if not origin_type or not dest_type:
+            return source
         suffix = "\uff08\u52a0\u73ed\uff09" if unit.get("business_reason") == "overtime" else ""
         return f"{C['taxi']}\uff08{origin_type}-{dest_type}\uff09{suffix}"
     return source
@@ -484,6 +513,7 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
                     "status": "needs_confirmation" if origin_need or dest_need else "draft",
                     "issues": [],
                 }
+                normalize_meal_column(unit)
                 unit["final_note"] = normal_note(unit)
                 units.append(unit)
                 unit_idx += 1
@@ -578,6 +608,7 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
                 "status": "draft",
                 "issues": [],
             }
+            normalize_meal_column(unit)
             unit["final_note"] = normal_note(unit)
             units.append(unit)
             unit_idx += 1
@@ -1196,6 +1227,7 @@ def apply_hint_to_unit(unit: dict[str, Any], hint: dict[str, Any], score: int, r
         unit["client_charge_code"] = clean(hint.get("client_charge_code"))
     if hint.get("final_template_column"):
         unit["final_template_column"] = clean(hint.get("final_template_column"))
+    normalize_meal_column(unit)
     if hint.get("final_note"):
         unit["final_note"] = clean(hint.get("final_note"))
     elif clean(unit.get("source_category")) == "meal":
@@ -1362,7 +1394,7 @@ def _legacy_build_questions(units: list[dict[str, Any]], existing: list[dict[str
                 "question_id": f"Q-{qidx:03d}",
                 "unit_ids": [unit_id],
                 "question": f"{unit_id} 的打车地点类型不完整。请确认出发地/目的地应写公司、客户、酒店、机场、火车站、家、餐厅或其他。",
-                "why_it_matters": "Taxi Note 必须写成打车（出发地类型-目的地类型）。",
+                "why_it_matters": "Taxi Note 必须写真实地点类型，例如打车（公司-火车站）或打车（机场-酒店），不能直接写占位字样。",
                 "status": "open",
             })
             qidx += 1
@@ -1736,6 +1768,14 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
                     "这是硬性防呆规则，用于防止未匹配交通费被错误丢进通讯费/Admin。",
                 )
             )
+        placeholder_errors = note_placeholder_errors(unit)
+        if placeholder_errors:
+            prompts.append(
+                (
+                    "这笔打车/行程的 Note 还缺少确认后的地点类型，不能把“出发地类型”或“目的地类型”这些占位字样写进最终表。请确认出发地和目的地分别应写公司、客户、酒店、机场、火车站、家、餐厅或其他。",
+                    "Taxi Note 必须使用真实地点类型；占位词只用于说明模板，不能作为最终报销说明。",
+                )
+            )
         date_prompt = date_prompt_for_unit(unit)
         if date_prompt:
             prompts.append(date_prompt)
@@ -1817,7 +1857,7 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
                         f"这笔打车地点类型不完整：出发地「{origin or '?'}」、目的地「{destination or '?'}」。"
                         "请确认分别应写公司、客户、酒店、机场、火车站、家、餐厅或其他。"
                     ),
-                    "Taxi Note 必须写成“打车（出发地类型-目的地类型）”，敏感或模糊地点不能硬猜。",
+                    "Taxi Note 必须写真实地点类型，例如“打车（公司-火车站）”或“打车（机场-酒店）”，敏感或模糊地点不能硬猜，也不能直接写占位字样。",
                 )
             )
         add_combined_question(questions, unit, prompts)

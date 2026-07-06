@@ -144,6 +144,7 @@ Read `references/stage-2-allocation.md` before allocating expenses. Keep these c
 - Exclude `CORP-2026-ADMIN` contexts from hotel/meal/taxi/travel automatic city/date scoring. Admin is not a Shanghai project and must not win fallback matching.
 - Match hotels first by hotel city plus stay dates; when stay dates or project dates are missing, use city uniqueness only for project pre-allocation, and still ask for missing nights/check-in/check-out needed for hotel caps.
 - Match meals by explicit user-provided meal notes when available. Parse notes such as `6.1 德克士 61.8` into meal hints, then match by combined amount/date/merchant evidence instead of any single strict field. Otherwise treat invoice dates as unreliable and auto-assign only when a non-Shanghai invoice city has exactly one project in the period. Show inferred meals as advisory so the user can batch-correct dates/attendees/amounts.
+- For meal amount columns and `Expense Nature`, apply form over substance: Shanghai invoice/restaurant city -> `meal`/local, non-Shanghai invoice/restaurant city -> `travel`/business trip, regardless of which project the meal is allocated to.
 - Match taxi and Didi ride items by the project journey they support: city/date for ordinary rides, airport/station transfer to the upcoming destination project, and project-to-project station/airport transfers to the project being traveled to.
 - Match railway and flight travel by route destination and travel date with a reasonable +/- 1 day project buffer.
 - When travel connects two project cities, assign it to the destination/project being traveled to, not the origin project. Never override this merely because the origin station city matches a previous project.
@@ -160,7 +161,7 @@ Read `references/stage-2-allocation.md` before allocating expenses. Keep these c
 - When a user challenges an item, run `scripts/trace_expense_item.py` and identify the source filename, invoice number, seller, amount, date, and trip details before applying corrections.
 - Track substitute invoices separately, ask the user for the partner approval screenshot, append the substitute marker to the final note, and carry the substitute flag to the Excel stage.
 - After receiving user answers, use `scripts/apply_allocation_answers.py` to update `expense-allocation.json` instead of manually rewriting allocation files. This preserves question status, substitute approval links, and change history.
-- Generate final reimbursement notes with the required Chinese templates from the stage-2 reference, including confirmed taxi origin/destination place types; ask the user when either endpoint type is unclear.
+- Generate final reimbursement notes with the required Chinese templates from the stage-2 reference, including confirmed taxi origin/destination place types. Never write literal placeholders such as `出发地类型` or `目的地类型` into `final_note`; ask the user when either endpoint type is unclear.
 - Mark rail/flight cancellation or refund evidence in the final note as `高铁退票费（出发地-目的地）` or `飞机退票费（出发地-目的地）` instead of the ordinary travel note.
 
 ## Stage 3 Excel Output Rules
@@ -171,9 +172,10 @@ Read `references/stage-3-excel-output.md` before writing the reimbursement workb
 - Write `Date` as `YYYYMMDD`.
 - Use only confirmed, reliable, or explicitly provisional `other` `expense_date`; if `date_required` is true or `expense_date` is blank, ask in chat before writing the workbook.
 - Use confirmed `client_name` and `client_charge_code` from stage 2.
-- Set `Expense Nature` by formal invoice/location city: Shanghai means local; otherwise business trip.
+- Set `Expense Nature` by formal invoice/location city, using the same meal form-over-substance rule: Shanghai means local; otherwise business trip.
 - Use the confirmed stage-2 `final_note` for `Note`.
 - Put each amount in exactly one template amount column: hotel, travel, taxi, meal, mobile, or other.
+- For meal rows, recompute the visible amount column by formal invoice/restaurant city before writing: Shanghai -> `meal`; non-Shanghai -> `travel`.
 - For meal expenses with daily standards, apply the cap after rows are built: business-trip meals are RMB 150/day, local overtime meals are RMB 60/day. Show `meal_daily_cap_checks` in chat. If a date exceeds the relevant cap without attendee details, ask whether the meal date is wrong, attendees are missing, or one item should use a lower `reimbursable_amount`; if attendee details exist, treat the over-cap result as advisory only. If reimbursable amount differs from invoice amount, the final note must state `发票金额XX/实际报销XX`.
 - For hotel expenses, apply the per-night cap after rows are built: Beijing/Shanghai/Guangzhou/Shenzhen are RMB 800/night, other cities are RMB 600/night. Show `hotel_cap_checks` in chat. If nights or city tier are missing, ask for check-in/check-out/nights/city. If a hotel exceeds the relevant cap with shared-room/co-occupant details, treat it as advisory only; otherwise ask whether one item should use a lower `reimbursable_amount`.
 - Assign overall proof numbers by substantive proof order: flight/rail, hotel, taxi/Didi, Gaode, meal, mobile, other.

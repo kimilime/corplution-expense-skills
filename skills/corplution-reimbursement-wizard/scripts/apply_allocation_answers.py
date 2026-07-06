@@ -122,6 +122,68 @@ def is_mobile_admin_unit(unit: dict[str, Any]) -> bool:
     return unit.get("source_category") == "mobile" or unit.get("final_template_column") == "mobile"
 
 
+def formal_meal_column(unit: dict[str, Any]) -> str:
+    if clean(unit.get("source_category")) != "meal":
+        return clean(unit.get("final_template_column"))
+    city = clean(unit.get("city"))
+    if city and "上海" in city:
+        return "meal"
+    if city:
+        return "travel"
+    return clean(unit.get("final_template_column")) or "meal"
+
+
+def normalize_meal_column(unit: dict[str, Any]) -> None:
+    if clean(unit.get("source_category")) == "meal":
+        unit["final_template_column"] = formal_meal_column(unit)
+
+
+def contains_place_type_placeholder(note: Any) -> bool:
+    text = clean(note)
+    return "出发地类型" in text or "目的地类型" in text
+
+
+def taxi_note(unit: dict[str, Any]) -> str:
+    origin_type = clean(unit.get("origin_place_type"))
+    dest_type = clean(unit.get("destination_place_type"))
+    if not origin_type or not dest_type:
+        return clean(unit.get("final_note") or unit.get("expense_note") or unit.get("source_note"))
+    suffix = "（加班）" if clean(unit.get("business_reason")) == "overtime" else ""
+    return f"打车（{origin_type}-{dest_type}）{suffix}"
+
+
+def refresh_taxi_note(unit: dict[str, Any], update: dict[str, Any]) -> None:
+    category = clean(unit.get("source_category"))
+    if category not in {"taxi", "travel"} or not clean(unit.get("origin")):
+        return
+    if not clean(unit.get("origin_place_type")) or not clean(unit.get("destination_place_type")):
+        return
+    note = clean(unit.get("final_note"))
+    source_note = clean(unit.get("source_note") or unit.get("expense_note"))
+    if (
+        "final_note" not in update
+        or not note
+        or contains_place_type_placeholder(note)
+        or note == source_note
+        or "->" in note
+    ):
+        unit["final_note"] = taxi_note(unit)
+
+
+def note_placeholder_errors(unit: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if contains_place_type_placeholder(unit.get("final_note")):
+        errors.append("taxi note still contains place-type placeholders")
+    if (
+        clean(unit.get("status")) in {"confirmed", "fixed"}
+        and clean(unit.get("source_category")) in {"taxi", "travel"}
+        and clean(unit.get("origin"))
+        and (not clean(unit.get("origin_place_type")) or not clean(unit.get("destination_place_type")))
+    ):
+        errors.append("confirmed taxi/travel item requires origin_place_type and destination_place_type")
+    return errors
+
+
 def mobile_accounting_errors(unit: dict[str, Any]) -> list[str]:
     source_category = clean(unit.get("source_category"))
     final_column = clean(unit.get("final_template_column"))
@@ -290,6 +352,9 @@ def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: boo
             value = list_text(value)
         unit[field] = value
 
+    normalize_meal_column(unit)
+    refresh_taxi_note(unit, update)
+
     if "expense_date" in update and clean(unit.get("expense_date")):
         unit["date_required"] = False
         unit["date_is_provisional"] = False
@@ -313,7 +378,7 @@ def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: boo
         unit["place_type_confidence"] = unit.get("place_type_confidence") or "confirmed"
 
     normalize_admin_client(unit)
-    accounting_errors = mobile_accounting_errors(unit)
+    accounting_errors = mobile_accounting_errors(unit) + note_placeholder_errors(unit)
     if accounting_errors:
         raise ValueError(f"{unit.get('unit_id')} accounting conflict: " + "; ".join(accounting_errors))
 

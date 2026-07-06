@@ -84,8 +84,7 @@ When the user provides concrete meal or expense notes, translate them into struc
       "merchant": "德克士",
       "merchant_aliases": ["Dicos"],
       "attendees": "姚",
-      "meal_context": "business_trip",
-      "final_template_column": "travel"
+      "meal_context": "business_trip"
     }
   ],
   "expense_hints": [
@@ -107,6 +106,8 @@ The allocation script scores these hints against extracted units using amount, d
 - Auto-apply a hint only when one extracted unit is the unique high-confidence match. If several units have similar evidence, show the candidates in the chat and ask the user to confirm by item number.
 
 Use hints to preserve attendee details even when a meal does not exceed the cap.
+
+Do not let a meal hint override the formal amount column or `Expense Nature`. For meal invoices, `final_template_column` and nature follow the invoice/restaurant city: Shanghai formal city -> `meal`/local; non-Shanghai formal city -> `travel`/business trip. A Shanghai invoice can still belong to an out-of-town project and use note `出差餐费`, but its amount column remains `meal` and its nature remains local.
 
 ## Allocation Units
 
@@ -163,6 +164,7 @@ Use type-specific pre-allocation rules. Do not apply one generic city/date rule 
 
 - Hotel: prioritize hotel city plus stay dates. If stay dates or project dates are missing, pre-allocate only when the hotel city maps to exactly one project context; still ask for missing nights/check-in/check-out for cap checks.
 - Meal: invoice date is unreliable. Use explicit user-provided meal details when available; otherwise pre-allocate only when a non-Shanghai meal city maps to exactly one project context. The project inference may be advisory, but the actual meal date remains blocking unless the user already provided it.
+- Meal amount column and `Expense Nature` are form-over-substance: decide `meal`/local versus `travel`/business trip by the invoice/restaurant city, not by the assigned project. Shanghai meal invoices go to `meal`/local even when allocated to a business-trip project; non-Shanghai meal invoices go to `travel`/business trip.
 - Taxi/Didi: allocate to the project journey the ride supports. Ordinary city rides match by city/date. Airport/station transfers belong to the upcoming destination project when the next project starts within the travel buffer. Transfers from one project city to a station/airport for the next city belong to the project being traveled to.
 - Flight/rail: match by route destination and travel date, allowing a reasonable +/- 1 day project buffer.
 - For taxi/ride transfers, do not require the ride city to equal the project city when the ride is clearly to/from an airport or railway station. A Shanghai ride to Hongqiao station/airport can belong to the out-of-town destination project if it supports that journey.
@@ -205,10 +207,10 @@ Final template column:
 
 Final note:
 
-- Normal taxi: `打车（出发地类型-目的地类型）`
-- Overtime taxi: `打车（出发地类型-目的地类型）（加班）`
+- Normal taxi: `打车（<confirmed origin place type>-<confirmed destination place type>）`
+- Overtime taxi: `打车（<confirmed origin place type>-<confirmed destination place type>）（加班）`
 
-Determine `origin_place_type` and `destination_place_type` before finalizing the note. If either type is uncertain, ask the user.
+Determine `origin_place_type` and `destination_place_type` before finalizing the note. If either type is uncertain, ask the user. Never write the literal placeholders `出发地类型` or `目的地类型` into `final_note` or the workbook.
 
 ### Railway And Flight Travel
 
@@ -282,8 +284,10 @@ Create a meal review list unless the user already provided clear meal details. A
 
 Final template column:
 
-- Shanghai/local meal -> `meal`
-- Out-of-town business-trip meal -> `travel`
+- Shanghai formal invoice/restaurant city -> `meal`
+- Non-Shanghai formal invoice/restaurant city -> `travel`
+
+This is form-over-substance. A Shanghai meal invoice allocated to a non-Shanghai business-trip project still uses `meal`; a non-Shanghai meal invoice uses `travel`.
 
 Final note:
 
@@ -347,8 +351,8 @@ The downstream Excel `Note` field must use these exact Chinese templates after a
 | High-speed rail refund/cancellation fee | `高铁退票费（出发地-目的地）` |
 | Flight | `飞机（出发地-目的地）` |
 | Flight refund/cancellation fee | `飞机退票费（出发地-目的地）` |
-| Taxi / Didi | `打车（出发地类型-目的地类型）` |
-| Overtime taxi | `打车（出发地类型-目的地类型）（加班）` |
+| Taxi / Didi | `打车（<confirmed origin place type>-<confirmed destination place type>）` |
+| Overtime taxi | `打车（<confirmed origin place type>-<confirmed destination place type>）（加班）` |
 | Out-of-town meal | `出差餐费` |
 | Shanghai station/airport meal | `出差餐费（高铁站/机场）` |
 | Overtime meal | `加班餐费` |

@@ -200,6 +200,36 @@ def mobile_accounting_errors(unit: dict[str, Any]) -> list[str]:
     return errors
 
 
+def formal_meal_column(unit: dict[str, Any]) -> str:
+    if clean(unit.get("source_category")) != "meal":
+        return clean(unit.get("final_template_column"))
+    city = clean(unit.get("city"))
+    if city and "上海" in city:
+        return "meal"
+    if city:
+        return "travel"
+    return clean(unit.get("final_template_column")) or "meal"
+
+
+def contains_place_type_placeholder(note: Any) -> bool:
+    text = clean(note)
+    return "出发地类型" in text or "目的地类型" in text
+
+
+def note_placeholder_errors(unit: dict[str, Any]) -> list[str]:
+    errors: list[str] = []
+    if contains_place_type_placeholder(unit.get("final_note")):
+        errors.append("taxi note still contains place-type placeholders")
+    if (
+        clean(unit.get("status")) in {"confirmed", "fixed"}
+        and clean(unit.get("source_category")) in {"taxi", "travel"}
+        and clean(unit.get("origin"))
+        and (not clean(unit.get("origin_place_type")) or not clean(unit.get("destination_place_type")))
+    ):
+        errors.append("confirmed taxi/travel item requires origin_place_type and destination_place_type")
+    return errors
+
+
 def money(value: Any) -> str:
     if value in (None, ""):
         return "0.00"
@@ -308,6 +338,8 @@ def require_ready(allocation: dict[str, Any], allow_unconfirmed: bool) -> list[s
             errors.append(f"{unit.get('unit_id')} has a provisional date but is not an other expense.")
         for accounting_error in mobile_accounting_errors(unit):
             errors.append(f"{unit.get('unit_id')} accounting conflict: {accounting_error}.")
+        for note_error in note_placeholder_errors(unit):
+            errors.append(f"{unit.get('unit_id')} note conflict: {note_error}.")
         destination_ctx = travel_destination_context(unit, contexts)
         if destination_ctx and not assignment_matches_context(unit, destination_ctx):
             errors.append(
@@ -426,7 +458,7 @@ def final_note(unit: dict[str, Any]) -> str:
 
 def expense_nature(unit: dict[str, Any]) -> str:
     city = clean(unit.get("city"))
-    amount_column = unit.get("final_template_column", "")
+    amount_column = formal_meal_column(unit) if unit.get("source_category") == "meal" else unit.get("final_template_column", "")
     if amount_column == "mobile":
         return C["local"]
     if amount_column in {"hotel", "travel"}:
@@ -442,7 +474,8 @@ def expense_nature(unit: dict[str, Any]) -> str:
 def make_rows(units: list[dict[str, Any]], requester: str) -> list[dict[str, Any]]:
     rows = []
     for unit in units:
-        amount_col = unit.get("final_template_column") or "other"
+        amount_col = formal_meal_column(unit) if unit.get("source_category") == "meal" else unit.get("final_template_column")
+        amount_col = amount_col or "other"
         if amount_col not in AMOUNT_COLUMNS:
             amount_col = "other"
         rows.append({

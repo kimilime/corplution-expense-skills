@@ -57,6 +57,13 @@ Amounts must be numeric values. Each row must have exactly one populated amount 
 
 Use `reimbursable_amount` for the visible Excel amount when it is present; otherwise use `amount`. Preserve `invoice_amount` in `final-expense-rows.json`. If the reimbursable amount differs from the invoice amount, append `（发票金额XX/实际报销XX）` to the final note.
 
+For meal rows, choose the visible amount column by formal invoice/restaurant city, not by project substance:
+
+- Shanghai formal city -> `meal`.
+- Non-Shanghai formal city -> `travel`.
+
+A Shanghai meal invoice assigned to an out-of-town project can still use note `出差餐费`, but its amount must stay in the `meal` column and `Expense Nature` must stay local.
+
 Date must come from Stage 2:
 
 - flight/rail: printed travel date
@@ -221,8 +228,8 @@ Use `final_note` from stage 2. It should already follow these templates:
 - `高铁退票费（出发地-目的地）`
 - `飞机（出发地-目的地）`
 - `飞机退票费（出发地-目的地）`
-- `打车（出发地类型-目的地类型）`
-- `打车（出发地类型-目的地类型）（加班）`
+- `打车（<confirmed origin place type>-<confirmed destination place type>）`
+- `打车（<confirmed origin place type>-<confirmed destination place type>）（加班）`
 - `出差餐费`
 - `出差餐费（高铁站/机场）`
 - `加班餐费`
@@ -233,6 +240,8 @@ Use `final_note` from stage 2. It should already follow these templates:
 If `is_substitute_invoice: true`, append `（抵）` after the normal final note.
 
 If `reimbursable_amount` differs from `invoice_amount`, append `（发票金额XX/实际报销XX）` after the normal final note, preserving any `（抵）` marker.
+
+Do not write literal placeholders such as `出发地类型` or `目的地类型` into the workbook. If a taxi/Didi row still has those words, or if a confirmed taxi row has missing `origin_place_type` or `destination_place_type`, stop and ask the applicant to confirm the place types.
 
 ## Overall Proof Numbering
 
@@ -533,6 +542,8 @@ Before delivering the workbook:
 - Didi/Gaode rides are split into ride rows and share the linked invoice proof number.
 - No Didi/Gaode summary invoice is also written as a duplicate row.
 - No taxi/travel/meal/hotel row falls back to Client `通讯费`, mobile column, or `CORP-2026-ADMIN`.
+- Meal amount columns follow the formal invoice/restaurant city rule: Shanghai -> `meal`; non-Shanghai -> `travel`.
+- Taxi/Didi final notes do not contain literal `出发地类型` or `目的地类型` placeholders.
 - Flight/rail between two project cities belongs to the destination/project being traveled to.
 - `Expense Nature` follows the formal Shanghai/non-Shanghai rule.
 - All substitute invoice notes include `（抵）`.
