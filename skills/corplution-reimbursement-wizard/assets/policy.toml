@@ -1,0 +1,33 @@
+# Corplution reimbursement policy values.
+#
+# This file is the single source of truth for company policy numbers and
+# year-coded charge codes. When policy changes (new fiscal year, new caps),
+# edit this file only; SKILL.md, references, and scripts all defer to it.
+
+[caps]
+# Daily meal caps in RMB.
+business_trip_meal_daily = "150.00"
+local_overtime_meal_daily = "60.00"
+
+# Hotel caps in RMB per night.
+first_tier_hotel_per_night = "800.00"
+other_city_hotel_per_night = "600.00"
+
+# Cities charged at the first-tier hotel cap. Match is case-insensitive.
+first_tier_cities = [
+    "北京", "上海", "广州", "深圳",
+    "beijing", "shanghai", "guangzhou", "shenzhen",
+]
+
+[charge_codes]
+# Administrative (non-project) charge code. Year-coded; update annually.
+admin = "CORP-2026-ADMIN"
+# Shared business-development code that multiple pending projects may use.
+# Never treat it alone as a unique project key.
+shared_bd = "CORP-2026-BD"
+
+[clients]
+# Client name written for mobile/telecom rows under the admin code.
+mobile = "通讯费"
+# Fallback client name for other admin expenses with no specific matter name.
+admin_fallback = "项目、调研以外的其他费用"

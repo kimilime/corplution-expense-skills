@@ -91,6 +91,8 @@ Corplution has two meal daily standards:
 - Business-trip meals: RMB 150 per day.
 - Local overtime meals: RMB 60 per day.
 
+Authoritative cap values live in `assets/policy.toml`; the numbers above are the current values for readability.
+
 After final rows are built and before final submission, calculate daily totals separately by meal policy.
 
 Treat a row as a business-trip meal when:
@@ -120,6 +122,8 @@ Corplution's hotel standards are:
 
 - Beijing, Shanghai, Guangzhou, Shenzhen: RMB 800 per night.
 - Other cities: RMB 600 per night.
+
+Authoritative cap values and the first-tier city list live in `assets/policy.toml`; the numbers above are the current values for readability.
 
 After final rows are built and before final submission, calculate each hotel item's reimbursable amount per stay against the relevant cap.
 

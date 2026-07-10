@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import integrity
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -168,11 +169,12 @@ def build_unit_update(unit: dict[str, Any], question_ids: list[str]) -> dict[str
     elif reliable_or_current_date(unit):
         update["expense_date"] = reliable_or_current_date(unit)
 
-    update["final_template_column"] = value_or_placeholder(
-        unit.get("final_template_column"),
-        "<hotel|travel|taxi|meal|mobile|other>",
-    )
-
+    # final_template_column is intentionally NOT offered: the visible amount
+    # column is computed from source_category + city (Shanghai meal -> meal
+    # column, out-of-town trip meal -> travel column, etc.) and re-normalized
+    # on every apply. Offering it here invited models to set it and then
+    # watch normalize silently override their value. To change a column, fix
+    # source_category or city instead.
     if category == "hotel":
         update["hotel_nights"] = value_or_placeholder(unit.get("hotel_nights"), "<nights>")
         update["check_in_date"] = value_or_placeholder(unit.get("check_in_date"), "<YYYY-MM-DD>")
@@ -270,7 +272,9 @@ def main(argv: list[str] | None = None) -> int:
 
     allocation_path = Path(args.allocation)
     payload = load_json(allocation_path)
+    integrity.require_valid(payload, allocation_path)
     template = build_template(payload, allocation_path, args.include_advisory)
+    template["source_allocation_fingerprint"] = payload.get("integrity", {}).get("fingerprint", "")
     output_path = Path(args.output)
     write_json(output_path, template)
     print(f"Wrote {output_path}")

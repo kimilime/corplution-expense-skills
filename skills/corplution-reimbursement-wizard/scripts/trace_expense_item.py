@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import json
+import integrity
 import sys
 from pathlib import Path
 from typing import Any
@@ -12,6 +13,12 @@ from typing import Any
 
 def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8-sig"))
+
+
+def load_allocation(path: Path) -> dict[str, Any]:
+    payload = load_json(path)
+    integrity.warn_if_invalid(payload, path)
+    return payload
 
 
 def clean(value: Any) -> str:
@@ -185,7 +192,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--json", action="store_true", help="Print JSON instead of text.")
     args = parser.parse_args(argv)
 
-    allocation = load_json(Path(args.allocation))
+    allocation = load_allocation(Path(args.allocation))
     extraction = load_json(Path(args.extraction))
     payload = trace_payload(allocation, extraction, args.item)
     if args.json:

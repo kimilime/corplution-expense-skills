@@ -16,6 +16,7 @@ Create a `process/` folder next to the final workbook or in the user-requested o
 
 - `process/invoice-extraction.md`: reviewable process file.
 - `process/invoice-extraction.json`: structured handoff for later stages.
+- `process/extraction-corrections.json`: durable, integrity-stamped correction and unsupported-input resolution overlay.
 - `process/evidence/`: optional rendered pages or OCR crops.
 
 ## User-Facing Review List
@@ -43,10 +44,21 @@ When the user reports that an item is wrong:
 1. Trace the user-facing item number back to `source_file`, invoice number, seller/service provider, amount, date, and any supporting trip item.
 2. Inspect the source file or rendered evidence when needed.
 3. Ask the user for the corrected value in natural language.
-4. Apply corrected downstream fields through `process/allocation-answers.json` and `scripts/apply_allocation_answers.py`.
+4. Apply an extraction correction through `scripts/apply_extraction_corrections.py`, then re-run allocation and use the allocation answers updater for any downstream decision.
 5. Keep correction notes/change logs instead of silently overwriting evidence.
 
 Do not require the user to mention internal IDs such as `DOC-001` or `UNIT-001`.
+
+## Unsupported Input Files
+
+Folder uploads can contain evidence formats the extractor cannot read, such as OFD, EML, or ZIP. These files are not document records, but they are still evidence and must be persisted in top-level `unresolved_input_files` with:
+
+- `source_file`, `filename`, `suffix`, and `sha256`
+- `status`: `open`, `exclude`, or `converted`
+- `resolution`, `resolved_by`, and `resolved_at` once the user decides
+- `replacement_file` when status is `converted`
+
+`open` is a hard stop for Stage 2, Stage 3, and Stage 4. Ask the user whether the file should be excluded or converted to a readable PDF/image, then save the decision through `input_resolutions` in `apply_extraction_corrections.py`. Match by SHA-256 whenever possible; a filename-only match that finds multiple files must be rejected.
 
 ## Canonical Document Fields
 
@@ -196,9 +208,12 @@ Documents needing review: N
     "supporting_schedule_count": 0,
     "unknown_count": 0,
     "review_count": 0,
+    "indexed_input_count": 0,
+    "unresolved_input_count": 0,
     "total_invoice_amount": "0.00"
   },
   "documents": [],
+  "unresolved_input_files": [],
   "document_links": [],
   "review_queue": []
 }
@@ -220,7 +235,8 @@ For Didi/Gaode, link summary invoice and trip report when total amounts match. G
 
 Stage 1 is complete only when:
 
-- Every input file appears in the document index.
+- Every input file appears either in the document index or in `unresolved_input_files`.
+- No `unresolved_input_files` entry remains `open`; the user has recorded an exclusion reason or a readable replacement file.
 - Every invoice-like file has extracted fields or review issues.
 - Every Didi/Gaode trip report has parsed trip items and a reported total when available.
 - Didi/Gaode summary invoices are linked to matching trip reports when possible.

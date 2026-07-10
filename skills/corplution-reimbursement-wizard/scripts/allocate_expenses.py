@@ -13,6 +13,13 @@ from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
+# Policy numbers and year-coded charge codes come from assets/policy.toml;
+# edit that file (not this one) when company policy changes.
+from policy_config import load_policy
+import integrity
+
+_POLICY = load_policy()
+
 
 C = {
     "local": "\u672c\u5730",
@@ -27,7 +34,7 @@ C = {
     "gaode": "\u9ad8\u5fb7",
     "didi": "\u6ef4\u6ef4",
     "admin": "Admin",
-    "admin_code": "CORP-2026-ADMIN",
+    "admin_code": _POLICY.admin_code,
     "admin_fallback_client": "\u9879\u76ee\u3001\u8c03\u7814\u4ee5\u5916\u7684\u5176\u4ed6\u8d39\u7528",
     "travel_meal": "\u51fa\u5dee\u9910\u8d39",
     "station_meal": "\u51fa\u5dee\u9910\u8d39\uff08\u9ad8\u94c1\u7ad9/\u673a\u573a\uff09",
@@ -109,7 +116,7 @@ def mobile_accounting_errors(unit: dict[str, Any]) -> list[str]:
     project_expense_categories = {"hotel", "meal", "taxi", "travel"}
     if source_category in project_expense_categories or final_column in project_expense_categories:
         if is_admin_code(unit.get("client_charge_code")):
-            errors.append("project expenses cannot be assigned to CORP-2026-ADMIN")
+            errors.append(f"project expenses cannot be assigned to {_POLICY.admin_code}")
     return errors
 
 
@@ -464,6 +471,37 @@ def normal_note(unit: dict[str, Any]) -> str:
     return source
 
 
+def print_document_reconciliation(extraction: dict[str, Any], units: list[dict[str, Any]]) -> None:
+    """Every extraction document must land in exactly one bucket. If any is
+    unaccounted for, that is a pipeline bug — say so loudly."""
+    docs = extraction.get("documents", [])
+    _, schedule_to_invoice = ride_schedule_links(extraction)
+    linked_invoices = set(schedule_to_invoice.values())
+    unit_doc_ids = {u.get("source_doc_id") for u in units if u.get("source_doc_id")}
+    excluded = [d for d in docs if d.get("excluded_by_user")]
+    supporting = [d for d in docs if not d.get("excluded_by_user")
+                  and d.get("document_role") == "supporting_document"]
+    unknown_units = [u for u in units if u.get("source_category") == "unknown"]
+    accounted = set()
+    for d in docs:
+        did = d["document_id"]
+        if d.get("excluded_by_user") or did in unit_doc_ids or did in linked_invoices            or d.get("document_role") in {"supporting_document", "supporting_schedule"}:
+            accounted.add(did)
+    unaccounted = [d for d in docs if d["document_id"] not in accounted]
+    print("")
+    print("DOCUMENT RECONCILIATION TO SHOW IN CHAT:")
+    print(f"- Extraction documents: {len(docs)} = expense units/linked {len(docs) - len(excluded) - len(supporting) - len(unaccounted)}"
+          f" + supporting documents {len(supporting)} + excluded by user {len(excluded)}")
+    for d in excluded:
+        print(f"  * excluded: {Path(str(d.get('source_file',''))).name} ({d.get('exclusion_reason','')})")
+    if unknown_units:
+        print(f"- Unidentified documents held as BLOCKING questions: {len(unknown_units)} (resolve via chat + apply_extraction_corrections.py)")
+    if unaccounted:
+        print(f"ERROR: {len(unaccounted)} document(s) unaccounted for — this is a bug, do not proceed:")
+        for d in unaccounted:
+            print(f"  * {d['document_id']}: {Path(str(d.get('source_file',''))).name} (role={d.get('document_role')})")
+
+
 def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
     docs = doc_by_id(extraction)
     invoice_to_schedule, schedule_to_invoice = ride_schedule_links(extraction)
@@ -473,6 +511,8 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
 
     for doc in extraction.get("documents", []):
         doc_id = doc["document_id"]
+        if doc.get("excluded_by_user"):
+            continue
         role = doc.get("document_role")
         subtype = doc.get("document_subtype")
         classification = doc.get("classification") or {}
@@ -653,6 +693,50 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
             units.append(unit)
             unit_idx += 1
             continue
+
+        if role == "supporting_document":
+            # Legitimate evidence with no expense row of its own (approval
+            # screenshots, payment receipts); packaging picks it up later.
+            continue
+
+        # Catch-all: every document the pipeline does not recognize becomes a
+        # BLOCKING question unit instead of silently vanishing. A file is
+        # evidence until the user explicitly drops it — it may be an invoice
+        # that needs OCR/vision, a partner approval screenshot, or a payment
+        # receipt (paper slip / Alipay / WeChat screenshot).
+        filename = Path(str(doc.get("source_file", ""))).name
+        amount = clean((doc.get("invoice") or {}).get("total_amount"))
+        unit = {
+            "unit_id": f"UNIT-{unit_idx:03d}",
+            "unit_no": unit_idx,
+            "source_doc_id": doc_id,
+            "source_filename": filename,
+            "source_category": "unknown",
+            "amount": amount,
+            "amount_column": "",
+            "status": "open",
+            "confidence": "low",
+            "match_reason": "document_role could not be determined automatically",
+            "issues": ["unidentified_document"],
+            "final_note": "",
+        }
+        units.append(unit)
+        questions.append({
+            "question_id": f"Q-UNKNOWN-{doc_id}",
+            "unit_ids": [unit["unit_id"]],
+            "question": (
+                f"第{unit_idx}项（{filename}）无法自动识别，请确认它是什么："
+                "① 发票（图片/扫描件，需要人工或视觉识别，请提供发票号码、开票日期、销售方、金额）；"
+                "② 合伙人审批截图等审批凭证；"
+                "③ 付款凭证（小票、支付宝/微信支付截图等支持文档）；"
+                "④ 其他，请说明；"
+                "或明确回复不报销/排除（需说明原因）。"
+                "确认后通过 apply_extraction_corrections.py 写回，再重跑 allocation。"
+            ),
+            "why_it_matters": "未识别的文件默认是报销证据；不确认或不排除就无法进入报销表，也无法通过 stage 3 preflight。",
+            "status": "open",
+        })
+        unit_idx += 1
 
     return units, questions
 
@@ -1454,7 +1538,7 @@ def apply_matches(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -
                 "client_charge_code": C["admin_code"],
                 "confidence": "fixed",
                 "status": "confirmed",
-                "match_reason": "Mobile/telecom expenses are assigned to CORP-2026-ADMIN with Client = 通讯费.",
+                "match_reason": f"Mobile/telecom expenses are assigned to {_POLICY.admin_code} with Client = {_POLICY.mobile_client}.",
             })
             normalize_admin_client(unit)
             continue
@@ -1918,7 +2002,7 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
         if accounting_errors:
             prompts.append(
                 (
-                    "这项费用的会计归属存在明显冲突：非通讯费不能写“通讯费”、不能进 mobile 列；打车/交通费也不能归入 CORP-2026-ADMIN。请按实际项目重新确认 Client、Client Charge Code、金额列和 Note。",
+                    f"这项费用的会计归属存在明显冲突：非通讯费不能写“通讯费”、不能进 mobile 列；打车/交通费也不能归入 {_POLICY.admin_code}。请按实际项目重新确认 Client、Client Charge Code、金额列和 Note。",
                     "这是硬性防呆规则，用于防止未匹配交通费被错误丢进通讯费/Admin。",
                 )
             )
@@ -1971,7 +2055,7 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
                 prompts.append(
                     (
                         "这是酒店费用。请确认入住日期、离店日期、住宿晚数；如果是标间同住，也请说明同住人或同住情况。",
-                        "酒店报销标准按每晚计算：北上广深 800/晚，其他城市 600/晚；缺少入住/离店日期和晚数时无法判断日期与是否超标。",
+                        f"酒店报销标准按每晚计算：北上广深 {_POLICY.first_tier_hotel_cap:f}/晚，其他城市 {_POLICY.other_city_hotel_cap:f}/晚；缺少入住/离店日期和晚数时无法判断日期与是否超标。",
                     )
                 )
 
@@ -2024,7 +2108,7 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
                 questions,
                 unit,
                 (
-                    "这笔费用已经归到 CORP-2026-ADMIN，Client 暂写为“项目、调研以外的其他费用”。"
+                    f"这笔费用已经归到 {_POLICY.admin_code}，Client 暂写为“{_POLICY.admin_fallback_client}”。"
                     "如果其实是年会、半年会、客户会、行业协会会议等具体事项，请直接告诉我应改成什么；"
                     "如果不改，这个默认值也可以先进入最终表。"
                 ),
@@ -2075,19 +2159,50 @@ def print_applicant_review_list(payload: dict[str, Any]) -> None:
         print(unit_review_line(unit))
 
 
+def add_trip_window_advisories(payload: dict[str, Any]) -> None:
+    """A weak classifier often files trip-day meals/transport as `other`.
+    The script cannot re-judge the category, but it can raise suspicion:
+    any `other` expense dated inside a project's travel window gets an
+    advisory so the user (the final judge) sees it."""
+    contexts = [c for c in payload.get("project_contexts", [])
+                if clean(c.get("client_charge_code")) != _POLICY.admin_code]
+    for unit in payload.get("allocation_units", []):
+        if unit.get("source_category") != "other":
+            continue
+        unit_date = clean(unit.get("expense_date"))
+        if not unit_date:
+            continue
+        for ctx in contexts:
+            if date_in_context(unit_date, ctx):
+                add_advisory_question(
+                    payload.setdefault("questions", []),
+                    unit,
+                    f"此项被分类为 other，但日期 {unit_date} 落在「{clean(ctx.get('client_name'))}」出差期间。"
+                    "请确认它是否其实是出差餐费/交通/住宿（若是，需改回对应类别，否则不会参与餐费/酒店标准检查）。",
+                    "出差期间的餐费若被归为 other，将绕过每日 150 元出差餐费上限检查。",
+                )
+                break
+
+
 def print_open_questions(payload: dict[str, Any]) -> None:
     open_questions = [q for q in payload.get("questions", []) if q.get("status", "open") == "open"]
     if not open_questions:
         print("No open allocation questions. Stage 2 is ready for Excel output.")
+        print("NEXT: run build_allocation_answers_template.py if draft units remain, "
+              "otherwise run write_reimbursement_template.py.")
     else:
         print("")
-        print("QUESTIONS TO ASK USER DIRECTLY IN THIS CHAT:")
-        print("Do not ask the user to open expense-allocation.md/json; copy or summarize these questions in the conversation.")
+        print("=== 请将以下内容原样转发给用户（逐字复制，不要归纳或省略）===")
+        print(f"这批费用有 {len(open_questions)} 个问题需要你确认：")
         for idx, question in enumerate(open_questions, start=1):
             print(f"{idx}. {question.get('question', '')}")
-            why = clean(question.get("why_it_matters"))
-            if why:
-                print(f"   Why: {why}")
+        print("请按编号回复即可，不用严格格式。")
+        print("=== 转发块结束 ===")
+        print("")
+        print(f"⚠ NEXT (MANDATORY): {len(open_questions)} blocking question(s). Your very next chat "
+              "message MUST contain the 转发块 above, verbatim, then STOP and wait for the user's "
+              "answers. Do not end your turn without sending it, and do not proceed to any later "
+              "stage first.")
 
 
 def print_advisory_questions(payload: dict[str, Any]) -> None:
@@ -2169,8 +2284,23 @@ def main(argv: list[str] | None = None) -> int:
 
     extraction_path = Path(args.extraction)
     extraction = load_json(extraction_path)
+    integrity.require_valid(extraction, extraction_path, kind="extraction")
+    unresolved_inputs = [
+        item for item in extraction.get("unresolved_input_files", [])
+        if item.get("status", "open") == "open"
+    ]
+    if unresolved_inputs:
+        print("ERROR: allocation is blocked because supplied files remain unsupported and undecided:", file=sys.stderr)
+        for item in unresolved_inputs:
+            print(f"  - {item.get('filename', '?')} ({item.get('suffix') or 'no suffix'}; "
+                  f"sha256 {item.get('sha256', '?')})", file=sys.stderr)
+        print("NEXT: ask the user whether each file should be excluded or converted to a readable PDF/image, "
+              "record that decision with apply_extraction_corrections.py (input_resolutions), then re-run "
+              "extract_invoices.py before allocation.", file=sys.stderr)
+        return 2
     contexts, raw_context, context_questions = load_context(Path(args.context) if args.context else None)
     units, link_questions = create_units(extraction, contexts)
+    print_document_reconciliation(extraction, units)
     apply_matches(units, contexts)
     questions = build_questions(units, context_questions + link_questions)
 
@@ -2178,6 +2308,7 @@ def main(argv: list[str] | None = None) -> int:
         "schema_version": "expense_allocation.v1",
         "generated_at": datetime.now().replace(microsecond=0).isoformat(),
         "source_extraction_file": str(extraction_path),
+        "source_extraction_fingerprint": extraction["integrity"]["fingerprint"],
         "raw_project_context": raw_context,
         "project_contexts": contexts,
         "allocation_units": units,
@@ -2185,11 +2316,13 @@ def main(argv: list[str] | None = None) -> int:
         "change_log": [],
     }
     output = Path(args.output)
+    integrity.stamp(payload, "allocate_expenses.py")
     write_json(output / "expense-allocation.json", payload)
     (output / "expense-allocation.md").write_text(build_markdown(payload), encoding="utf-8")
     print(f"Wrote {output / 'expense-allocation.json'}")
     print(f"Wrote {output / 'expense-allocation.md'}")
     print_applicant_review_list(payload)
+    add_trip_window_advisories(payload)
     print_open_questions(payload)
     print_advisory_questions(payload)
     return 0

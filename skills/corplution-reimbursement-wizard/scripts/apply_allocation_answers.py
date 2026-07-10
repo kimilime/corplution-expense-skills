@@ -17,13 +17,19 @@ ALLOWED_COLUMNS = {"hotel", "travel", "taxi", "meal", "mobile", "other"}
 OPEN_STATUSES = {"open", "needs_confirmation", "draft"}
 CLOSED_UNIT_STATUSES = {"confirmed", "fixed", "dropped", "excluded", "non_reimbursable"}
 ALLOWED_UNIT_STATUSES = OPEN_STATUSES | CLOSED_UNIT_STATUSES
-ADMIN_CODE = "CORP-2026-ADMIN"
-ADMIN_FALLBACK_CLIENT = "项目、调研以外的其他费用"
-MOBILE_CLIENT = "通讯费"
+# Policy values come from assets/policy.toml; edit that file when policy changes.
+from policy_config import load_policy
+import integrity
+
+_POLICY = load_policy()
+ADMIN_CODE = _POLICY.admin_code
+ADMIN_FALLBACK_CLIENT = _POLICY.admin_fallback_client
+MOBILE_CLIENT = _POLICY.mobile_client
 
 ALLOWED_ROOT_FIELDS = {
     "schema_version",
     "generated_at",
+    "source_allocation_fingerprint",
     "source_allocation_file",
     "fill_instructions",
     "review_context",
@@ -73,7 +79,6 @@ ALLOWED_UNIT_FIELDS = {
     "expense_note",
     "expenses_nature",
     "final_note",
-    "final_template_column",
     "check_in_date",
     "check_out_date",
     "hotel_city",
@@ -161,7 +166,11 @@ def formal_meal_column(unit: dict[str, Any]) -> str:
         return "meal"
     if city:
         return "travel"
-    return clean(unit.get("final_template_column")) or "meal"
+    current = clean(unit.get("final_template_column"))
+    # A stale non-meal column (e.g. "other" left over from reclassification)
+    # must not survive: it would drop the row into the wrong workbook column
+    # and hide it from the daily meal cap policy detection.
+    return current if current in {"meal", "travel"} else "meal"
 
 
 def normalize_meal_column(unit: dict[str, Any]) -> None:
@@ -405,7 +414,7 @@ def mobile_accounting_errors(unit: dict[str, Any]) -> list[str]:
     project_expense_categories = {"hotel", "meal", "taxi", "travel"}
     if source_category in project_expense_categories or final_column in project_expense_categories:
         if is_admin_code(unit.get("client_charge_code")):
-            errors.append("project expenses cannot be assigned to CORP-2026-ADMIN")
+            errors.append(f"project expenses cannot be assigned to {ADMIN_CODE}")
     return errors
 
 
@@ -575,8 +584,81 @@ def add_issue(unit: dict[str, Any], field: str, problem: str) -> None:
         issues.append(issue)
 
 
+def guard_meal_reclass_signal(unit: dict[str, Any], update: dict[str, Any], was_meal: bool) -> str | None:
+    """Reclassifying something INTO a meal needs one decidable signal, or the
+    150/60 daily-cap policy cannot tell trip meal from overtime meal and the
+    row cannot be placed in the right column."""
+    if was_meal or clean(update.get("source_category")) != "meal":
+        return None
+    has_signal = (
+        clean(unit.get("city"))
+        or clean(unit.get("meal_context"))
+        or clean(unit.get("final_note")).startswith(("出差餐费", "加班餐费"))
+    )
+    if has_signal:
+        return None
+    return (
+        f"{unit.get('unit_id')}: reclassified to meal, but there is no way to decide which "
+        "meal policy applies. Add ONE of: city (哪个城市吃的 — 决定 meal/travel 列和是否按 "
+        "150/天出差餐费检查), meal_context: \"overtime\" (加班餐, 60/天), or a final_note "
+        "starting with 出差餐费/加班餐费."
+    )
+
+
+def guard_meal_note_mismatch(unit: dict[str, Any]) -> str | None:
+    """A meal-style final_note on a non-meal unit is internally inconsistent:
+    the daily meal cap check selects by source_category, so this unit would
+    silently escape it (the exact failure: reclassify other->meal by writing
+    the note but forgetting source_category)."""
+    note = clean(unit.get("final_note"))
+    cat = clean(unit.get("source_category"))
+    if "餐费" in note and cat != "meal":
+        return (
+            f"{unit.get('unit_id')} is inconsistent after this update: final_note "
+            f"{note!r} describes a meal, but source_category is {cat!r} — the RMB150/60 "
+            "daily meal cap check selects rows by category and would NOT see this item. "
+            "Either add source_category: \"meal\" to the same unit update (reclassifying "
+            "it as a meal), or fix the final_note if it is genuinely not a meal."
+        )
+    return None
+
+
+def guard_category_flip(unit: dict[str, Any], update: dict[str, Any]) -> str | None:
+    """Trip meals must KEEP source_category=meal; the writer script moves them
+    into the travel amount column by formal city automatically. Flipping the
+    category disables the RMB-150/day meal cap check entirely."""
+    new_cat = clean(update.get("source_category"))
+    old_cat = clean(unit.get("source_category"))
+    if old_cat == "meal" and new_cat in {"travel", "taxi"} and not update.get("manual_correction"):
+        return (
+            f"refusing to change {unit.get('unit_id')} source_category meal -> {new_cat}: "
+            "if you want a trip meal shown in the travel column, do NOTHING — "
+            "write_reimbursement_template.py assigns the column by restaurant city automatically, "
+            "and the item must stay category=meal so the daily meal cap check still sees it. "
+            "If this document truly is not a meal (extraction error), resubmit with "
+            "manual_correction: true and a correction_note explaining why."
+        )
+    return None
+
+
+COMPUTED_FIELDS_TEACHING = {
+    "final_template_column": (
+        "final_template_column is COMPUTED, not settable: the writer derives the visible "
+        "amount column from source_category + city (Shanghai restaurant -> meal column, "
+        "out-of-town trip meal -> travel column with the RMB150/day trip-meal cap; "
+        "Shanghai ride -> taxi, out-of-town ride -> travel). Any value you set here is "
+        "re-normalized away on apply. If the column looks wrong, fix the INPUT instead: "
+        "set city (e.g. \u57ce\u5e02\u5199\u9519) or source_category (extraction error, "
+        "needs manual_correction + correction_note)."
+    ),
+}
+
+
 def validate_update(update: dict[str, Any], lenient: bool) -> list[str]:
     errors: list[str] = []
+    for field, teaching in COMPUTED_FIELDS_TEACHING.items():
+        if field in update:
+            errors.append(teaching)
     for path in placeholder_paths(update, "unit_update"):
         errors.append(f"Unfilled template placeholder at {path}")
     for field in update:
@@ -737,7 +819,7 @@ def sync_admin_client_advisories(payload: dict[str, Any]) -> None:
                 "unit_ids": [unit_id],
                 "user_no": unit_no(unit),
                 "question": (
-                    f"第{unit_no(unit)}项已经归到 CORP-2026-ADMIN，Client 暂写为"
+                    f"第{unit_no(unit)}项已经归到 {ADMIN_CODE}，Client 暂写为"
                     f"“{ADMIN_FALLBACK_CLIENT}”。如果其实是年会、半年会、客户会、"
                     "行业协会会议等具体事项，请直接告诉我要改成什么；不改也可以继续写表。"
                 ),
@@ -831,7 +913,18 @@ def apply_answers(
     write_output: bool = True,
 ) -> dict[str, Any]:
     payload = load_json(allocation_path)
+    integrity.require_valid(payload, allocation_path)
     answers = load_json(answers_path)
+    expected = payload.get("integrity", {}).get("fingerprint", "")
+    provided = str(answers.get("source_allocation_fingerprint", "")).strip()
+    if provided != expected:
+        raise ValueError(
+            "answers file was generated against a DIFFERENT allocation generation "
+            f"(fingerprint {provided[:8] or '<missing>'}... vs current {expected[:8]}...). "
+            "Unit ids may have shifted after allocation was re-run — replaying old answers "
+            "would silently write data onto the wrong units. Regenerate the template against "
+            "the CURRENT allocation, re-fill it, then apply. Never reuse an old answers file."
+        )
     unit_updates, question_updates, context_updates = normalize_answers(answers)
     unit_lookup = units_by_id(payload)
     unit_no_lookup = units_by_no(payload)
@@ -847,7 +940,17 @@ def apply_answers(
             unit = resolve_unit_ref(unit_ref, unit_lookup, unit_no_lookup)
             if not unit:
                 raise ValueError(f"Unknown unit reference: {unit_ref}")
+            flip_error = guard_category_flip(unit, update)
+            if flip_error:
+                raise ValueError(flip_error)
+            was_meal = clean(unit.get("source_category")) == "meal"
             changes.append(apply_unit_update(unit, update, lenient))
+            mismatch = guard_meal_note_mismatch(unit)
+            if mismatch:
+                raise ValueError(mismatch)
+            signal_error = guard_meal_reclass_signal(unit, update, was_meal)
+            if signal_error:
+                raise ValueError(signal_error)
             touched_units.add(unit["unit_id"])
 
     for unit in payload.get("allocation_units", []):
@@ -871,9 +974,47 @@ def apply_answers(
         if output_path.resolve() == allocation_path.resolve():
             backup = allocation_path.with_suffix(allocation_path.suffix + ".bak")
             shutil.copy2(allocation_path, backup)
+        integrity.stamp(payload, "apply_allocation_answers.py")
         write_json(output_path, payload)
         markdown_path.write_text(build_markdown(payload), encoding="utf-8")
+        remaining = [q for q in payload.get("questions", []) if q.get("status", "open") == "open"]
+        if remaining:
+            print(f"NEXT: {len(remaining)} blocking question(s) still open — relay them to the user "
+                  "verbatim and wait; do not run stage 3 yet.")
+        else:
+            print("NEXT: no blocking questions remain — run write_reimbursement_template.py "
+                  "(stage 3). If allocation was re-generated since this template was built, "
+                  "regenerate the template first.")
     return payload
+
+
+def print_answers_schema_help(allocation_path: Path) -> None:
+    """Printed on every validation failure.
+
+    Do not guess field names or invent a schema — that is what caused this
+    error. The fastest fix is always to regenerate the canonical template.
+    """
+    print("", file=sys.stderr)
+    print("HOW TO FIX (do not guess the schema, do not write a patch script):", file=sys.stderr)
+    print("1. Regenerate the canonical answers template for the CURRENT allocation state:", file=sys.stderr)
+    print(f"   python scripts/build_allocation_answers_template.py --allocation {allocation_path} "
+          "--output process/allocation-answers.template.json", file=sys.stderr)
+    print("2. Fill ONLY the generated unit_updates entries. A valid entry looks like:", file=sys.stderr)
+    print(json.dumps({
+        "unit_updates": [{
+            "unit_id": "<UNIT-XXX>",
+            "status": "confirmed",
+            "client_name": "<客户名称或事项名称>",
+            "client_charge_code": "<Client Charge Code>",
+            "expense_date": "<YYYY-MM-DD>",
+            "final_note": "<最终备注>",
+        }]
+    }, ensure_ascii=False, indent=2), file=sys.stderr)
+    print("NOTE: every <> value above is a placeholder — copy the STRUCTURE, replace every", file=sys.stderr)
+    print("value with real data; unreplaced placeholders are rejected by validation.", file=sys.stderr)
+    print("3. Top-level keys allowed: " + ", ".join(sorted(ALLOWED_ROOT_FIELDS)), file=sys.stderr)
+    print("4. unit_update fields allowed: " + ", ".join(sorted(ALLOWED_UNIT_FIELDS)), file=sys.stderr)
+    print("5. Validate with --dry-run first, then apply without it.", file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -901,6 +1042,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
+        print_answers_schema_help(allocation_path)
         return 2
     if args.dry_run:
         print("Dry run OK. No files were written.")

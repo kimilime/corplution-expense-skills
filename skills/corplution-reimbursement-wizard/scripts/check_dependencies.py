@@ -50,7 +50,15 @@ def install_requirements(requirements: Path) -> int:
     command = [sys.executable, "-m", "pip", "install", "-r", str(requirements)]
     print("Installing Python dependencies:")
     print(" ".join(command))
-    return subprocess.call(command)
+    rc = subprocess.call(command)
+    if rc != 0:
+        # Externally managed environments (PEP 668), e.g. sandboxed agent
+        # containers, reject plain pip installs; retry with the override flag.
+        retry = command + ["--break-system-packages"]
+        print("Plain install failed; retrying for externally managed environments:")
+        print(" ".join(retry))
+        rc = subprocess.call(retry)
+    return rc
 
 
 def main(argv: list[str] | None = None) -> int:

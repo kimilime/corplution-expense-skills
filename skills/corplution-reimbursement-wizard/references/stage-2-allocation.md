@@ -44,7 +44,7 @@ Ask the user to provide, in natural language:
 
 Do not require a rigid form. Parse the user's natural language into structured context and show a concise draft for confirmation when the context is ambiguous.
 
-Ask missing information in the current chat, not by asking the user to open process files. The Markdown and JSON outputs are audit/process artifacts for Codex; the user-facing loop must happen in conversation.
+Ask missing information in the current chat, not by asking the user to open process files. The Markdown and JSON outputs are internal audit/process artifacts for the agent; the user-facing loop must happen in conversation.
 
 ## Project Context Model
 
@@ -107,7 +107,7 @@ The allocation script scores these hints against extracted units using amount, d
 
 Use hints to preserve attendee details even when a meal does not exceed the cap.
 
-Do not let a meal hint override the formal amount column or `Expense Nature`. For meal invoices, `final_template_column` and nature follow the invoice/restaurant city: Shanghai formal city -> `meal`/local; non-Shanghai formal city -> `travel`/business trip. A Shanghai invoice can still belong to an out-of-town project and use note `出差餐费`, but its amount column remains `meal` and its nature remains local.
+Do not let a meal hint override the formal amount column or `Expense Nature`. For meal invoices, `final_template_column` and nature follow the invoice/restaurant city: Shanghai formal city -> `meal`/local; non-Shanghai formal city -> `travel`/business trip. A Shanghai invoice can still belong to an out-of-town project and use note `出差餐费`, but its amount column remains `meal` and its nature remains local. `final_template_column` is computed and re-normalized on every apply — it cannot be set through the answers file; to change a column, correct `city` or `source_category` instead.
 
 ## Allocation Units
 
@@ -256,7 +256,7 @@ Final note:
 
 If stay dates or nights are missing, infer project ownership from city uniqueness only when high confidence, but still ask the user for check-in date, check-out date, and number of nights. Project pre-allocation and hotel cap validation are separate: a hotel can be pre-allocated while still requiring stay-night confirmation.
 
-Also ask for shared-room/co-occupant details when a hotel may exceed the per-night standard. Stage 3 applies hotel caps after final rows are built: Beijing/Shanghai/Guangzhou/Shenzhen are RMB 800 per night, other cities are RMB 600 per night.
+Also ask for shared-room/co-occupant details when a hotel may exceed the per-night standard. Stage 3 applies hotel caps after final rows are built (per-night amounts and the first-tier city list are defined in `assets/policy.toml`; currently first-tier cities are RMB 800 per night, other cities RMB 600).
 
 Carry these fields when known:
 

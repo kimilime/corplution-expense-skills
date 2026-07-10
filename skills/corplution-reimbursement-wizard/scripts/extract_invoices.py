@@ -4,6 +4,9 @@
 from __future__ import annotations
 
 import argparse
+
+import extraction_corrections as xc
+import integrity
 import hashlib
 import json
 import re
@@ -155,16 +158,30 @@ def sha256_file(path: Path) -> str:
     return h.hexdigest()
 
 
-def iter_input_files(paths: list[Path]) -> list[Path]:
+def iter_input_files(paths: list[Path]) -> tuple[list[Path], list[Path]]:
+    """Collect supported files and, separately, files that were skipped.
+
+    Skipped files must be surfaced to the user, never silently dropped:
+    unsupported suffixes (e.g. .ofd e-invoices, .eml, .zip) may still be
+    reimbursement evidence that needs manual handling.
+    """
     files: list[Path] = []
+    skipped: list[Path] = []
     for path in paths:
         if path.is_dir():
             for child in sorted(path.rglob("*")):
-                if child.is_file() and child.suffix.lower() in PDF_SUFFIXES | IMAGE_SUFFIXES:
+                if not child.is_file():
+                    continue
+                if child.suffix.lower() in PDF_SUFFIXES | IMAGE_SUFFIXES:
                     files.append(child)
+                else:
+                    skipped.append(child)
         elif path.is_file():
-            files.append(path)
-    return files
+            if path.suffix.lower() in PDF_SUFFIXES | IMAGE_SUFFIXES:
+                files.append(path)
+            else:
+                skipped.append(path)
+    return files, skipped
 
 
 def has_tesseract() -> bool:
@@ -969,6 +986,54 @@ def applicant_review_line(doc: dict[str, Any]) -> str:
     return " | ".join(parts)
 
 
+def print_input_reconciliation(payload: dict[str, Any], files: list[Path], skipped: list[Path]) -> None:
+    """Print a mechanical accounting of every input file.
+
+    The agent must copy or summarize this block in chat. Every file the user
+    provided has to end up in exactly one bucket: indexed, needing manual
+    transcription, or skipped-unsupported. Nothing is allowed to disappear.
+    """
+    documents = payload.get("documents", [])
+    manual_docs = [doc for doc in documents if doc.get("extraction_method") == "manual_review"]
+    print("")
+    print("INPUT RECONCILIATION TO SHOW IN CHAT:")
+    print(f"- Files received: {len(files) + len(skipped)}")
+    print(f"- Indexed for extraction: {len(documents)}")
+    print(f"- Needing manual review/transcription (no usable text layer or OCR): {len(manual_docs)}")
+    for doc in manual_docs:
+        print(f"  * {doc.get('document_id', '?')}: {Path(str(doc.get('source_file', '?'))).name}")
+    unresolved = [item for item in payload.get("unresolved_input_files", []) if item.get("status") == "open"]
+    resolved = [item for item in payload.get("unresolved_input_files", []) if item.get("status") != "open"]
+    print(f"- Unsupported input files awaiting an explicit decision: {len(unresolved)}")
+    for item in unresolved:
+        print(f"  * {item.get('filename')} (unsupported suffix {item.get('suffix') or '<none>'}; sha256 {item.get('sha256')})")
+    if resolved:
+        print(f"- Previously resolved unsupported input files: {len(resolved)}")
+    if manual_docs:
+        print("ACTION: read each file visually if you can, then record what you saw via")
+        print("scripts/apply_extraction_corrections.py. If you cannot read it and OCR is")
+        print("unavailable, ask the user in chat with this template (batch all items):")
+        print("---")
+        print(f"有 {len(manual_docs)} 个文件我这边无法自动识别（图片/扫描件）。")
+        print("麻烦你对照原件告诉我每一项是什么：发票（请给发票号码、开票日期、销售方、金额）、")
+        print("合伙人审批截图、付款凭证（小票/支付宝/微信截图），还是其他？不报销的也请说明。")
+        for doc in manual_docs:
+            print(f"- {Path(str(doc.get('source_file', '?'))).name}")
+        print("---")
+        print("Then write the answers back with apply_extraction_corrections.py; they persist")
+        print("across extractor re-runs. Do NOT hand-edit invoice-extraction.json.")
+    if unresolved:
+        print("ACTION: tell the user these files were not processed and ask whether they are")
+        print("reimbursement evidence that needs converting (e.g. OFD/eml to PDF) or can be excluded.")
+        print("Record the user's decision through apply_extraction_corrections.py under input_resolutions;")
+        print("unsupported inputs remain a hard blocker until that decision is persisted.")
+    if manual_docs or unresolved:
+        print("NEXT: resolve the items above (vision/OCR/ask user + apply_extraction_corrections.py) "
+              "BEFORE running allocate_expenses.py.")
+    else:
+        print("NEXT: relay the extraction review list below to the user, then run allocate_expenses.py.")
+
+
 def print_extraction_review_list(payload: dict[str, Any]) -> None:
     docs = payload.get("documents", [])
     if not docs:
@@ -990,6 +1055,8 @@ def write_markdown(output_dir: Path, payload: dict[str, Any]) -> Path:
     lines.append("")
     lines.append(f"Generated at: {payload['generated_at']}")
     lines.append(f"Input files: {batch['input_count']}")
+    lines.append(f"Indexed for extraction: {batch['indexed_input_count']}")
+    lines.append(f"Unsupported inputs awaiting decision: {batch['unresolved_input_count']}")
     lines.append(f"Documents needing review: {batch['review_count']}")
     lines.append("")
     lines.append("## Batch Summary")
@@ -1000,6 +1067,21 @@ def write_markdown(output_dir: Path, payload: dict[str, Any]) -> Path:
     lines.append(f"| Supporting schedules | {batch['supporting_schedule_count']} |")
     lines.append(f"| Unknown documents | {batch['unknown_count']} |")
     lines.append(f"| Total invoice amount | {batch['total_invoice_amount']} |")
+    lines.append("")
+    lines.append("## Unsupported Input Files")
+    lines.append("")
+    lines.append("Every supplied file remains evidence until it is explicitly excluded or replaced with a readable conversion.")
+    lines.append("")
+    lines.append("| File | Suffix | SHA-256 | Status | Resolution | Replacement |")
+    lines.append("| --- | --- | --- | --- | --- | --- |")
+    for item in payload.get("unresolved_input_files", []):
+        lines.append(
+            f"| {md_escape(item.get('filename'))} | {md_escape(item.get('suffix'))} | "
+            f"{md_escape(item.get('sha256'))} | {md_escape(item.get('status'))} | "
+            f"{md_escape(item.get('resolution'))} | {md_escape(item.get('replacement_file'))} |"
+        )
+    if not payload.get("unresolved_input_files"):
+        lines.append("| None |  |  |  |  |  |")
     lines.append("")
     lines.append("## Applicant Review List")
     lines.append("")
@@ -1091,14 +1173,31 @@ def write_markdown(output_dir: Path, payload: dict[str, Any]) -> Path:
     return path
 
 
-def build_payload(input_files: list[Path]) -> dict[str, Any]:
+def unsupported_input_record(path: Path) -> dict[str, str]:
+    return {
+        "source_file": str(path),
+        "filename": path.name,
+        "suffix": path.suffix.lower(),
+        "sha256": sha256_file(path),
+        "status": "open",
+        "resolution": "",
+        "replacement_file": "",
+    }
+
+
+def build_payload(input_files: list[Path], skipped_files: list[Path]) -> dict[str, Any]:
     documents = [extract_document(f"DOC-{idx:03d}", path) for idx, path in enumerate(input_files, start=1)]
     links, review_queue = build_links_and_reviews(documents)
+    batch = batch_summary(documents, review_queue)
+    batch["input_count"] = len(input_files) + len(skipped_files)
+    batch["indexed_input_count"] = len(input_files)
+    batch["unresolved_input_count"] = len(skipped_files)
     return {
         "schema_version": "invoice_extraction.v1",
         "generated_at": datetime.now().replace(microsecond=0).isoformat(),
-        "batch": batch_summary(documents, review_queue),
+        "batch": batch,
         "documents": documents,
+        "unresolved_input_files": [unsupported_input_record(path) for path in skipped_files],
         "document_links": links,
         "review_queue": review_queue,
     }
@@ -1112,17 +1211,64 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     input_paths = [Path(item).expanduser() for item in args.inputs]
-    files = iter_input_files(input_paths)
-    if not files:
+    files, skipped = iter_input_files(input_paths)
+    if not files and not skipped:
         print("No supported PDF or image files found.", file=sys.stderr)
         return 2
 
-    payload = build_payload(files)
+    payload = build_payload(files, skipped)
     output_dir = Path(args.output)
+
+    # Re-run safety: back up the previous result, then replay saved corrections
+    # so vision/user fixes survive re-extraction (see extraction_corrections.py).
+    existing = output_dir / "invoice-extraction.json"
+    if existing.exists():
+        backup = existing.with_suffix(existing.suffix + ".bak")
+        backup.write_bytes(existing.read_bytes())
+        print(f"Previous extraction backed up to {backup}")
+    overlay = xc.load_overlay(output_dir)
+    if overlay.get("corrections") or overlay.get("input_resolutions"):
+        stamp_ok, stamp_reason = integrity.check(overlay)
+        if not stamp_ok:
+            print(f"WARNING: {xc.overlay_path(output_dir).name} failed its integrity check "
+                  f"({stamp_reason}) — it was edited outside apply_extraction_corrections.py. "
+                  "Schema-valid entries will still replay, but prefer the script so entries are "
+                  "validated and stamped.", file=sys.stderr)
+        valid_entries = []
+        for idx, entry in enumerate(overlay["corrections"], start=1):
+            entry_errors = xc.validate_correction(entry)
+            if entry_errors:
+                print(f"WARNING: skipping invalid overlay correction #{idx} "
+                      f"(overlay was edited outside apply_extraction_corrections.py?): "
+                      f"{'; '.join(entry_errors)}", file=sys.stderr)
+            else:
+                valid_entries.append(entry)
+        valid_input_resolutions = []
+        for idx, entry in enumerate(overlay["input_resolutions"], start=1):
+            entry_errors = xc.validate_input_resolution(entry)
+            if entry_errors:
+                print(f"WARNING: skipping invalid overlay input resolution #{idx} "
+                      f"(overlay was edited outside apply_extraction_corrections.py?): "
+                      f"{'; '.join(entry_errors)}", file=sys.stderr)
+            else:
+                valid_input_resolutions.append(entry)
+        if valid_entries:
+            replay_log = xc.apply_overlay(payload, {"corrections": valid_entries})
+            print(f"Replayed {len(valid_entries)} saved correction(s) from {xc.overlay_path(output_dir).name}:")
+            for line in replay_log:
+                print(f"  {line}")
+        if valid_input_resolutions:
+            replay_log = xc.apply_input_resolutions(payload, {"input_resolutions": valid_input_resolutions})
+            print(f"Replayed {len(valid_input_resolutions)} saved input resolution(s) from {xc.overlay_path(output_dir).name}:")
+            for line in replay_log:
+                print(f"  {line}")
+
+    integrity.stamp(payload, "extract_invoices.py")
     json_path = write_json(output_dir, payload)
     md_path = write_markdown(output_dir, payload)
     print(f"Wrote {md_path}")
     print(f"Wrote {json_path}")
+    print_input_reconciliation(payload, files, skipped)
     print_extraction_review_list(payload)
     return 0
 

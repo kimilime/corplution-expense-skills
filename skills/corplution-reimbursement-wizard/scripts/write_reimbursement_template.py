@@ -4,6 +4,7 @@
 from __future__ import annotations
 
 import argparse
+import hashlib
 import copy
 import json
 import re
@@ -45,23 +46,20 @@ C = {
     "hotel_cap_over_needs_confirmation": "\u8d85\u6807\uff0c\u9700\u786e\u8ba4\u665a\u6570/\u540c\u4f4f/\u5b9e\u62a5\u91d1\u989d",
 }
 
-BUSINESS_TRIP_MEAL_DAILY_CAP = Decimal("150.00")
-LOCAL_OVERTIME_MEAL_DAILY_CAP = Decimal("60.00")
-FIRST_TIER_HOTEL_CAP = Decimal("800.00")
-OTHER_CITY_HOTEL_CAP = Decimal("600.00")
-ADMIN_CODE = "CORP-2026-ADMIN"
-ADMIN_FALLBACK_CLIENT = "\u9879\u76ee\u3001\u8c03\u7814\u4ee5\u5916\u7684\u5176\u4ed6\u8d39\u7528"
-MOBILE_CLIENT = "\u901a\u8baf\u8d39"
-FIRST_TIER_CITIES = {
-    "\u5317\u4eac",
-    "\u4e0a\u6d77",
-    "\u5e7f\u5dde",
-    "\u6df1\u5733",
-    "beijing",
-    "shanghai",
-    "guangzhou",
-    "shenzhen",
-}
+# Policy numbers and year-coded values come from assets/policy.toml via
+# policy_config; edit that file (not this one) when company policy changes.
+from policy_config import load_policy
+import integrity
+
+_POLICY = load_policy()
+BUSINESS_TRIP_MEAL_DAILY_CAP = _POLICY.business_trip_meal_daily_cap
+LOCAL_OVERTIME_MEAL_DAILY_CAP = _POLICY.local_overtime_meal_daily_cap
+FIRST_TIER_HOTEL_CAP = _POLICY.first_tier_hotel_cap
+OTHER_CITY_HOTEL_CAP = _POLICY.other_city_hotel_cap
+ADMIN_CODE = _POLICY.admin_code
+ADMIN_FALLBACK_CLIENT = _POLICY.admin_fallback_client
+MOBILE_CLIENT = _POLICY.mobile_client
+FIRST_TIER_CITIES = _POLICY.first_tier_cities
 
 
 AMOUNT_COLUMNS = {
@@ -208,11 +206,11 @@ def mobile_accounting_errors(unit: dict[str, Any]) -> list[str]:
         if final_column != "mobile":
             errors.append("mobile expense must use the mobile amount column")
         if clean(unit.get("client_charge_code")).upper() != ADMIN_CODE:
-            errors.append("mobile expense must be assigned to CORP-2026-ADMIN")
+            errors.append(f"mobile expense must be assigned to {ADMIN_CODE}")
     project_expense_categories = {"hotel", "meal", "taxi", "travel"}
     if source_category in project_expense_categories or final_column in project_expense_categories:
         if clean(unit.get("client_charge_code")).upper() == ADMIN_CODE:
-            errors.append("project expenses cannot be assigned to CORP-2026-ADMIN")
+            errors.append(f"project expenses cannot be assigned to {ADMIN_CODE}")
     return errors
 
 
@@ -224,7 +222,11 @@ def formal_meal_column(unit: dict[str, Any]) -> str:
         return "meal"
     if city:
         return "travel"
-    return clean(unit.get("final_template_column")) or "meal"
+    current = clean(unit.get("final_template_column"))
+    # A stale non-meal column (e.g. "other" left over from reclassification)
+    # must not survive: it would drop the row into the wrong workbook column
+    # and hide it from the daily meal cap policy detection.
+    return current if current in {"meal", "travel"} else "meal"
 
 
 def is_shanghai_city(value: Any) -> bool:
@@ -586,6 +588,12 @@ def require_ready(allocation: dict[str, Any], allow_unconfirmed: bool) -> list[s
             continue
         if not allow_unconfirmed and status not in {"confirmed", "fixed"}:
             errors.append(f"{unit.get('unit_id')} is not confirmed or fixed.")
+        if "餐费" in clean(unit.get("final_note")) and clean(unit.get("source_category")) != "meal":
+            errors.append(
+                f"{unit.get('unit_id')} has a meal-style final_note but source_category "
+                f"{clean(unit.get('source_category'))!r} — it would escape the daily meal cap check. "
+                "Fix source_category (or the note) via the answers updater before writing the workbook."
+            )
         if not allow_unconfirmed and unit.get("date_required"):
             errors.append(f"{unit.get('unit_id')} still requires a user-confirmed expense date.")
         if (
@@ -926,8 +934,14 @@ def meal_daily_cap_checks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
     return checks
 
 
+def _meal_population_line(meal_checks: list) -> str:
+    total = sum(len(day.get("items", [])) for day in meal_checks)
+    return f"(covering {total} meal item(s) across {len(meal_checks)} day(s) — items are selected by source_category=meal)"
+
+
 def print_meal_cap_check(checks: list[dict[str, Any]]) -> None:
     print("\nMEAL DAILY CAP CHECK TO SHOW IN CHAT")
+    print(_meal_population_line(checks))
     print("Copy or summarize this check in the conversation before final submission.")
     if not checks:
         print("No meal rows requiring daily cap checks found.")
@@ -1642,7 +1656,39 @@ def main(argv: list[str] | None = None) -> int:
             return 2
 
     allocation = load_json(allocation_path)
+    integrity.require_valid(allocation, allocation_path)
     errors = require_ready(allocation, args.allow_unconfirmed)
+    extraction_path = allocation_path.parent / "invoice-extraction.json"
+    if not extraction_path.exists():
+        errors.append(
+            f"Current extraction not found next to allocation: {extraction_path}. "
+            "Re-run Stage 1 and Stage 2 from the same process folder before writing Excel."
+        )
+    else:
+        extraction = load_json(extraction_path)
+        integrity.require_valid(extraction, extraction_path, kind="extraction")
+        extraction_fp = (extraction.get("integrity") or {}).get("fingerprint", "")
+        allocated_fp = str(allocation.get("source_extraction_fingerprint", ""))
+        if not allocated_fp:
+            errors.append(
+                "Allocation has no source_extraction_fingerprint and cannot prove which extraction generation "
+                "it used. Re-run allocate_expenses.py and regenerate the answers template."
+            )
+        elif allocated_fp != extraction_fp:
+            errors.append(
+                "Extraction changed after allocation was created. Re-run allocate_expenses.py, regenerate the "
+                "answers template, and reapply the user's answers before writing Excel."
+            )
+        unresolved_inputs = [
+            item for item in extraction.get("unresolved_input_files", [])
+            if item.get("status", "open") == "open"
+        ]
+        if unresolved_inputs:
+            names = ", ".join(str(item.get("filename", "?")) for item in unresolved_inputs)
+            errors.append(
+                "Unsupported input files still need a recorded user decision: " + names + ". "
+                "Resolve them through apply_extraction_corrections.py, then re-run Stage 1 and Stage 2."
+            )
     print_stage3_preflight_summary(allocation, errors)
     if errors:
         for error in errors:
@@ -1699,7 +1745,20 @@ def main(argv: list[str] | None = None) -> int:
             }
         ],
     }
+    # Provenance chain: packaging verifies these against the CURRENT allocation,
+    # so a workbook built before later allocation edits cannot be packaged.
+    payload["source_allocation_fingerprint"] = allocation.get("integrity", {}).get("fingerprint", "")
+    payload["source_extraction_fingerprint"] = allocation.get("source_extraction_fingerprint", "")
+    payload["blocking_policy_checks"] = len(checks_requiring_confirmation(payload))
+    # Preview provenance: packaging refuses workbooks generated past open gates.
+    payload["generated_with_allow_unconfirmed"] = bool(args.allow_unconfirmed)
+    payload["open_allocation_questions"] = len([
+        q for q in allocation.get("questions", []) if q.get("status", "open") == "open"
+    ])
+    workbook_path = Path(args.output)
+    payload["workbook_sha256"] = hashlib.sha256(workbook_path.read_bytes()).hexdigest()
     process_dir = Path(args.process_dir)
+    integrity.stamp(payload, "write_reimbursement_template.py")
     write_json(process_dir / "final-expense-rows.json", payload)
     (process_dir / "final-expense-rows.md").write_text(build_markdown(payload, Path(args.output)), encoding="utf-8")
     print(f"Wrote {args.output}")
@@ -1710,7 +1769,11 @@ def main(argv: list[str] | None = None) -> int:
     print_stage3_review_summary(payload)
     if checks_requiring_confirmation(payload):
         print("ERROR: Stage 3 policy checks require applicant confirmation before final submission.", file=sys.stderr)
+        print("NEXT: relay the STAGE 3 REVIEW SUMMARY above to the user VERBATIM, resolve the blocking "
+              "checks via the answers updater, then RE-RUN this script. Packaging will refuse until "
+              "blocking checks are zero.")
         return 3
+    print("NEXT: run scripts/package_reimbursement_files.py to build the final submission package.")
     return 0
 
 

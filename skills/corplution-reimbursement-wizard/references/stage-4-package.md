@@ -103,6 +103,7 @@ Rules:
 
 - Use the same `{No}` as the related invoice/proof group.
 - If one support document supports several rows under the same proof number, copy it once.
+- If distinct support files would otherwise receive the same name, keep every file and add deterministic `-2`, `-3`, and later suffixes before the extension. Never overwrite one evidence file with another.
 - If a substitute invoice has no approval screenshot, keep the issue visible in the package manifest and ask the user before final delivery when possible.
 
 ## Workbook File
@@ -125,6 +126,8 @@ The manifest should list:
 - every invoice file copied
 - every support document copied
 - unresolved issues that must be shown directly to the user before submission
+- current final-rows fingerprint and workbook SHA-256
+- SHA-256 for every copied invoice and support document
 - proof number
 - source document ID
 - source item IDs when relevant
@@ -142,10 +145,15 @@ JSON shape:
   "requester": "",
   "package_date": "YYYYMMDD",
   "workbook": "报销申请表-Requester-YYYYMMDD.xlsx",
+  "workbook_sha256": "",
+  "final_rows_fingerprint": "",
+  "invoice_count": 1,
+  "support_count": 1,
   "invoice_files": [
     {
       "proof_no": 1,
       "filename": "001-高铁-446.00.pdf",
+      "sha256": "",
       "source_file": "",
       "invoice_no": "",
       "type": "高铁",
@@ -157,6 +165,7 @@ JSON shape:
     {
       "proof_no": 3,
       "filename": "003-行程单.pdf",
+      "sha256": "",
       "source_file": "",
       "type": "行程单"
     }
@@ -164,6 +173,12 @@ JSON shape:
   "issues": []
 }
 ```
+
+The manifest is integrity-stamped after all package files are copied. A package is deliverable only when its manifest validates against the current `final-expense-rows.json`, its workbook hash, and every listed invoice/support-file hash.
+
+Build each package in a fresh sibling staging directory. Only after its workbook, evidence folders, and stamped manifest are complete may the script replace the previous package root for the same requester/date. This replacement is deliberate: a rerun must contain exactly the files named by its new manifest and must not retain stale invoices or support files from an earlier run.
+
+If `package_reimbursement_files.py` exits with code `3`, it has written a review package and manifest, but `issues` is non-empty. Treat this as a blocking stop: show the issue list in chat, obtain the missing evidence or an explicit applicant decision, then re-run Stage 4. Do not describe that package as complete or submit it.
 
 ## Validation
 
@@ -177,4 +192,7 @@ Before final delivery:
 - Substitute invoices have `替票审批` support files or a visible missing-approval issue.
 - File names use final proof numbers and match `final-expense-rows.json`.
 - Original source files were copied, not moved.
-- A concise final package summary has been shown in chat: package folder, workbook filename, invoice/support-document counts, and unresolved issues.
+- A rerun has no stale invoice or support file outside the current manifest.
+- The integrity-stamped manifest matches the current final-rows fingerprint, workbook hash, file counts, and every listed package file hash.
+- The manifest has no unresolved issues before calling the workflow complete or submitting the package.
+- A concise final package summary has been shown in chat: package folder, workbook filename, and invoice/support-document counts.
