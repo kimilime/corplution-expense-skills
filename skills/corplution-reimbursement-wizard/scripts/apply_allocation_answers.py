@@ -20,6 +20,7 @@ ALLOWED_UNIT_STATUSES = OPEN_STATUSES | CLOSED_UNIT_STATUSES
 # Policy values come from assets/policy.toml; edit that file when policy changes.
 from policy_config import load_policy
 import integrity
+import text_safety
 
 _POLICY = load_policy()
 ADMIN_CODE = _POLICY.admin_code
@@ -113,6 +114,22 @@ CORRECTION_META_FIELDS = {
     "corrected_fields",
     "correction_note",
     "manual_correction",
+}
+
+
+# These are the fields a helper or user can change and that can later reach
+# applicant-facing questions, final Notes, or workbook cells. Raw extraction
+# evidence is deliberately excluded because OCR uncertainty belongs in Stage 1
+# review rather than being mistaken for a terminal encoding failure here.
+ENCODING_CHECK_UNIT_FIELDS = ALLOWED_UNIT_FIELDS | META_FIELDS
+ENCODING_CHECK_CONTEXT_FIELDS = {
+    "client_name",
+    "client_charge_code",
+    "city",
+    "project_context_id",
+    "date_start",
+    "date_end",
+    "description",
 }
 
 
@@ -926,6 +943,20 @@ def apply_answers(
             "the CURRENT allocation, re-fill it, then apply. Never reuse an old answers file."
         )
     unit_updates, question_updates, context_updates = normalize_answers(answers)
+    answer_text_issues = text_safety.find_suspect_text(
+        {
+            "unit_updates": unit_updates,
+            "question_updates": question_updates,
+            "project_contexts": context_updates,
+        },
+        path="answers",
+    )
+    if answer_text_issues:
+        raise ValueError(
+            "answers JSON appears to contain encoding-damaged text. Do not pass Chinese through a "
+            "PowerShell inline command; read/write UTF-8 files or use Unicode escapes. Findings: "
+            + "; ".join(answer_text_issues)
+        )
     unit_lookup = units_by_id(payload)
     unit_no_lookup = units_by_no(payload)
 
@@ -959,6 +990,22 @@ def apply_answers(
     apply_question_updates(payload, question_updates)
     close_answered_questions(payload, touched_units)
     sync_admin_client_advisories(payload)
+    allocation_text_issues = text_safety.find_suspect_text(
+        {
+            "allocation_units": text_safety.pick_fields(
+                payload.get("allocation_units", []), ENCODING_CHECK_UNIT_FIELDS
+            ),
+            "project_contexts": text_safety.pick_fields(
+                payload.get("project_contexts", []), ENCODING_CHECK_CONTEXT_FIELDS
+            ),
+        },
+        path="allocation",
+    )
+    if allocation_text_issues:
+        raise ValueError(
+            "the applied allocation would contain encoding-damaged user-visible text. Nothing was written. "
+            "Fix the UTF-8 helper input and rerun. Findings: " + "; ".join(allocation_text_issues)
+        )
     payload["generated_at"] = datetime.now().replace(microsecond=0).isoformat()
     payload.setdefault("change_log", []).append({
         "timestamp": payload["generated_at"],

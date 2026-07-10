@@ -50,6 +50,7 @@ C = {
 # policy_config; edit that file (not this one) when company policy changes.
 from policy_config import load_policy
 import integrity
+import text_safety
 
 _POLICY = load_policy()
 BUSINESS_TRIP_MEAL_DAILY_CAP = _POLICY.business_trip_meal_daily_cap
@@ -72,6 +73,37 @@ AMOUNT_COLUMNS = {
 }
 
 ALLOWED_SOURCE_CATEGORIES = {"hotel", "travel", "taxi", "meal", "mobile", "other"}
+
+ALLOCATION_TEXT_FIELDS = {
+    "attendees",
+    "approval_file",
+    "business_reason",
+    "city",
+    "client_charge_code",
+    "client_name",
+    "correction_note",
+    "destination",
+    "destination_place_type",
+    "expense_date",
+    "expense_note",
+    "expenses_nature",
+    "final_note",
+    "hotel_city",
+    "origin",
+    "origin_place_type",
+    "room_share_note",
+    "room_shared_with",
+    "route",
+    "substitute_for",
+}
+WORKBOOK_ROW_TEXT_FIELDS = {
+    "date",
+    "requester",
+    "client",
+    "client_charge_code",
+    "expenses_nature",
+    "note",
+}
 
 
 PROOF_ORDER = {
@@ -163,6 +195,30 @@ def load_json(path: Path) -> dict[str, Any]:
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+def workbook_text_issues(path: Path) -> list[str]:
+    """Verify that saved cells did not suffer a terminal/encoding conversion."""
+    findings: list[str] = []
+    workbook = openpyxl.load_workbook(path, read_only=True, data_only=False)
+    try:
+        for worksheet in workbook.worksheets:
+            for row in worksheet.iter_rows():
+                for cell in row:
+                    if not isinstance(cell.value, str) or cell.value.startswith("="):
+                        continue
+                    findings.extend(
+                        text_safety.find_suspect_text(
+                            cell.value,
+                            path=f"workbook.{worksheet.title}!{cell.coordinate}",
+                            limit=max(1, 20 - len(findings)),
+                        )
+                    )
+                    if len(findings) >= 20:
+                        return findings
+    finally:
+        workbook.close()
+    return findings
 
 
 def clean(value: Any) -> str:
@@ -1658,6 +1714,19 @@ def main(argv: list[str] | None = None) -> int:
     allocation = load_json(allocation_path)
     integrity.require_valid(allocation, allocation_path)
     errors = require_ready(allocation, args.allow_unconfirmed)
+    allocation_text_issues = text_safety.find_suspect_text(
+        {
+            "allocation_units": text_safety.pick_fields(
+                allocation.get("allocation_units", []), ALLOCATION_TEXT_FIELDS
+            )
+        },
+        path="allocation",
+    )
+    if allocation_text_issues:
+        errors.append(
+            "Allocation contains suspect encoding damage in user-visible fields. Regenerate the answers file "
+            "from UTF-8 input and apply it through the updater: " + "; ".join(allocation_text_issues)
+        )
     extraction_path = allocation_path.parent / "invoice-extraction.json"
     if not extraction_path.exists():
         errors.append(
@@ -1699,9 +1768,22 @@ def main(argv: list[str] | None = None) -> int:
     proof_groups = assign_proof_numbers(units)
     rows = make_rows(units, args.requester)
     rows.sort(key=lambda r: (r["client"], r["client_charge_code"], ROW_ORDER.get(r["row_order_type"], 99), r["expense_date"], r["proof_no"]))
+    row_text_issues = text_safety.find_suspect_text(
+        text_safety.pick_fields(rows, WORKBOOK_ROW_TEXT_FIELDS),
+        path="final_rows.rows",
+    )
+    if row_text_issues:
+        print("ERROR: Refusing to write a workbook with suspect encoding damage: " + "; ".join(row_text_issues), file=sys.stderr)
+        return 2
     meal_checks = meal_daily_cap_checks(rows)
     hotel_checks = hotel_cap_checks(rows)
     project_blocks, summary_rows = write_workbook(Path(args.output), rows, template_path, layout)
+    saved_workbook_text_issues = workbook_text_issues(Path(args.output))
+    if saved_workbook_text_issues:
+        print("ERROR: Workbook text scan found suspect encoding damage. The workbook is not a deliverable; "
+              "fix the UTF-8 answers input and re-run Stage 3. Findings: "
+              + "; ".join(saved_workbook_text_issues), file=sys.stderr)
+        return 2
     meal_check_status = aggregate_check_status(meal_checks)
     hotel_check_status = aggregate_check_status(hotel_checks)
 

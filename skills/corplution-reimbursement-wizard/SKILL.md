@@ -88,6 +88,10 @@ python scripts/apply_allocation_answers.py --allocation process/expense-allocati
 python scripts/apply_allocation_answers.py --allocation process/expense-allocation.json --answers process/allocation-answers.json
 ```
 
+### Batch-Answer Helper Encoding Rule
+
+Before writing any helper that generates `allocation-answers.json`, read `references/batch-answer-helpers.md`. A helper starts from the CURRENT generated template, preserves its root object/fingerprint and existing `unit_updates`, and writes only the answers file. It never mutates a process JSON. Read/write explicit UTF-8 files (`utf-8-sig` template input, UTF-8 JSON output); do not inject Chinese through PowerShell inline Python, `-Command`, or a console pipeline. Use a UTF-8 helper file with UTF-8 source data, or Unicode escapes for constrained inline values. Always run the official updater with `--dry-run` first. The updater rejects suspect `?`, replacement characters, and common mojibake markers, while Stage 3 repeats the check on final-visible fields and workbook cells.
+
 If the user says a recognized item is wrong, first trace that user-facing item number back to its source files, then ask for or apply the corrected fields.
 
 ```bash
