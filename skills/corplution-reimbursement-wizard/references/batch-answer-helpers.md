@@ -52,4 +52,4 @@ python scripts/apply_allocation_answers.py --allocation process/expense-allocati
 python scripts/apply_allocation_answers.py --allocation process/expense-allocation.json --answers process/allocation-answers.json
 ```
 
-The updater rejects literal `?`, replacement characters, and common mojibake markers in editable answers. Stage 3 repeats the check for user-visible allocation fields and scans saved workbook cells. Treat an encoding failure exactly like a schema failure: fix the helper input, regenerate the answers file, and rerun the official path. Do not patch the allocation or workbook afterward.
+The updater rejects consecutive `??` markers, replacement characters, and common mojibake markers in editable answers. A single ASCII `?` is allowed in legitimate English free text. Stage 3 repeats the check for user-visible allocation fields and scans saved workbook cells. Treat an encoding failure exactly like a schema failure: fix the helper input, regenerate the answers file, and rerun the official path. Do not patch the allocation or workbook afterward.

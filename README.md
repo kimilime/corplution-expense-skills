@@ -149,13 +149,13 @@ python skills/corplution-reimbursement-wizard/scripts/package_reimbursement_file
 
 - 批量 helper 只允许从本次生成的 `allocation-answers.template.json` 填充既有 `unit_updates`，再生成 `allocation-answers.json`；绝不能直接修改任何 `process/*.json`。
 - helper 必须显式以 `utf-8-sig` 读取模板、以 UTF-8 写出 JSON。不要把中文值经由 PowerShell inline Python、`-Command` 或控制台管道传入；应使用 UTF-8 的 Python/JSON 文件，或在受限 inline 值中使用 Unicode escape。
-- 先运行官方 updater 的 `--dry-run`，再 apply。updater、Stage 3 和保存后的 Excel 均会拒绝 `?`、替换字符及常见乱码标记；失败后修 helper 输入并重新生成 answers，不要补丁式修改 allocation 或 workbook。
+- 先运行官方 updater 的 `--dry-run`，再 apply。updater、Stage 3 和保存后的 Excel 均会拒绝连续 `??`、替换字符及常见乱码标记；单个 ASCII `?` 的正常英文说明允许保留。失败后修 helper 输入并重新生成 answers，不要补丁式修改 allocation 或 workbook。
 
 ## Batch Answers Helper Encoding Safety
 
 - A batch helper may only fill existing `unit_updates` in the current `allocation-answers.template.json` and then generate `allocation-answers.json`; it must never edit any `process/*.json` directly.
 - Read the template as `utf-8-sig` and write JSON as UTF-8. Do not route Chinese text through PowerShell inline Python, `-Command`, or a console pipeline; use UTF-8 Python/JSON files or Unicode escapes for constrained inline values.
-- Run the official updater with `--dry-run` before apply. The updater, Stage 3, and the saved workbook reject `?`, replacement characters, and common mojibake markers; repair the helper input and regenerate answers instead of patching allocation or workbook files.
+- Run the official updater with `--dry-run` before apply. The updater, Stage 3, and the saved workbook reject consecutive `??`, replacement characters, and common mojibake markers; a single ASCII `?` in legitimate English free text is allowed. Repair the helper input and regenerate answers instead of patching allocation or workbook files.
 
 ## Notes
 

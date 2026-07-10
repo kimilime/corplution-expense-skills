@@ -9,14 +9,16 @@ these helpers before such text can become a process record or workbook cell.
 
 from __future__ import annotations
 
+import re
 from typing import Any, Iterable
 
 
-# These markers are invalid in confirmed business data. A literal ASCII '?'
-# is included intentionally: the workflow uses Chinese punctuation and final
-# Notes are statements, not questions. It is the common PowerShell/GBK loss
-# marker observed when a helper injects Chinese through an inline command.
-SUSPECT_MARKERS = ("?", "\ufffd", "\u951f\u65a4\u62f7", "\u00c3", "\u00c2", "\u00e2\u20ac")
+# A single ASCII '?' can be legitimate in an English free-text explanation.
+# Repeated '?' is the common PowerShell/GBK loss pattern when several Chinese
+# characters were injected through an inline command. The other markers are
+# unambiguously suspect in confirmed business data.
+QUESTION_MARK_RUN = re.compile(r"\?{2,}")
+SUSPECT_MARKERS = ("\ufffd", "\u951f\u65a4\u62f7", "\u00c3", "\u00c2", "\u00e2\u20ac")
 
 
 def find_suspect_text(value: Any, path: str = "$", limit: int = 20) -> list[str]:
@@ -27,6 +29,9 @@ def find_suspect_text(value: Any, path: str = "$", limit: int = 20) -> list[str]
         if len(findings) >= limit:
             return
         if isinstance(item, str):
+            if QUESTION_MARK_RUN.search(item):
+                findings.append(f"{item_path} contains consecutive ASCII question marks: {item!r}")
+                return
             for marker in SUSPECT_MARKERS:
                 if marker in item:
                     findings.append(f"{item_path} contains suspect encoding marker {marker!r}: {item!r}")
