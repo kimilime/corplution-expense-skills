@@ -18,7 +18,7 @@ Use this skill for the Corplution reimbursement workflow:
 
 Do not write the reimbursement Excel workbook until stage 2 has no blocking open questions. Preserve uncertain results in the review queue or allocation question queue.
 
-Company policy numbers (meal/hotel caps, first-tier cities) and year-coded charge codes live in `assets/policy.toml`; when policy or fiscal year changes, edit that one file. Process JSONs are integrity-stamped: `invoice-extraction.json` may only be changed via `apply_extraction_corrections.py`, `expense-allocation.json` only via the answers template + `apply_allocation_answers.py`, and `final-expense-rows.json` only by re-running Stage 3. Any other edit makes the next script exit with code `4` and print recovery steps — follow them instead of patching further.
+Company policy numbers (meal/hotel caps, first-tier cities) and year-coded charge codes live in `assets/policy.toml`; when policy or fiscal year changes, edit that one file. Process JSONs are integrity-stamped: `invoice-extraction.json` may only be changed via `apply_extraction_corrections.py`, `expense-allocation.json` only via Composer-generated answers + `apply_allocation_answers.py` (the template generator is a recovery fallback), and `final-expense-rows.json` only by re-running Stage 3. Any other edit makes the next script exit with code `4` and print recovery steps — follow them instead of patching further.
 
 Every input file is reimbursement evidence until the user explicitly says to drop it. Never skip or ignore a file because it cannot be read automatically — an unidentified file may be an invoice that needs OCR or visual reading, a partner approval screenshot, or a payment proof (paper receipt, Alipay/WeChat screenshot). Unidentified files become blocking questions; ask the user what each one is, and record an explicit exclusion (with the user's reason) for anything dropped.
 
@@ -33,50 +33,60 @@ If the user already provided files or context, acknowledge what is present, ask 
 1. In a new environment, check bundled script dependencies before running workflow scripts. The skill-local dependency file is `requirements.txt`.
 
 ```bash
-python scripts/check_dependencies.py
+python scripts/chief_orchestrator.py run dependencies
 ```
 
 If Python packages are missing, install them from the skill-local requirements file:
 
 ```bash
-python scripts/check_dependencies.py --install
+python scripts/chief_orchestrator.py run dependencies --install
 ```
 
-Every stage script prints a `NEXT:` line on completion telling you the required next action — always follow it. At any point, and ALWAYS when the user asks about progress or status, run `python scripts/check_workflow_status.py` and relay its output; it reports per-stage completion, unresolved items, and stale artifacts (e.g., a workbook generated before later allocation edits — packaging refuses stale workbooks and unresolved cap checks).
+Use `scripts/chief_orchestrator.py` as the default workflow entry. It fills canonical process paths, dispatches the existing scripts without duplicating their business logic, preserves the child exit code, and prints one authoritative `CHIEF NEXT` result after every run. Direct script calls remain supported for debugging and recovery, but they are not journaled.
+
+```bash
+python scripts/chief_orchestrator.py status
+python scripts/chief_orchestrator.py next
+python scripts/chief_orchestrator.py next --json
+```
+
+At any point, and ALWAYS when the user asks about progress or status, run the Chief `status` command and relay its output. `next` returns exactly one of `command`, `needs_user`, `blocked`, or `complete`; it emits executable `argv` only when all required parameters are known. Never turn a `needs_user` result into a guessed command. The legacy `python scripts/check_workflow_status.py` command uses the same shared state engine and remains compatible.
+
+Runs dispatched by Chief append privacy-minimized events to `process/workflow-journal.jsonl`. The journal records stage/script, timestamps, exit code, duration, artifact hashes, and counts only; it must not contain raw invoice text, applicant answers, client details, full command arguments, or source paths. It is observational rather than an integrity authority, never enters the final package, and a journal-write failure must not replace the underlying script's exit code.
 
 Missing OCR system tools such as Tesseract or Poppler do not block text-layer PDFs or Excel/package stages. If OCR is unavailable, stage 1 must mark scan-only inputs as `manual_review` instead of inventing fields.
 
 If the user mainly provides scanned PDFs or images and expects OCR, run the stricter check and explain any missing system tool in chat:
 
 ```bash
-python scripts/check_dependencies.py --strict-ocr
+python scripts/chief_orchestrator.py run dependencies --strict-ocr
 ```
 
 2. For invoice extraction, read `references/stage-1-output.md` before changing the schema, classification rules, or process-file format.
-3. Run the bundled extractor when the user provides PDFs or images. Pass the whole upload folder (or every provided file) in one call — never pre-filter by which files look readable:
+3. Run the bundled extractor when the user provides PDFs or images. Pass the whole upload/evidence folder (or every provided file) in one call — never pre-filter by which files look readable. Do not pass a task root that contains `process`, `output`, or the workflow journal; Chief rejects that overlap so generated artifacts cannot be mistaken for newly supplied evidence.
 
 ```bash
-python scripts/extract_invoices.py --output process <input-file-or-folder> [...]
+python scripts/chief_orchestrator.py run extract <input-file-or-folder> [...]
 ```
 
-4. The extractor prints an `INPUT RECONCILIATION` block followed by an extraction review list, and writes the same review to `process/invoice-extraction.md` in UTF-8. Copy or summarize it directly in chat before moving to allocation, so the user can confirm recognized files by item number and source filename. Unsupported files such as OFD/eml are persisted in `unresolved_input_files` with a SHA-256 and block later stages until the user explicitly excludes them (with a reason) or provides a readable replacement through `input_resolutions` in `scripts/apply_extraction_corrections.py`. If terminal output is garbled or truncated, read the UTF-8 Markdown process file instead of writing a one-off extraction helper script. Correct any `needs_review` items through that same script — read the file visually if you can and record what you saw; otherwise ask the user what it is using the template the extractor prints. Never hand-edit `invoice-extraction.json`; corrections and input resolutions persist in `process/extraction-corrections.json` and replay automatically on every re-run. Do not ask the user to open `process/invoice-extraction.md/json`.
+4. The extractor prints an `INPUT RECONCILIATION` block followed by an extraction review list, and writes the same review to `process/invoice-extraction.md` in UTF-8. Copy or summarize it directly in chat before moving to allocation, so the user can confirm recognized files by item number and source filename. Unsupported files such as OFD/eml are persisted in `unresolved_input_files` with a SHA-256 and block later stages until the user explicitly excludes them (with a reason) or provides a readable replacement through `input_resolutions`. Apply a prepared corrections/resolutions file with `python scripts/chief_orchestrator.py run correct-extraction --corrections <corrections.json>`. If terminal output is garbled or truncated, read the UTF-8 Markdown process file instead of writing a one-off extraction helper script. Read a file visually when possible and record what you saw; otherwise ask the user using the extractor's question template. Never hand-edit `invoice-extraction.json`; corrections persist in `process/extraction-corrections.json` and replay automatically on every re-run. Do not ask the user to open `process/invoice-extraction.md/json`.
 5. For project allocation, read `references/stage-2-allocation.md`, then parse the user's natural-language project context and match it against `process/invoice-extraction.json`. Convert the user's natural-language project note into a temporary `project-context.json` yourself whenever enough information is present; do not ask the user to write JSON. Ask the user only for missing business facts such as date range, city, client name, or Client Charge Code.
 
 ```bash
-python scripts/allocate_expenses.py --extraction process/invoice-extraction.json --context project-context.json --output process
+python scripts/chief_orchestrator.py run allocate --context project-context.json
 ```
 
-Allocation refuses to run while unsupported inputs remain open, and records the exact extraction fingerprint it used. If extraction is rerun later, regenerate allocation and its answers template rather than reusing the old allocation.
+Allocation refuses to run while unsupported inputs remain open, and records the exact extraction fingerprint it used. If extraction is rerun later, regenerate allocation and recompose any answers rather than reusing the old allocation or answers file.
 
 The allocation script prints an applicant review list, then a ready-to-send 转发块 containing all blocking questions in Chinese. Relay the 转发块 VERBATIM as your next chat message — do not summarize, shorten, or end your turn without sending it — then wait for the user's answers. If terminal output is garbled, read the Markdown process file instead of creating temporary print/extraction scripts.
 
-Before translating the user's natural-language answers into JSON, generate a current-task answers template. Fill the generated canonical `unit_updates` entries; do not invent another schema such as `answers[].allocations`.
+When the user answers allocation questions, use the bundled Composer to turn those decisions into the current allocation's canonical `unit_updates`; do not invent another schema such as `answers[].allocations`. Composer resolves current user-facing unit numbers, binds the live allocation fingerprint, dry-runs the updater, and publishes `process/allocation-answers.json` only after validation succeeds. Then run the updater and repeat until no blocking questions remain. Do not create ad hoc patch scripts to mutate `expense-allocation.json`; the updater refreshes notes, closes questions, preserves change history, and runs accounting checks. After ANY allocation re-run, recompose answers because unit ids may have shifted and old answers must not be replayed.
+
+Use `build_allocation_answers_template.py` only for an exceptional update the Composer cannot express or when inspecting the canonical schema during recovery. Do not make manual template filling the default batch path.
 
 ```bash
-python scripts/build_allocation_answers_template.py --allocation process/expense-allocation.json --output process/allocation-answers.template.json
+python scripts/chief_orchestrator.py run template
 ```
-
-When the user answers allocation questions, compile the confirmed decisions into `process/allocation-answers.json`, run the bundled updater, and repeat until no blocking questions remain. Do not create ad hoc patch scripts to mutate `expense-allocation.json`; the updater refreshes notes, closes questions, preserves change history, and runs accounting checks. After ANY allocation re-run, regenerate allocation answers because unit ids may have shifted and replaying old answers would write data onto the wrong units.
 
 ### Batch Answers
 
@@ -84,23 +94,21 @@ For batch confirmations, use the bundled composer instead of writing a helper sc
 
 ```bash
 # Use --set only for compact values without whitespace or shell-sensitive characters.
-python scripts/compose_answers.py --allocation process/expense-allocation.json \
+python scripts/chief_orchestrator.py run compose \
     --set "3,5,7-12: status=confirmed client=山西信托 city=太原 note=出差餐费"
 
 # Use a UTF-8 decisions file for any space, quote, path, long note, or uncertain console encoding.
-python scripts/compose_answers.py --allocation process/expense-allocation.json \
+python scripts/chief_orchestrator.py run compose \
     --decisions process/batch-decisions.json
 ```
 
 The composer writes no process JSON. It produces answers only; `apply_allocation_answers.py` remains the sole Stage 2 writer. Use a one-off helper only when the composer cannot express the required update. Keep any such helper in the session working directory, never inside this skill's folder, and follow `references/batch-answer-helpers.md`.
 
 ```bash
-python scripts/apply_allocation_answers.py --allocation process/expense-allocation.json --answers process/allocation-answers.json --dry-run
+python scripts/chief_orchestrator.py run apply
 ```
 
-```bash
-python scripts/apply_allocation_answers.py --allocation process/expense-allocation.json --answers process/allocation-answers.json
-```
+Composer already ran the official updater in `--dry-run` mode before publishing the answers file. Use `run apply --dry-run` first only for a recovery answers file produced without Composer.
 
 ### Batch-Answer Helper Encoding Rule
 
@@ -109,13 +117,13 @@ Before writing any helper that generates `allocation-answers.json`, read `refere
 If the user says a recognized item is wrong, first trace that user-facing item number back to its source files, then ask for or apply the corrected fields.
 
 ```bash
-python scripts/trace_expense_item.py --allocation process/expense-allocation.json --extraction process/invoice-extraction.json --item 9
+python scripts/chief_orchestrator.py run trace --item 9
 ```
 
 6. For Excel output, read `references/stage-3-excel-output.md`, ask the user for requester if missing, and write rows from `process/expense-allocation.json`. By default, the workbook is generated directly by script using `assets/reimbursement-workbook-layout.toml` for static workbook layout and Python code for business logic, formulas, sorting, and project blocks. The legacy template remains bundled at `assets/reimbursement-template.xlsx`; pass `--template bundled` or a custom `.xlsx` path only when a template-based fallback is explicitly needed.
 
 ```bash
-python scripts/write_reimbursement_template.py --allocation process/expense-allocation.json --output <filled.xlsx> --requester <name> --process-dir process
+python scripts/chief_orchestrator.py run write --output <filled.xlsx> --requester <name>
 ```
 
 Stage 3 verifies that allocation still belongs to the current extraction generation and that no unsupported input remains unresolved. A mismatch requires a fresh Stage 2 run, not a manual repair.
@@ -123,7 +131,7 @@ Stage 3 verifies that allocation still belongs to the current extraction generat
 7. For final packaging, read `references/stage-4-package.md`, then copy and rename source files using the final proof numbers.
 
 ```bash
-python scripts/package_reimbursement_files.py --final-rows process/final-expense-rows.json --extraction process/invoice-extraction.json --workbook <filled.xlsx> --output-root output
+python scripts/chief_orchestrator.py run package
 ```
 
 After packaging, copy or summarize the final package summary in chat: package folder, workbook name, invoice/support-document counts, and any unresolved package issues.
@@ -204,8 +212,8 @@ Read `references/stage-2-allocation.md` before allocating expenses. Keep these c
 - Use simple user-facing item numbers in conversation, such as item 1 or item 2, instead of internal IDs like `DOC-001` or `UNIT-001`. Keep internal IDs only in process JSON/Markdown for traceability.
 - When a user challenges an item, run `scripts/trace_expense_item.py` and identify the source filename, invoice number, seller, amount, date, and trip details before applying corrections.
 - Track substitute invoices separately, ask the user for the partner approval screenshot, append the substitute marker to the final note, and carry the substitute flag to the Excel stage.
-- After receiving user answers, generate `allocation-answers.template.json` with `scripts/build_allocation_answers_template.py`, fill it into `allocation-answers.json`, and use `scripts/apply_allocation_answers.py` to update `expense-allocation.json` instead of manually rewriting allocation files. This preserves question status, substitute approval links, and change history.
-- Never create temporary patch scripts for bulk allocation edits. Convert batch natural-language answers into the generated canonical `unit_updates` template and run the updater even when the JSON is long.
+- After receiving user answers, use `scripts/compose_answers.py` (normally through Chief) to generate a fingerprint-bound `allocation-answers.json`, then use `scripts/apply_allocation_answers.py` to update `expense-allocation.json`. Generate `allocation-answers.template.json` only for Composer-inexpressible recovery cases. This preserves question status, substitute approval links, and change history.
+- Never create temporary patch scripts for bulk allocation edits. Convert batch natural-language answers through Composer and the updater even when the decision batch is long.
 - Generate final reimbursement notes with the required Chinese templates from the stage-2 reference, including confirmed taxi origin/destination place types. Never write literal placeholders such as `出发地类型` or `目的地类型` into `final_note`; ask the user when either endpoint type is unclear.
 - Mark rail/flight cancellation or refund evidence in the final note as `高铁退票费（出发地-目的地）` or `飞机退票费（出发地-目的地）` instead of the ordinary travel note.
 

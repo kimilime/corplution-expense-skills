@@ -34,9 +34,10 @@ def load(path: Path) -> dict[str, Any] | None:
     if not path.exists():
         return None
     try:
-        return json.loads(path.read_text(encoding="utf-8-sig"))
+        value = json.loads(path.read_text(encoding="utf-8-sig"))
     except Exception:
         return None
+    return value if isinstance(value, dict) else None
 
 
 def sha256_file(path: Path) -> str:
@@ -107,24 +108,87 @@ def validate_package_manifest(
     return True, "ok"
 
 
-def main(argv: list[str] | None = None) -> int:
-    configure_stdio()
-    parser = argparse.ArgumentParser(description="Report reimbursement workflow status.")
-    parser.add_argument("--process-dir", default="process")
-    parser.add_argument("--output-root", default="output")
-    args = parser.parse_args(argv)
-    pdir = Path(args.process_dir)
+FINAL_UNIT_STATUSES = {"confirmed", "fixed", "dropped", "excluded", "non_reimbursable"}
+ANSWER_ACTION_FIELDS = (
+    "unit_updates",
+    "question_updates",
+    "project_contexts",
+    "confirm_units",
+    "drop_units",
+    "exclude_units",
+)
 
+
+def next_step(
+    kind: str,
+    stage: str,
+    summary: str,
+    *,
+    operation: str | None = None,
+    parameters: dict[str, Any] | None = None,
+    missing: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build a machine-readable next action without embedding a shell command."""
+    return {
+        "kind": kind,
+        "stage": stage,
+        "summary": summary,
+        "operation": operation,
+        "parameters": parameters or {},
+        "missing": missing or [],
+        "argv": None,
+    }
+
+
+def inspect_workflow(
+    process_dir: str | Path = "process",
+    output_root: str | Path = "output",
+) -> dict[str, Any]:
+    """Inspect all four stages once and return the shared workflow state.
+
+    This function is the single state source for both the legacy status CLI and
+    chief_orchestrator.py. It is read-only and never repairs process artifacts.
+    """
+    pdir = Path(process_dir)
+    root = Path(output_root)
     lines: list[str] = []
-    next_action = ""
+    pending_next: dict[str, Any] | None = None
+    pending_priority = -1
     integrity_blocked = False
+    stages: dict[str, dict[str, Any]] = {}
+    artifacts: dict[str, dict[str, Any]] = {}
+
+    def set_next(candidate: dict[str, Any], *, priority: int = 0) -> None:
+        nonlocal pending_next, pending_priority
+        if pending_next is None or priority > pending_priority:
+            pending_next = candidate
+            pending_priority = priority
 
     # Stage 1
-    extraction = load(pdir / "invoice-extraction.json")
+    extraction_path = pdir / "invoice-extraction.json"
+    extraction = load(extraction_path)
     extraction_fp = ""
     if not extraction:
-        lines.append("Stage 1 提取: ✗ 未运行 (no invoice-extraction.json)")
-        next_action = "run extract_invoices.py on ALL provided files"
+        if extraction_path.exists():
+            lines.append("Stage 1 提取: BLOCKED invoice-extraction.json 无法解析")
+            stages["extraction"] = {"number": 1, "status": "blocked", "reason": "malformed_json"}
+            integrity_blocked = True
+            set_next(next_step(
+                "blocked",
+                "extraction",
+                "invoice-extraction.json cannot be parsed; re-run extraction on all original inputs.",
+                missing=["all original invoice/support input paths"],
+            ), priority=100)
+        else:
+            lines.append("Stage 1 提取: ✗ 未运行 (no invoice-extraction.json)")
+            stages["extraction"] = {"number": 1, "status": "not_started"}
+            set_next(next_step(
+                "needs_user",
+                "extraction",
+                "Provide all invoice, trip-report, approval, and payment-evidence files or folders.",
+                operation="extract",
+                missing=["source invoice/support file paths"],
+            ))
     else:
         ok, reason = integrity.check(extraction)
         extraction_fp = str((extraction.get("integrity") or {}).get("fingerprint", "")) if ok else ""
@@ -136,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
             item for item in extraction.get("unresolved_input_files", [])
             if item.get("status", "open") == "open"
         ]
-        state = "✓" if ok else "BLOCKED"
+        state = "BLOCKED" if not ok else ("…" if unresolved_inputs or pending else "✓")
         stamp_note = "" if ok else f" [INTEGRITY FAILED: {reason}]"
         lines.append(f"Stage 1 提取: {state} {len(docs)} 份文档，排除 {len(excluded)}，待识别/复核 {len(pending)}{stamp_note}")
         if unresolved_inputs:
@@ -145,86 +209,380 @@ def main(argv: list[str] | None = None) -> int:
                 lines.append(f"    * {item.get('filename', '?')}")
         for d in pending[:10]:
             lines.append(f"  - 待识别: {Path(str(d.get('source_file', '?'))).name}")
+        stage1_status = "ready" if ok and not unresolved_inputs and not pending else (
+            "blocked" if not ok else "needs_user"
+        )
+        stages["extraction"] = {
+            "number": 1,
+            "status": stage1_status,
+            "document_count": len(docs),
+            "excluded_count": len(excluded),
+            "review_count": len(pending),
+            "unresolved_input_count": len(unresolved_inputs),
+            "integrity_valid": ok,
+        }
+        artifacts["extraction"] = {
+            "path": str(extraction_path),
+            "integrity_fingerprint": extraction_fp,
+        }
         if not ok:
             integrity_blocked = True
-            next_action = "re-run extract_invoices.py; make changes only through apply_extraction_corrections.py"
+            set_next(next_step(
+                "blocked",
+                "extraction",
+                "Extraction integrity failed; re-run extraction and use only the sanctioned corrections flow.",
+                missing=["all original invoice/support input paths"],
+            ), priority=100)
         elif unresolved_inputs:
-            next_action = "ask the user to exclude or convert every unsupported input, apply input_resolutions, then re-run extract_invoices.py"
-        elif pending and not next_action:
-            next_action = "resolve unidentified documents (vision/OCR/ask user + apply_extraction_corrections.py)"
+            set_next(next_step(
+                "needs_user",
+                "extraction",
+                "Ask the applicant to exclude or replace every unsupported input, then apply the recorded resolutions.",
+                operation="correct-extraction",
+                missing=[f"resolution for {item.get('filename', '?')}" for item in unresolved_inputs],
+            ))
+        elif pending:
+            set_next(next_step(
+                "needs_user",
+                "extraction",
+                "Resolve every unidentified or review-required document through vision/OCR or applicant confirmation.",
+                operation="correct-extraction",
+                missing=[Path(str(item.get("source_file", "?"))).name for item in pending],
+            ))
+
+    stage1_ready = stages.get("extraction", {}).get("status") == "ready"
 
     # Stage 2
-    allocation = load(pdir / "expense-allocation.json")
+    allocation_path = pdir / "expense-allocation.json"
+    allocation = load(allocation_path)
     alloc_fp = ""
+    answers_current = False
+    current_answer_count = 0
     if not allocation:
-        lines.append("Stage 2 归集: ✗ 未运行")
-        if not next_action:
-            next_action = "run allocate_expenses.py with project context"
+        if allocation_path.exists():
+            lines.append("Stage 2 归集: BLOCKED expense-allocation.json 无法解析")
+            stages["allocation"] = {"number": 2, "status": "blocked", "reason": "malformed_json"}
+            integrity_blocked = True
+            set_next(next_step(
+                "blocked",
+                "allocation",
+                "expense-allocation.json cannot be parsed; regenerate Stage 2 from the current extraction.",
+                missing=["project context file"],
+            ), priority=100)
+        else:
+            lines.append("Stage 2 归集: ✗ 未运行")
+            stages["allocation"] = {"number": 2, "status": "not_started"}
+            if stage1_ready:
+                context_path = pdir.parent / "project-context.json"
+                if context_path.is_file():
+                    set_next(next_step(
+                        "command",
+                        "allocation",
+                        "Run Stage 2 with the current extraction and project context.",
+                        operation="allocate",
+                        parameters={"context": str(context_path)},
+                    ))
+                else:
+                    set_next(next_step(
+                        "needs_user",
+                        "allocation",
+                        "Collect the consultant's project dates, cities, clients, and charge codes, "
+                        "then create project-context.json.",
+                        operation="allocate",
+                        missing=["project context (date range, city, client, charge code)"],
+                    ))
     else:
         ok, reason = integrity.check(allocation)
         alloc_fp = (allocation.get("integrity") or {}).get("fingerprint", "") if ok else ""
         units = allocation.get("allocation_units", [])
         confirmed = [u for u in units if u.get("status") in {"confirmed", "fixed"}]
         closed = [u for u in units if u.get("status") in {"dropped", "excluded", "non_reimbursable"}]
+        unconfirmed = [u for u in units if u.get("status") not in FINAL_UNIT_STATUSES]
         open_qs = [q for q in allocation.get("questions", []) if q.get("status", "open") == "open"]
+        answers_path = pdir / "allocation-answers.json"
+        answers = load(answers_path)
+        if answers:
+            answer_action_counts = {
+                field: len(answers.get(field, []))
+                if isinstance(answers.get(field, []), list) else 0
+                for field in ANSWER_ACTION_FIELDS
+            }
+            current_answer_count = sum(answer_action_counts.values())
+            answers_current = bool(
+                alloc_fp
+                and current_answer_count
+                and str(answers.get("source_allocation_fingerprint", "")) == str(alloc_fp)
+            )
+            artifacts["allocation_answers"] = {
+                "path": str(answers_path),
+                "source_allocation_fingerprint": str(answers.get("source_allocation_fingerprint", "")),
+                "action_count": current_answer_count,
+                "action_counts": answer_action_counts,
+                "current": answers_current,
+            }
         generation_mismatch = bool(extraction_fp) and (
             str(allocation.get("source_extraction_fingerprint", "")) != extraction_fp
         )
-        stage2_state = "BLOCKED" if not ok or generation_mismatch else ("✓" if not open_qs else "…")
+        upstream_unavailable = not stage1_ready
+        stage2_state = "BLOCKED" if not ok or generation_mismatch or upstream_unavailable else (
+            "✓" if not open_qs and not unconfirmed and not answers_current else "…"
+        )
         stamp_note = "" if ok else f" [INTEGRITY FAILED: {reason}]"
         if generation_mismatch:
             stamp_note += " [STALE: extraction changed after allocation]"
+        if upstream_unavailable and not generation_mismatch:
+            stamp_note += " [BLOCKED: extraction is not ready]"
+        answer_note = f"，待应用答案 {current_answer_count} 项" if answers_current else ""
         lines.append(f"Stage 2 归集: {stage2_state} 单元 {len(confirmed)}/{len(units)} 已确认"
-                     f"（另排除 {len(closed)}），阻断问题 {len(open_qs)} 个{stamp_note}")
+                     f"（另排除 {len(closed)}），阻断问题 {len(open_qs)} 个{answer_note}{stamp_note}")
+        stage2_ready = (
+            ok and not generation_mismatch and not upstream_unavailable
+            and not open_qs and not unconfirmed and not answers_current
+        )
+        stages["allocation"] = {
+            "number": 2,
+            "status": "ready" if stage2_ready else (
+                "blocked" if not ok or generation_mismatch or upstream_unavailable else (
+                    "command_ready" if answers_current else "needs_user"
+                )
+            ),
+            "unit_count": len(units),
+            "confirmed_count": len(confirmed),
+            "closed_count": len(closed),
+            "unconfirmed_count": len(unconfirmed),
+            "open_question_count": len(open_qs),
+            "unapplied_answer_count": current_answer_count if answers_current else 0,
+            "integrity_valid": ok,
+            "generation_mismatch": generation_mismatch,
+        }
+        artifacts["allocation"] = {
+            "path": str(allocation_path),
+            "integrity_fingerprint": str(alloc_fp),
+            "source_extraction_fingerprint": str(allocation.get("source_extraction_fingerprint", "")),
+        }
         if not ok:
             integrity_blocked = True
-        if not ok and not next_action:
-            next_action = "re-run allocate_expenses.py; make changes only through the allocation answers updater"
-        elif generation_mismatch and not next_action:
-            next_action = "re-run allocate_expenses.py because extraction changed; regenerate the answers template before applying answers"
-        elif open_qs and not next_action:
-            next_action = f"relay the {len(open_qs)} blocking question(s) to the user verbatim (re-run allocate_expenses.py to reprint them)"
+        if not ok:
+            set_next(next_step(
+                "blocked",
+                "allocation",
+                "Allocation integrity failed; regenerate Stage 2 and use only composer/updater for later changes.",
+                missing=["current project context file"],
+            ), priority=100)
+        elif generation_mismatch:
+            context_path = pdir.parent / "project-context.json"
+            if context_path.is_file():
+                set_next(next_step(
+                    "command",
+                    "allocation",
+                    "Extraction changed; regenerate allocation and all answers from the current extraction.",
+                    operation="allocate",
+                    parameters={"context": str(context_path)},
+                ))
+            else:
+                set_next(next_step(
+                    "needs_user",
+                    "allocation",
+                    "Extraction changed; recreate project-context.json before regenerating allocation.",
+                    operation="allocate",
+                    missing=["current project context file"],
+                ))
+        elif answers_current:
+            set_next(next_step(
+                "command",
+                "allocation",
+                f"Apply the {current_answer_count} current fingerprint-bound answer action(s) "
+                "through the official updater.",
+                operation="apply",
+                parameters={"answers": str(answers_path)},
+            ))
+        elif open_qs:
+            set_next(next_step(
+                "needs_user",
+                "allocation",
+                f"Relay and answer the {len(open_qs)} blocking allocation question(s), "
+                "then compose/apply the decisions.",
+                operation="compose",
+                missing=["applicant answers to open allocation questions"],
+            ))
+        elif unconfirmed:
+            set_next(next_step(
+                "needs_user",
+                "allocation",
+                f"Confirm or close the {len(unconfirmed)} remaining draft allocation unit(s), "
+                "then compose/apply the decisions.",
+                operation="compose",
+                missing=["confirmation for remaining draft allocation units"],
+            ))
+
+    stage2_ready = stages.get("allocation", {}).get("status") == "ready"
 
     # Stage 3
-    rows = load(pdir / "final-expense-rows.json")
+    rows_path = pdir / "final-expense-rows.json"
+    rows = load(rows_path)
     rows_ready = False
     rows_fingerprint = ""
     if not rows:
-        lines.append("Stage 3 报销表: ✗ 未运行（餐费/酒店上限检查尚未发生）")
-        if not next_action:
-            next_action = "run write_reimbursement_template.py"
+        if rows_path.exists():
+            lines.append("Stage 3 报销表: BLOCKED final-expense-rows.json 无法解析")
+            stages["workbook"] = {"number": 3, "status": "blocked", "reason": "malformed_json"}
+            integrity_blocked = True
+            set_next(next_step(
+                "blocked",
+                "workbook",
+                "final-expense-rows.json cannot be parsed; regenerate Stage 3 from the confirmed allocation.",
+                missing=["requester and workbook output path"],
+            ), priority=100)
+        else:
+            lines.append("Stage 3 报销表: ✗ 未运行（餐费/酒店上限检查尚未发生）")
+            stages["workbook"] = {"number": 3, "status": "not_started"}
+            if stage2_ready:
+                set_next(next_step(
+                    "needs_user",
+                    "workbook",
+                    "Provide the requester and desired workbook path, then run Stage 3.",
+                    operation="write",
+                    missing=["requester", "workbook output path"],
+                ))
     else:
         rows_ok, rows_reason = integrity.check(rows)
         rows_fp = str(rows.get("source_allocation_fingerprint", ""))
-        rows_fingerprint = str((rows.get("integrity") or {}).get("fingerprint", ""))
+        rows_fingerprint = str((rows.get("integrity") or {}).get("fingerprint", "")) if rows_ok else ""
         workbook_sha = str(rows.get("workbook_sha256", ""))
-        blocking = int(rows.get("blocking_policy_checks", 0) or 0)
+        try:
+            blocking = int(rows.get("blocking_policy_checks", 0) or 0)
+        except (TypeError, ValueError):
+            blocking = 1
+        try:
+            preview_open_questions = int(rows.get("open_allocation_questions", 0) or 0)
+        except (TypeError, ValueError):
+            preview_open_questions = 1
+        preview = bool(rows.get("generated_with_allow_unconfirmed")) or preview_open_questions > 0
         stale = bool(alloc_fp) and rows_fp != alloc_fp
+        upstream_unavailable = not stage2_ready
+        recorded_workbook = str(rows.get("workbook", ""))
+        template_workbook = str(rows.get("template_workbook", ""))
+        layout_file = str(rows.get("layout_file", ""))
+        workbook_source = str(rows.get("workbook_source", ""))
+        workbook_path = Path(recorded_workbook).expanduser() if recorded_workbook else None
+        workbook_exists = bool(workbook_path and workbook_path.is_file())
+        actual_workbook_sha = ""
+        if workbook_exists and workbook_path:
+            try:
+                actual_workbook_sha = sha256_file(workbook_path)
+            except OSError:
+                workbook_exists = False
+        workbook_mismatch = bool(workbook_sha and actual_workbook_sha and workbook_sha != actual_workbook_sha)
         if not rows_ok:
             state = f"✗ 完整性失败（{rows_reason}）"
+        elif upstream_unavailable:
+            state = "✗ 上游 allocation 未就绪"
         elif not workbook_sha:
             state = "✗ 缺少工作簿哈希，不能验证或打包"
         elif stale:
             state = "✗ 已过期（allocation 在其生成后被修改）"
+        elif preview:
+            state = "✗ 预览件越过了开放关卡，不能交付"
         elif blocking:
             state = "… 有阻断的政策检查"
+        elif not workbook_exists:
+            state = "✗ 记录中的工作簿不存在"
+        elif workbook_mismatch:
+            state = "✗ 工作簿内容与 final rows 哈希不符"
         else:
             state = "✓"
             rows_ready = True
         lines.append(f"Stage 3 报销表: {state}，行数 {len(rows.get('rows', []))}，未决餐费/酒店检查 {blocking} 个")
-        if not rows_ok and not next_action:
-            next_action = "re-run write_reimbursement_template.py (final rows integrity failed)"
+        if rows_ready:
+            stage3_status = "ready"
+        elif not rows_ok or upstream_unavailable or not workbook_sha or stale or preview:
+            stage3_status = "blocked"
+        elif blocking:
+            stage3_status = "needs_user"
+        else:
+            stage3_status = "blocked"
+        stages["workbook"] = {
+            "number": 3,
+            "status": stage3_status,
+            "row_count": len(rows.get("rows", [])),
+            "blocking_policy_check_count": blocking,
+            "preview": preview,
+            "integrity_valid": rows_ok,
+            "allocation_stale": stale,
+            "workbook_exists": workbook_exists,
+            "workbook_hash_matches": bool(actual_workbook_sha and actual_workbook_sha == workbook_sha),
+        }
+        artifacts["final_rows"] = {
+            "path": str(rows_path),
+            "integrity_fingerprint": rows_fingerprint,
+            "source_allocation_fingerprint": rows_fp,
+        }
+        artifacts["workbook"] = {
+            "path": recorded_workbook,
+            "recorded_sha256": workbook_sha,
+            "actual_sha256": actual_workbook_sha,
+        }
         if not rows_ok:
             integrity_blocked = True
-        elif not workbook_sha and not next_action:
-            next_action = "re-run write_reimbursement_template.py (workbook hash is missing)"
-        elif stale and not next_action:
-            next_action = "re-run write_reimbursement_template.py (workbook is stale)"
-        elif blocking and not next_action:
-            next_action = "relay the stage 3 review summary to the user; resolve via updater, then re-run stage 3"
+        if not rows_ok:
+            set_next(next_step(
+                "blocked",
+                "workbook",
+                "Final rows integrity failed; regenerate Stage 3 instead of repairing the derived file.",
+                missing=["requester and workbook output path"],
+            ), priority=100)
+        elif upstream_unavailable:
+            set_next(next_step(
+                "blocked",
+                "workbook",
+                "The upstream allocation is not ready; resolve the earlier stage before regenerating Stage 3.",
+            ))
+        elif not workbook_sha or stale or preview or not workbook_exists or workbook_mismatch:
+            requester = str(rows.get("requester", ""))
+            write_parameters = {"requester": requester, "output": recorded_workbook}
+            missing_write_source: list[str] = []
+            if template_workbook:
+                write_parameters["template"] = template_workbook
+            elif layout_file:
+                write_parameters["layout"] = layout_file
+            elif workbook_source == "template":
+                missing_write_source.append("original template workbook path")
+            if requester and recorded_workbook and stage2_ready and not missing_write_source:
+                set_next(next_step(
+                    "command",
+                    "workbook",
+                    "Regenerate the workbook and final rows from the current confirmed allocation.",
+                    operation="write",
+                    parameters=write_parameters,
+                ))
+            else:
+                set_next(next_step(
+                    "needs_user",
+                    "workbook",
+                    "Regenerate Stage 3 after confirming its requester and workbook output path.",
+                    operation="write",
+                    missing=["requester", "workbook output path", *missing_write_source],
+                ))
+        elif blocking:
+            if answers_current:
+                set_next(next_step(
+                    "command",
+                    "workbook",
+                    "Apply the current policy-check decisions through the updater, then rerun Stage 3.",
+                    operation="apply",
+                    parameters={"answers": str(pdir / "allocation-answers.json")},
+                ))
+            else:
+                set_next(next_step(
+                    "needs_user",
+                    "workbook",
+                    "Show the Stage 3 meal/hotel review summary, resolve every blocking check "
+                    "through the updater, then rerun Stage 3.",
+                    operation="compose",
+                    missing=["applicant decision for blocking meal/hotel policy checks"],
+                ))
 
     # Stage 4: require a current, stamped manifest and every listed package file.
-    root = Path(args.output_root)
     candidates = sorted(p for p in root.glob("**/*.xlsx")) if root.exists() else []
     expected_sha = str((rows or {}).get("workbook_sha256", ""))
     verified = None
@@ -237,8 +595,11 @@ def main(argv: list[str] | None = None) -> int:
                     continue
             except OSError:
                 continue
-            mf = load(c.parent / "package-manifest.json")
-            if mf:
+            manifest_path = c.parent / "package-manifest.json"
+            mf = load(manifest_path)
+            if manifest_path.exists() and mf is None:
+                incomplete = (c, "manifest integrity failed: manifest JSON cannot be parsed")
+            elif mf is not None:
                 ok, reason = validate_package_manifest(mf, c, expected_sha, rows_fingerprint)
                 if ok:
                     verified = c
@@ -248,31 +609,110 @@ def main(argv: list[str] | None = None) -> int:
                 orphan = c
     if verified:
         lines.append(f"Stage 4 打包: ✓ {verified.parent}（manifest、final rows 与全部包内文件已验证）")
+        stages["package"] = {"number": 4, "status": "ready", "package_root": str(verified.parent)}
+        manifest = load(verified.parent / "package-manifest.json") or {}
+        artifacts["package_manifest"] = {
+            "path": str(verified.parent / "package-manifest.json"),
+            "integrity_fingerprint": str((manifest.get("integrity") or {}).get("fingerprint", "")),
+        }
     elif incomplete:
         candidate, reason = incomplete
         lines.append(f"Stage 4 打包: ✗ {candidate.parent} 不可提交：{reason}")
-        if not next_action:
-            next_action = "resolve package issues or rebuild the package with package_reimbursement_files.py"
+        stages["package"] = {"number": 4, "status": "blocked", "reason": reason}
+        if reason.startswith("manifest integrity failed:"):
+            integrity_blocked = True
+            set_next(next_step(
+                "blocked",
+                "package",
+                "Package manifest integrity failed; rebuild Stage 4 from the current verified workbook.",
+            ), priority=100)
+        elif reason.startswith("package has "):
+            set_next(next_step(
+                "needs_user",
+                "package",
+                "Resolve every package manifest issue, then rebuild the package.",
+                operation="package",
+                missing=[reason],
+            ))
+        else:
+            set_next(next_step(
+                "command",
+                "package",
+                "Rebuild the package because its manifest or packaged files no longer validate.",
+                operation="package",
+            ))
     elif orphan:
         lines.append(f"Stage 4 打包: ? {orphan} 哈希匹配但无有效 package manifest —— 只是被复制的工作簿，不是完整打包")
-        if not next_action:
-            next_action = "run package_reimbursement_files.py to produce a real package (workbook alone is not a deliverable)"
+        stages["package"] = {"number": 4, "status": "not_started", "reason": "orphan_workbook"}
+        set_next(next_step(
+            "command",
+            "package",
+            "Build a complete package; a copied workbook without a valid manifest is not deliverable.",
+            operation="package",
+        ))
     elif candidates:
         lines.append(f"Stage 4 打包: ? 发现 {len(candidates)} 个 .xlsx 但均非本批 stage 3 产物（哈希不符/无法验证）")
-        if not next_action:
-            next_action = "re-run package_reimbursement_files.py with the latest stage 3 workbook"
+        stages["package"] = {"number": 4, "status": "not_started", "reason": "wrong_workbook_candidates"}
+        set_next(next_step(
+            "command",
+            "package",
+            "Package the exact workbook recorded by the latest final rows.",
+            operation="package",
+        ))
     elif rows and not rows_ready:
         lines.append("Stage 4 打包: ✗ Stage 3 产物不可验证，不能判断打包状态")
+        stages["package"] = {"number": 4, "status": "blocked", "reason": "stage3_not_ready"}
     else:
         lines.append("Stage 4 打包: ✗ 未运行")
-        if not next_action:
-            next_action = "run package_reimbursement_files.py"
+        stages["package"] = {"number": 4, "status": "not_started"}
+        if rows_ready:
+            set_next(next_step(
+                "command",
+                "package",
+                "Build the final submission package from the current verified workbook.",
+                operation="package",
+            ))
 
-    print("WORKFLOW STATUS (relay to the user):")
-    for line in lines:
-        print(line)
-    print(f"NEXT: {next_action or 'workflow complete — deliver the package summary to the user'}")
-    return 2 if integrity_blocked else 0
+    if pending_next is None:
+        pending_next = next_step(
+            "complete",
+            "complete",
+            "Workflow complete; deliver the verified package summary to the applicant.",
+        )
+
+    return {
+        "schema_version": "reimbursement_workflow_state.v1",
+        "process_dir": str(pdir),
+        "output_root": str(root),
+        "stages": stages,
+        "artifacts": artifacts,
+        "lines": lines,
+        "next": pending_next,
+        "integrity_blocked": integrity_blocked,
+        "complete": pending_next.get("kind") == "complete",
+    }
+
+
+def render_status(state: dict[str, Any]) -> str:
+    lines = ["WORKFLOW STATUS (relay to the user):", *state.get("lines", [])]
+    lines.append(f"NEXT: {(state.get('next') or {}).get('summary', 'inspect workflow state')}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    configure_stdio()
+    parser = argparse.ArgumentParser(description="Report reimbursement workflow status.")
+    parser.add_argument("--process-dir", default="process")
+    parser.add_argument("--output-root", default="output")
+    parser.add_argument("--json", action="store_true", help="Print the shared machine-readable workflow state.")
+    args = parser.parse_args(argv)
+
+    state = inspect_workflow(args.process_dir, args.output_root)
+    if args.json:
+        print(json.dumps(state, ensure_ascii=False, indent=2))
+    else:
+        print(render_status(state))
+    return 2 if state.get("integrity_blocked") else 0
 
 
 if __name__ == "__main__":
