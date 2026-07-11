@@ -32,8 +32,6 @@ ALLOWED_ROOT_FIELDS = {
     "generated_at",
     "source_allocation_fingerprint",
     "source_allocation_file",
-    "fill_instructions",
-    "review_context",
     "unit_updates",
     "question_updates",
     "project_contexts",
@@ -117,7 +115,7 @@ CORRECTION_META_FIELDS = {
 }
 
 
-# These are the fields a helper or user can change and that can later reach
+# These are the fields a decision or user answer can change and that can later reach
 # applicant-facing questions, final Notes, or workbook cells. Raw extraction
 # evidence is deliberately excluded because OCR uncertainty belongs in Stage 1
 # review rather than being mistaken for a terminal encoding failure here.
@@ -506,14 +504,19 @@ def validate_answers_root(answers: Any) -> None:
     if isinstance(answers, list):
         raise ValueError(
             "Answers must be a JSON object with top-level unit_updates/question_updates/project_contexts. "
-            "Run build_allocation_answers_template.py and fill the generated template instead of passing a bare list."
+            "Use compose_answers.py to compile allocation_decisions.v1 instead of passing a bare list."
         )
     if not isinstance(answers, dict):
         raise ValueError("Answers must be a JSON object.")
+    if answers.get("schema_version") != "allocation_answers.v1":
+        raise ValueError(
+            "schema_version must be 'allocation_answers.v1'. Generate this file with compose_answers.py; "
+            "diagnostic templates are intentionally not accepted as updater input."
+        )
     if "answers" in answers:
         raise ValueError(
             "Unsupported top-level key 'answers'. Use the canonical schema with 'unit_updates'. "
-            "Run build_allocation_answers_template.py to create a fill-in template."
+            "Use compose_answers.py to compile a canonical answers file."
         )
     unknown = sorted(set(answers) - ALLOWED_ROOT_FIELDS)
     if unknown:
@@ -580,8 +583,8 @@ def normalize_answers(answers: Any) -> tuple[list[dict[str, Any]], list[dict[str
     ]
     if not unit_updates and not question_updates and not context_updates:
         raise ValueError(
-            "Answers file contains no actionable updates. Fill a generated allocation-answers template "
-            "with unit_updates, or use confirm_units/drop_units/exclude_units."
+            "Answers file contains no actionable updates. Correct the allocation_decisions.v1 input and "
+            "rerun compose_answers.py."
         )
     for idx, update in enumerate(question_updates, start=1):
         paths = placeholder_paths(update, f"question_updates[{idx}]")
@@ -686,7 +689,7 @@ def validate_update(update: dict[str, Any], lenient: bool) -> list[str]:
             continue
         errors.append(message)
     if not any(field in ALLOWED_UNIT_FIELDS for field in update):
-        errors.append("Unit update has no fields to apply; fill or remove this template entry.")
+        errors.append("Unit update has no fields to apply; correct or remove this decision entry.")
     column = update.get("final_template_column")
     if column and column not in ALLOWED_COLUMNS:
         errors.append(f"Invalid final_template_column: {column}")
@@ -939,8 +942,8 @@ def apply_answers(
             "answers file was generated against a DIFFERENT allocation generation "
             f"(fingerprint {provided[:8] or '<missing>'}... vs current {expected[:8]}...). "
             "Unit ids may have shifted after allocation was re-run — replaying old answers "
-            "would silently write data onto the wrong units. Regenerate the template against "
-            "the CURRENT allocation, re-fill it, then apply. Never reuse an old answers file."
+            "would silently write data onto the wrong units. Rerun Composer against the CURRENT "
+            "allocation and apply only its newly published answers. Never reuse an old answers file."
         )
     unit_updates, question_updates, context_updates = normalize_answers(answers)
     answer_text_issues = text_safety.find_suspect_text(
@@ -1004,7 +1007,7 @@ def apply_answers(
     if allocation_text_issues:
         raise ValueError(
             "the applied allocation would contain encoding-damaged user-visible text. Nothing was written. "
-            "Fix the UTF-8 helper input and rerun. Findings: " + "; ".join(allocation_text_issues)
+            "Fix the UTF-8 decisions input and rerun Composer. Findings: " + "; ".join(allocation_text_issues)
         )
     payload["generated_at"] = datetime.now().replace(microsecond=0).isoformat()
     payload.setdefault("change_log", []).append({
@@ -1030,38 +1033,25 @@ def apply_answers(
                   "verbatim and wait; do not run stage 3 yet.")
         else:
             print("NEXT: no blocking questions remain — run write_reimbursement_template.py "
-                  "(stage 3). If allocation was re-generated since this template was built, "
-                  "regenerate the template first.")
+                  "(stage 3). If allocation was regenerated, rerun Composer before applying any "
+                  "additional decisions.")
     return payload
 
 
 def print_answers_schema_help(allocation_path: Path) -> None:
-    """Printed on every validation failure.
-
-    Do not guess field names or invent a schema — that is what caused this
-    error. The fastest fix is always to regenerate the canonical template.
-    """
+    """Keep every validation failure on the Composer/updater path."""
     print("", file=sys.stderr)
-    print("HOW TO FIX (do not guess the schema, do not write a patch script):", file=sys.stderr)
-    print("1. Regenerate the canonical answers template for the CURRENT allocation state:", file=sys.stderr)
-    print(f"   python scripts/build_allocation_answers_template.py --allocation {allocation_path} "
-          "--output process/allocation-answers.template.json", file=sys.stderr)
-    print("2. Fill ONLY the generated unit_updates entries. A valid entry looks like:", file=sys.stderr)
-    print(json.dumps({
-        "unit_updates": [{
-            "unit_id": "<UNIT-XXX>",
-            "status": "confirmed",
-            "client_name": "<客户名称或事项名称>",
-            "client_charge_code": "<Client Charge Code>",
-            "expense_date": "<YYYY-MM-DD>",
-            "final_note": "<最终备注>",
-        }]
-    }, ensure_ascii=False, indent=2), file=sys.stderr)
-    print("NOTE: every <> value above is a placeholder — copy the STRUCTURE, replace every", file=sys.stderr)
-    print("value with real data; unreplaced placeholders are rejected by validation.", file=sys.stderr)
-    print("3. Top-level keys allowed: " + ", ".join(sorted(ALLOWED_ROOT_FIELDS)), file=sys.stderr)
-    print("4. unit_update fields allowed: " + ", ".join(sorted(ALLOWED_UNIT_FIELDS)), file=sys.stderr)
-    print("5. Validate with --dry-run first, then apply without it.", file=sys.stderr)
+    print("HOW TO FIX (stay on the canonical Composer/updater path):", file=sys.stderr)
+    print("1. Correct the same UTF-8 allocation_decisions.v1 file that was passed to Composer.", file=sys.stderr)
+    print(f"2. Rerun compose_answers.py against the CURRENT allocation: {allocation_path}", file=sys.stderr)
+    print("3. Apply only the allocation-answers.json that Composer publishes after its dry-run passes.", file=sys.stderr)
+    print(
+        "Do not fill an allocation-answers template, create fill_answers.py/patch scripts, or edit "
+        "expense-allocation.json directly.",
+        file=sys.stderr,
+    )
+    print("Canonical answers root fields: " + ", ".join(sorted(ALLOWED_ROOT_FIELDS)), file=sys.stderr)
+    print("Canonical unit update fields: " + ", ".join(sorted(ALLOWED_UNIT_FIELDS)), file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:

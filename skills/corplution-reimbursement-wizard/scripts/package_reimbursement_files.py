@@ -164,6 +164,31 @@ def build_package(
         raise SystemExit(2)
     allocation = load_json(allocation_path)
     integrity.require_valid(allocation, allocation_path)
+    expected_context_sha = str(allocation.get("source_project_context_sha256", "")).strip()
+    recorded_context = str(allocation.get("source_project_context_file", "")).strip()
+    if expected_context_sha:
+        context_path = Path(recorded_context).expanduser() if recorded_context else Path()
+        if recorded_context and not context_path.is_absolute():
+            context_path = allocation_path.parent.parent / context_path
+        if not recorded_context or not context_path.is_file():
+            print(
+                "ERROR: the project context used by allocation is missing. Restore/rewrite canonical "
+                "project-context.json, rerun Stage 2 and Composer, then regenerate Stage 3.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
+        try:
+            actual_context_sha = hashlib.sha256(context_path.read_bytes()).hexdigest()
+        except OSError as exc:
+            print(f"ERROR: project context cannot be read for provenance validation: {exc}", file=sys.stderr)
+            raise SystemExit(2)
+        if actual_context_sha != expected_context_sha:
+            print(
+                "ERROR: project context changed after allocation. Rerun Stage 2, recompose/apply answers, "
+                "regenerate Stage 3, then package.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
     current_fp = allocation.get("integrity", {}).get("fingerprint", "")
     rows_fp = str(final_rows.get("source_allocation_fingerprint", ""))
     if rows_fp != current_fp:
@@ -214,7 +239,7 @@ def build_package(
     allocation_extraction_fp = str(allocation.get("source_extraction_fingerprint", ""))
     if not allocation_extraction_fp or allocation_extraction_fp != extraction_fp:
         print("ERROR: allocation does not match the current extraction generation. Re-run "
-              "allocate_expenses.py, regenerate the answers template, and reapply confirmed answers "
+              "allocate_expenses.py, recompose decisions, and reapply confirmed answers "
               "before writing Excel and packaging.", file=sys.stderr)
         raise SystemExit(2)
     unresolved_inputs = [

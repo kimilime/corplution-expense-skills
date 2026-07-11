@@ -75,7 +75,7 @@ def _recovery_message(path: Path, reason: str, kind: str) -> str:
         f"  1. Restore the last valid backup: cp {bak} {path}  (then redo your change properly), or\n"
         "  2. Re-run scripts/allocate_expenses.py to regenerate allocation from extraction + context.\n"
         "Then apply changes ONLY via:\n"
-        "  python scripts/build_allocation_answers_template.py --allocation <file> --output process/allocation-answers.template.json\n"
+        "  python scripts/compose_answers.py --allocation <file> --decisions <allocation_decisions.v1.json>\n"
         "  python scripts/apply_allocation_answers.py --allocation <file> --answers process/allocation-answers.json\n"
         "This is the only route that preserves change history and runs the accounting checks."
     )

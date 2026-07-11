@@ -24,6 +24,7 @@ Optional:
 Do not write the final workbook until:
 
 - `Requester` is known.
+- The extraction fingerprint and project-context SHA-256 recorded by Stage 2 still match their current inputs; otherwise rerun allocation and Composer first.
 - Every included allocation unit is confirmed or fixed.
 - Open questions that affect client, charge code, final template column, amount, date, note, or proof number are resolved.
 - No included unit has `date_required: true`, and no included unit has a blank `expense_date`. Pure `other` rows may use a provisional invoice-date `expense_date` when `date_is_provisional: true`; this is advisory, not blocking.

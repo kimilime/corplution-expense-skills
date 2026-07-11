@@ -121,7 +121,16 @@ class WorkflowStateTests(unittest.TestCase):
         self.assertEqual("allocation", state["next"]["stage"])
 
         context = self.fixture.root / "project-context.json"
-        context.write_text("{}\n", encoding="utf-8")
+        context.write_text(json.dumps({
+            "schema_version": "project_context.v1",
+            "project_contexts": [{
+                "date_start": "2026-06-01",
+                "date_end": "2026-06-30",
+                "city": "Shanghai",
+                "client_name": "Test Client",
+                "client_charge_code": "CORP-TEST",
+            }],
+        }), encoding="utf-8")
         state = self.inspect()
         self.assertEqual("command", state["next"]["kind"])
         self.assertEqual("allocate", state["next"]["operation"])
@@ -184,6 +193,36 @@ class WorkflowStateTests(unittest.TestCase):
         state = self.inspect()
         self.assertEqual("command", state["next"]["kind"])
         self.assertEqual("package", state["next"]["operation"])
+
+    def test_changed_project_context_makes_allocation_stale(self) -> None:
+        extraction = self.fixture.extraction()
+        context = self.fixture.root / "project-context.json"
+        context_payload = {
+            "schema_version": "project_context.v1",
+            "project_contexts": [{
+                "date_start": "2026-06-01",
+                "date_end": "2026-06-30",
+                "city": "Shanghai",
+                "client_name": "Test Client",
+                "client_charge_code": "CORP-TEST",
+            }],
+        }
+        context.write_text(json.dumps(context_payload), encoding="utf-8")
+        allocation = self.fixture.allocation(extraction)
+        allocation["source_project_context_file"] = str(context)
+        allocation["source_project_context_sha256"] = hashlib.sha256(context.read_bytes()).hexdigest()
+        integrity.stamp(allocation, "test")
+        (self.fixture.process / "expense-allocation.json").write_text(
+            json.dumps(allocation, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        self.assertFalse(self.inspect()["stages"]["allocation"]["context_mismatch"])
+
+        context_payload["project_contexts"][0]["project_description"] = "Changed after allocation"
+        context.write_text(json.dumps(context_payload), encoding="utf-8")
+        state = self.inspect()
+        self.assertTrue(state["stages"]["allocation"]["context_mismatch"])
+        self.assertEqual("allocate", state["next"]["operation"])
 
     def test_missing_or_preview_workbook_yields_safe_stage3_regeneration(self) -> None:
         extraction = self.fixture.extraction()
@@ -410,6 +449,26 @@ class JournalTests(unittest.TestCase):
         ])
         with self.assertRaises(chief_orchestrator.OrchestratorError):
             chief_orchestrator.build_child_command(args)
+
+    def test_import_wrapper_is_rejected_with_direct_command(self) -> None:
+        wrapper = self.root / "run_chief.py"
+        wrapper.write_text(
+            "import sys\n"
+            f"sys.path.insert(0, {str(SCRIPTS)!r})\n"
+            "import chief_orchestrator\n"
+            "chief_orchestrator.main()\n",
+            encoding="utf-8",
+        )
+        result = subprocess.run(
+            [sys.executable, "-X", "utf8", str(wrapper), "status"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.assertEqual(2, result.returncode)
+        self.assertIn("run_chief.py", result.stderr)
+        self.assertIn(str(SCRIPTS / "chief_orchestrator.py"), result.stderr)
 
 
 if __name__ == "__main__":

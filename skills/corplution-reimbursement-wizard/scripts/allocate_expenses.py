@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import hashlib
 import json
 import re
 import sys
@@ -272,6 +273,102 @@ def reliable_invoice_expense_date(
     return "", "needs_user_date", True, "普通发票开票日期不能直接作为报销发生日期。"
 
 
+PROJECT_CONTEXT_SCHEMA_VERSION = "project_context.v1"
+PROJECT_CONTEXT_REQUIRED_FIELDS = {
+    "date_start",
+    "date_end",
+    "city",
+    "client_name",
+    "client_charge_code",
+}
+PROJECT_CONTEXT_OPTIONAL_FIELDS = {
+    "context_id",
+    "project_description",
+    "user_notes",
+    "project_scope",
+    "travel_buffer_days",
+    "status",
+    "meal_hints",
+    "expense_hints",
+}
+PROJECT_CONTEXT_FIELDS = PROJECT_CONTEXT_REQUIRED_FIELDS | PROJECT_CONTEXT_OPTIONAL_FIELDS
+PROJECT_CONTEXT_ROOT_FIELDS = {"schema_version", "project_contexts"}
+
+
+def project_context_template_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "assets" / "project-context-template.json"
+
+
+def context_schema_errors(payload: Any) -> list[str]:
+    if not isinstance(payload, dict):
+        return ["root must be an object with schema_version and project_contexts; root arrays are not accepted"]
+
+    errors: list[str] = []
+    unknown_root = sorted(set(payload) - PROJECT_CONTEXT_ROOT_FIELDS)
+    if unknown_root:
+        errors.append(
+            "unsupported root field(s): " + ", ".join(unknown_root)
+            + "; use only schema_version and project_contexts"
+        )
+    if payload.get("schema_version") != PROJECT_CONTEXT_SCHEMA_VERSION:
+        errors.append(f"schema_version must be {PROJECT_CONTEXT_SCHEMA_VERSION!r}")
+
+    contexts = payload.get("project_contexts")
+    if not isinstance(contexts, list) or not contexts:
+        alias_note = " Found 'projects'; rename it to 'project_contexts'." if "projects" in payload else ""
+        errors.append("project_contexts must be a non-empty array." + alias_note)
+        return errors
+
+    seen_context_ids: set[str] = set()
+    for index, context in enumerate(contexts, start=1):
+        label = f"project_contexts[{index - 1}]"
+        if not isinstance(context, dict):
+            errors.append(f"{label} must be an object")
+            continue
+        unknown_fields = sorted(set(context) - PROJECT_CONTEXT_FIELDS)
+        if unknown_fields:
+            errors.append(
+                f"{label} unsupported field(s): {', '.join(unknown_fields)}; "
+                f"allowed fields: {', '.join(sorted(PROJECT_CONTEXT_FIELDS))}"
+            )
+        missing = sorted(
+            field for field in PROJECT_CONTEXT_REQUIRED_FIELDS
+            if not clean(context.get(field))
+        )
+        if missing:
+            errors.append(f"{label} missing required canonical field(s): {', '.join(missing)}")
+        context_id = clean(context.get("context_id"))
+        if context_id:
+            if context_id in seen_context_ids:
+                errors.append(f"{label}.context_id duplicates {context_id!r}")
+            seen_context_ids.add(context_id)
+        for field in PROJECT_CONTEXT_REQUIRED_FIELDS | {"project_description", "context_id"}:
+            value = clean(context.get(field))
+            if value.startswith("<") and value.endswith(">"):
+                errors.append(f"{label}.{field} still contains template placeholder {value!r}")
+        start_text = clean(context.get("date_start"))
+        end_text = clean(context.get("date_end"))
+        start = parse_date(start_text) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", start_text) else None
+        end = parse_date(end_text) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", end_text) else None
+        if start_text and start is None:
+            errors.append(f"{label}.date_start must be YYYY-MM-DD")
+        if end_text and end is None:
+            errors.append(f"{label}.date_end must be YYYY-MM-DD")
+        if start and end and end < start:
+            errors.append(f"{label}.date_end cannot be earlier than date_start")
+        try:
+            buffer_days = int(context.get("travel_buffer_days", 1))
+            if buffer_days < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            errors.append(f"{label}.travel_buffer_days must be a non-negative integer")
+        for hints_field in ("meal_hints", "expense_hints"):
+            hints = context.get(hints_field, [])
+            if not isinstance(hints, list) or any(not isinstance(item, dict) for item in hints):
+                errors.append(f"{label}.{hints_field} must be an array of objects")
+    return errors
+
+
 def load_context(path: Path | None) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
     if not path:
         return [], "", [{
@@ -281,29 +378,31 @@ def load_context(path: Path | None) -> tuple[list[dict[str, Any]], str, list[dic
             "why_it_matters": "没有项目上下文时，只能生成费用清单，不能可靠匹配 Client 和 Client Charge Code。",
             "status": "open",
         }]
-    text = path.read_text(encoding="utf-8-sig")
-    if path.suffix.lower() == ".json":
-        payload = json.loads(text)
-        contexts = payload.get("project_contexts", payload if isinstance(payload, list) else [])
-        normalized = []
-        for idx, ctx in enumerate(contexts, start=1):
-            item = dict(ctx)
-            item.setdefault("context_id", f"CTX-{idx:03d}")
-            item.setdefault("travel_buffer_days", 1)
-            item.setdefault("status", "draft")
-            normalized.append(item)
-        return normalized, "", []
-    return [], text, [{
-        "question_id": "Q-CONTEXT-001",
-        "unit_ids": [],
-        "question": (
-            f"已收到自然语言项目说明：{text[:200]}。我会把它整理成项目上下文用于匹配；"
-            "请确认这段说明是否覆盖报销周期、城市、客户名称和 Client Charge Code。"
-            "如果缺任何一项，请直接补充。"
-        ),
-        "why_it_matters": "脚本保留原文；agent 应把自然语言整理成结构化项目上下文，用户只需要确认或补充缺项。",
-        "status": "open",
-    }]
+    if path.suffix.lower() != ".json":
+        raise ValueError(
+            "project context must be canonical UTF-8 JSON; convert natural-language notes internally "
+            "instead of passing a text file to allocation"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"project context JSON cannot be read: {exc}") from exc
+    errors = context_schema_errors(payload)
+    if errors:
+        raise ValueError("invalid project context schema:\n- " + "\n- ".join(errors))
+
+    normalized = []
+    for idx, ctx in enumerate(payload["project_contexts"], start=1):
+        item = dict(ctx)
+        item.setdefault("context_id", f"CTX-{idx:03d}")
+        item.setdefault("project_description", "")
+        item.setdefault("user_notes", "")
+        item.setdefault("travel_buffer_days", 1)
+        item.setdefault("status", "draft")
+        item.setdefault("meal_hints", [])
+        item.setdefault("expense_hints", [])
+        normalized.append(item)
+    return normalized, "", []
 
 
 def doc_by_id(extraction: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -2188,7 +2287,7 @@ def print_open_questions(payload: dict[str, Any]) -> None:
     open_questions = [q for q in payload.get("questions", []) if q.get("status", "open") == "open"]
     if not open_questions:
         print("No open allocation questions. Stage 2 is ready for Excel output.")
-        print("NEXT: run build_allocation_answers_template.py if draft units remain, "
+        print("NEXT: if draft units remain, write allocation_decisions.v1 and run compose_answers.py; "
               "otherwise run write_reimbursement_template.py.")
     else:
         print("")
@@ -2298,7 +2397,22 @@ def main(argv: list[str] | None = None) -> int:
               "record that decision with apply_extraction_corrections.py (input_resolutions), then re-run "
               "extract_invoices.py before allocation.", file=sys.stderr)
         return 2
-    contexts, raw_context, context_questions = load_context(Path(args.context) if args.context else None)
+    context_path = Path(args.context) if args.context else None
+    try:
+        contexts, raw_context, context_questions = load_context(context_path)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("CANONICAL PROJECT CONTEXT TEMPLATE (copy the structure; replace every placeholder):", file=sys.stderr)
+        print(project_context_template_path().read_text(encoding="utf-8"), file=sys.stderr)
+        print(
+            "NEXT: rewrite the same project-context.json in this exact schema, using one context object "
+            "per distinct project/travel date window, then rerun allocation. Do not ask the applicant "
+            "to write JSON and do not bypass this check with a launcher or patch script.",
+            file=sys.stderr,
+        )
+        return 2
+    print(f"PROJECT CONTEXT VALIDATED: {len(contexts)} canonical context window(s).")
     units, link_questions = create_units(extraction, contexts)
     print_document_reconciliation(extraction, units)
     apply_matches(units, contexts)
@@ -2309,6 +2423,10 @@ def main(argv: list[str] | None = None) -> int:
         "generated_at": datetime.now().replace(microsecond=0).isoformat(),
         "source_extraction_file": str(extraction_path),
         "source_extraction_fingerprint": extraction["integrity"]["fingerprint"],
+        "source_project_context_file": str(context_path.resolve()) if context_path else "",
+        "source_project_context_sha256": (
+            hashlib.sha256(context_path.read_bytes()).hexdigest() if context_path else ""
+        ),
         "raw_project_context": raw_context,
         "project_contexts": contexts,
         "allocation_units": units,

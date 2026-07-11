@@ -1714,6 +1714,28 @@ def main(argv: list[str] | None = None) -> int:
     allocation = load_json(allocation_path)
     integrity.require_valid(allocation, allocation_path)
     errors = require_ready(allocation, args.allow_unconfirmed)
+    expected_context_sha = str(allocation.get("source_project_context_sha256", "")).strip()
+    recorded_context = str(allocation.get("source_project_context_file", "")).strip()
+    if expected_context_sha:
+        context_path = Path(recorded_context).expanduser() if recorded_context else Path()
+        if recorded_context and not context_path.is_absolute():
+            context_path = allocation_path.parent.parent / context_path
+        if not recorded_context or not context_path.is_file():
+            errors.append(
+                "The project context used by allocation is missing. Restore/rewrite the canonical "
+                "project-context.json and rerun Stage 2 plus Composer before writing Excel."
+            )
+        else:
+            try:
+                actual_context_sha = hashlib.sha256(context_path.read_bytes()).hexdigest()
+            except OSError as exc:
+                errors.append(f"The project context cannot be read for provenance validation: {exc}")
+            else:
+                if actual_context_sha != expected_context_sha:
+                    errors.append(
+                        "Project context changed after allocation was created. Rerun Stage 2, recompose "
+                        "answers, and apply them before writing Excel."
+                    )
     allocation_text_issues = text_safety.find_suspect_text(
         {
             "allocation_units": text_safety.pick_fields(
@@ -1724,8 +1746,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     if allocation_text_issues:
         errors.append(
-            "Allocation contains suspect encoding damage in user-visible fields. Regenerate the answers file "
-            "from UTF-8 input and apply it through the updater: " + "; ".join(allocation_text_issues)
+            "Allocation contains suspect encoding damage in user-visible fields. Correct the UTF-8 "
+            "allocation_decisions.v1 input, rerun Composer, and apply it through the updater: "
+            + "; ".join(allocation_text_issues)
         )
     extraction_path = allocation_path.parent / "invoice-extraction.json"
     if not extraction_path.exists():
@@ -1741,12 +1764,12 @@ def main(argv: list[str] | None = None) -> int:
         if not allocated_fp:
             errors.append(
                 "Allocation has no source_extraction_fingerprint and cannot prove which extraction generation "
-                "it used. Re-run allocate_expenses.py and regenerate the answers template."
+                "it used. Re-run allocate_expenses.py and recompose decisions."
             )
         elif allocated_fp != extraction_fp:
             errors.append(
-                "Extraction changed after allocation was created. Re-run allocate_expenses.py, regenerate the "
-                "answers template, and reapply the user's answers before writing Excel."
+                "Extraction changed after allocation was created. Re-run allocate_expenses.py, recompose "
+                "decisions, and reapply the user's answers before writing Excel."
             )
         unresolved_inputs = [
             item for item in extraction.get("unresolved_input_files", [])

@@ -4,6 +4,20 @@ Use this reference after stage 1 has produced `process/invoice-extraction.json`.
 
 Do not fill the Excel reimbursement template in this stage. Produce allocation process files for the next stage.
 
+## Contents
+
+- [Inputs](#inputs)
+- [User Project Context](#user-project-context)
+- [Project Context Model](#project-context-model)
+- [Allocation Units](#allocation-units)
+- [Matching Method](#matching-method)
+- [Expense-Type Rules](#expense-type-rules)
+- [Final Note Format](#final-note-format)
+- [Interaction Loop](#interaction-loop)
+- [Applying User Answers](#applying-user-answers)
+- [JSON Output](#json-output)
+- [Completion Criteria](#completion-criteria)
+
 ## Inputs
 
 Required:
@@ -48,22 +62,31 @@ Ask missing information in the current chat, not by asking the user to open proc
 
 ## Project Context Model
 
-Represent user context as `project_contexts`:
+Write the agent-created `project-context.json` in exactly the `project_context.v1` root shape below. The user supplies business facts in natural language; the agent writes this JSON. Do not use aliases such as root `projects`, `charge_code`, or free-form `notes`.
 
 ```json
 {
-  "context_id": "CTX-001",
-  "date_start": "YYYY-MM-DD",
-  "date_end": "YYYY-MM-DD",
-  "city": "Taiyuan",
-  "client_name": "",
-  "client_charge_code": "CORP-2026-BD",
-  "project_description": "",
-  "user_notes": "",
-  "travel_buffer_days": 1,
-  "status": "draft"
+  "schema_version": "project_context.v1",
+  "project_contexts": [
+    {
+      "context_id": "CTX-001",
+      "date_start": "<YYYY-MM-DD>",
+      "date_end": "<YYYY-MM-DD>",
+      "city": "<project city>",
+      "client_name": "<client name>",
+      "client_charge_code": "<Client Charge Code>",
+      "project_description": "",
+      "user_notes": "",
+      "travel_buffer_days": 1,
+      "status": "draft",
+      "meal_hints": [],
+      "expense_hints": []
+    }
+  ]
 }
 ```
+
+Use `assets/project-context-template.json` as the source structure. Create one context object for each distinct travel/project date window. Repeating the same Client and Code across several date windows is valid; final workbook blocks still merge by `client_name + client_charge_code`. Allocation rejects malformed, empty, placeholder-filled, or alias-based contexts before creating any expense units.
 
 Project identity is composite:
 
@@ -438,7 +461,7 @@ Stage 2 is intentionally iterative:
 5. Create suggested assignments for medium-confidence items.
 6. Show an applicant review list in the current conversation before questions, so the user can identify each item by simple number and source filename.
 7. Ask targeted questions in the current conversation for low-confidence, medium-confidence, meal, other, conflicting, or substitute-invoice items. Batch repetitive questions by expense type whenever several items need the same kind of answer.
-8. Generate `allocation-answers.template.json`, fill it with the user's answers as canonical `unit_updates`, apply it with `scripts/apply_allocation_answers.py`, and regenerate `expense-allocation.md/json`.
+8. Translate the user's answers into canonical `allocation_decisions.v1`, run `scripts/compose_answers.py`, then apply the published answers with `scripts/apply_allocation_answers.py` to regenerate `expense-allocation.md/json`.
 9. Repeat until every allocation unit is confirmed or explicitly left in the question queue.
 
 Group questions by expense type first, then list user-facing item numbers inside each group. If one item has multiple uncertainties, ask them together in that type group. For example, a single meal group can ask for actual meal date, project/client, attendees, and note type for items 1/3/5/7. A single hotel group can ask for check-in/check-out/nights for several hotels. A single taxi group can ask for unclear origin/destination place types for several rides.
@@ -483,108 +506,87 @@ python scripts/trace_expense_item.py --allocation process/expense-allocation.jso
 
 Then answer with the source filename(s), invoice number, seller/service provider, amount, date, and trip details so the user can confirm which file it is.
 
-After the user provides the corrected value, fill the generated answers template into `allocation-answers.json` and apply it with `scripts/apply_allocation_answers.py`. Include `manual_correction: true` and a short `correction_note` when the correction changes recognized evidence such as amount, date, seller, invoice number, category, route, origin, or destination.
+After the user provides the corrected value, encode it in `allocation_decisions.v1`, run Composer, and apply the published answers. Include `manual_correction: true` and a short `correction_note` when the correction changes recognized evidence such as amount, date, seller, invoice number, category, route, origin, or destination.
 
-Example correction patch:
+Example correction decision:
 
 ```json
 {
-  "unit_updates": [
+  "schema_version": "allocation_decisions.v1",
+  "decisions": [
     {
-      "unit_no": 9,
-      "amount": "123.45",
-      "expense_date": "2026-06-09",
-      "source_category": "meal",
-      "final_template_column": "meal",
-      "final_note": "加班餐费",
-      "manual_correction": true,
-      "correction_note": "User checked the source invoice and corrected the recognized amount/date."
+      "units": "9",
+      "set": {
+        "amount": "123.45",
+        "expense_date": "2026-06-09",
+        "source_category": "meal",
+        "final_note": "加班餐费",
+        "manual_correction": true,
+        "correction_note": "User checked the source invoice and corrected the recognized amount/date."
+      }
     }
-  ]
+  ],
+  "question_updates": [],
+  "project_contexts": [],
+  "confirm_units": [],
+  "drop_units": [],
+  "exclude_units": []
 }
 ```
 
 ## Applying User Answers
 
-After the user answers in natural language, first generate a current-task answers template:
+After the user answers in natural language, write a UTF-8 decisions file using `assets/allocation-decisions-template.json` as the exact root structure. Do not ask the user to create it.
 
-```bash
-python scripts/build_allocation_answers_template.py --allocation process/expense-allocation.json --output process/allocation-answers.template.json
-```
-
-The template includes canonical `unit_updates` plus `review_context` so the model can fill item numbers, source filenames, current suggestions, and missing fields without guessing the JSON schema. Fill the template into `process/allocation-answers.json`; replace every `<...>` placeholder before applying. Do not create `answers[].allocations`, `patch_allocation.py`, or any other ad hoc shape.
-
-Validate the filled JSON before writing:
-
-```bash
-python scripts/apply_allocation_answers.py --allocation process/expense-allocation.json --answers process/allocation-answers.json --dry-run
-```
-
-Then apply:
-
-```bash
-python scripts/apply_allocation_answers.py --allocation process/expense-allocation.json --answers process/allocation-answers.json
-```
-
-Use this script instead of manually editing `expense-allocation.json`. It updates allocation units, closes answered questions, keeps a backup when overwriting, and appends a change-log entry. The updater rejects noncanonical top-level keys such as `answers`, empty/no-op update files, and unfilled template placeholders so a failed answer translation cannot look like a successful apply.
-
-Do not write one-off patch scripts for bulk allocation updates. Even if the user confirms many hotel dates, taxi place types, meal dates, or project assignments at once, create an `allocation-answers.json` with multiple `unit_updates` and run `scripts/apply_allocation_answers.py`. The updater also refreshes derived notes such as hotel, taxi, and rail/flight notes; direct JSON mutation can bypass these safeguards.
-
-Canonical answers JSON shape:
+Canonical decisions shape:
 
 ```json
 {
-  "schema_version": "allocation_answers.v1",
-  "unit_updates": [
+  "schema_version": "allocation_decisions.v1",
+  "decisions": [
     {
-      "unit_no": 1,
-      "status": "confirmed",
-      "client_name": "",
-      "client_charge_code": "",
-      "admin_client_review_needed": false,
-      "project_context_id": "CTX-001",
-      "expense_date": "YYYY-MM-DD",
-      "date_source": "user_confirmed",
-      "date_is_provisional": false,
-      "date_required": false,
-      "city": "",
-      "final_template_column": "travel",
-      "final_note": "",
-      "reimbursable_amount": "",
-      "hotel_nights": "",
-      "check_in_date": "",
-      "check_out_date": "",
-      "shared_room": false,
-      "room_shared_with": "",
-      "origin_place_type": "",
-      "destination_place_type": "",
-      "attendees": "",
-      "is_substitute_invoice": false,
-      "substitute_for": "",
-      "approval_file": "",
-      "answer": "Short human-readable summary of the user's answer."
+      "units": "1,3,5-7",
+      "set": {
+        "status": "confirmed",
+        "client_name": "<real client name>",
+        "client_charge_code": "<real charge code>",
+        "expense_date": "<YYYY-MM-DD>",
+        "final_note": "<final reimbursement note>"
+      }
     }
   ],
-  "question_updates": [
-    {
-      "question_id": "Q-001",
-      "status": "answered",
-      "answer": "User confirmed this item belongs to Client X / Code Y."
-    }
-  ],
-  "project_contexts": []
+  "question_updates": [],
+  "project_contexts": [],
+  "confirm_units": [],
+  "drop_units": [],
+  "exclude_units": []
 }
 ```
 
-Convenience keys are also supported:
+`decisions[].units` accepts one displayed item number, comma-separated numbers, or ranges. `decisions[].set` accepts canonical updater fields plus Composer aliases such as `client`, `code`, `note`, `date`, `nights`, `checkin`, `checkout`, `attendee`, `origin_type`, and `destination_type`.
+
+The root action arrays are also supported:
 
 - `confirm_units`: list of user-facing item numbers or internal unit IDs to mark confirmed.
 - `drop_units`: list of user-facing item numbers or internal unit IDs to drop.
 - `exclude_units`: list of user-facing item numbers or internal unit IDs to exclude.
+- `question_updates`: explicit question status/answer updates.
+- `project_contexts`: controlled context additions/updates.
 
-For grouped questions, translate each natural-language batch into one or more `unit_updates` using `unit_nos`, for example `{"unit_nos": [1, 3, 5, 7], "client_name": "山西信托", "client_charge_code": "CORP-2026-BD", ...}`. If the user provides different dates for each item, create separate unit updates or separate per-item entries so each `expense_date` is correct.
+Run Composer, then apply only its published output:
 
-Prefer `unit_no` or numeric lists when translating user answers. Internal `unit_id` / `unit_ids` remain supported for scripts and process files, but they should not be shown to the user in chat.
+```bash
+python scripts/chief_orchestrator.py run compose --decisions process/batch-decisions.json
+python scripts/chief_orchestrator.py run apply
+```
+
+Composer resolves the current displayed `user_no` values, binds the current allocation fingerprint, validates text and fields, and calls the updater in dry-run mode before atomically publishing `process/allocation-answers.json`. The updater remains the sole writer of `expense-allocation.json`; it refreshes derived hotel/taxi/rail/flight Notes, closes questions, retains a backup, and appends change history.
+
+If Composer or its updater dry-run fails, correct the same UTF-8 decisions file and rerun Composer. Never generate `fill_answers.py`, write a batch helper, fill a diagnostic answers template, create a patch/fix script, edit a process JSON, or modify a bundled script. `build_allocation_answers_template.py` is developer-only diagnostic output and its schema is intentionally rejected by the updater.
+
+For grouped questions, translate each natural-language batch into one or more `decisions` entries. If the user provides different dates for each item, create separate decision entries so each `expense_date` is correct.
+
+Prefer displayed numeric item selectors when translating user answers. Internal `unit_id` values remain supported only in control action arrays and process files; do not show them to the user in chat.
 
 For substitute invoices, keep `approval_file` even though it will not appear in the visible Excel sheet. Stage 3 must carry it into `final-expense-rows.json`, and Stage 4 must use it to copy the approval screenshot into the support-document folder.
 

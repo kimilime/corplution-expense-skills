@@ -18,6 +18,7 @@ from pathlib import Path
 from typing import Any
 
 import integrity
+import allocate_expenses
 
 
 def configure_stdio() -> None:
@@ -46,6 +47,27 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def validate_project_context(path: Path) -> tuple[bool, str]:
+    if not path.is_file():
+        return False, "project context file does not exist"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return False, f"project context JSON cannot be read: {exc}"
+    errors = allocate_expenses.context_schema_errors(payload)
+    if errors:
+        return False, "; ".join(errors)
+    return True, "ok"
+
+
+def recorded_project_context_path(allocation: dict[str, Any] | None, process_dir: Path) -> Path:
+    recorded = str((allocation or {}).get("source_project_context_file", "")).strip()
+    if not recorded:
+        return process_dir.parent / "project-context.json"
+    path = Path(recorded).expanduser()
+    return path if path.is_absolute() else process_dir.parent / path
 
 
 def manifest_file_path(folder: Path, filename: Any) -> Path | None:
@@ -275,13 +297,26 @@ def inspect_workflow(
             if stage1_ready:
                 context_path = pdir.parent / "project-context.json"
                 if context_path.is_file():
-                    set_next(next_step(
-                        "command",
-                        "allocation",
-                        "Run Stage 2 with the current extraction and project context.",
-                        operation="allocate",
-                        parameters={"context": str(context_path)},
-                    ))
+                    context_ok, context_reason = validate_project_context(context_path)
+                    if context_ok:
+                        set_next(next_step(
+                            "command",
+                            "allocation",
+                            "Run Stage 2 with the current extraction and canonical project context.",
+                            operation="allocate",
+                            parameters={"context": str(context_path)},
+                        ))
+                    else:
+                        lines.append(f"  - BLOCKED: project-context.json 结构无效：{context_reason}")
+                        stages["allocation"]["status"] = "blocked"
+                        stages["allocation"]["context_schema_valid"] = False
+                        set_next(next_step(
+                            "blocked",
+                            "allocation",
+                            "Rewrite project-context.json internally using assets/project-context-template.json; "
+                            "do not ask the applicant to write JSON or run allocation with an invalid context.",
+                            missing=["canonical project-context.json"],
+                        ))
                 else:
                     set_next(next_step(
                         "needs_user",
@@ -302,6 +337,7 @@ def inspect_workflow(
         answers_path = pdir / "allocation-answers.json"
         answers = load(answers_path)
         if answers:
+            answers_schema_valid = answers.get("schema_version") == "allocation_answers.v1"
             answer_action_counts = {
                 field: len(answers.get(field, []))
                 if isinstance(answers.get(field, []), list) else 0
@@ -311,6 +347,7 @@ def inspect_workflow(
             answers_current = bool(
                 alloc_fp
                 and current_answer_count
+                and answers_schema_valid
                 and str(answers.get("source_allocation_fingerprint", "")) == str(alloc_fp)
             )
             artifacts["allocation_answers"] = {
@@ -318,31 +355,47 @@ def inspect_workflow(
                 "source_allocation_fingerprint": str(answers.get("source_allocation_fingerprint", "")),
                 "action_count": current_answer_count,
                 "action_counts": answer_action_counts,
+                "schema_valid": answers_schema_valid,
                 "current": answers_current,
             }
         generation_mismatch = bool(extraction_fp) and (
             str(allocation.get("source_extraction_fingerprint", "")) != extraction_fp
         )
+        context_path = recorded_project_context_path(allocation, pdir)
+        expected_context_sha = str(allocation.get("source_project_context_sha256", "")).strip()
+        context_ok, context_reason = validate_project_context(context_path)
+        actual_context_sha = ""
+        if context_ok:
+            try:
+                actual_context_sha = sha256_file(context_path)
+            except OSError as exc:
+                context_ok = False
+                context_reason = f"project context cannot be hashed: {exc}"
+        context_mismatch = bool(expected_context_sha) and (
+            not context_ok or actual_context_sha != expected_context_sha
+        )
         upstream_unavailable = not stage1_ready
-        stage2_state = "BLOCKED" if not ok or generation_mismatch or upstream_unavailable else (
+        stage2_state = "BLOCKED" if not ok or generation_mismatch or context_mismatch or upstream_unavailable else (
             "✓" if not open_qs and not unconfirmed and not answers_current else "…"
         )
         stamp_note = "" if ok else f" [INTEGRITY FAILED: {reason}]"
         if generation_mismatch:
             stamp_note += " [STALE: extraction changed after allocation]"
+        if context_mismatch:
+            stamp_note += " [STALE: project context changed, disappeared, or became invalid]"
         if upstream_unavailable and not generation_mismatch:
             stamp_note += " [BLOCKED: extraction is not ready]"
         answer_note = f"，待应用答案 {current_answer_count} 项" if answers_current else ""
         lines.append(f"Stage 2 归集: {stage2_state} 单元 {len(confirmed)}/{len(units)} 已确认"
                      f"（另排除 {len(closed)}），阻断问题 {len(open_qs)} 个{answer_note}{stamp_note}")
         stage2_ready = (
-            ok and not generation_mismatch and not upstream_unavailable
+            ok and not generation_mismatch and not context_mismatch and not upstream_unavailable
             and not open_qs and not unconfirmed and not answers_current
         )
         stages["allocation"] = {
             "number": 2,
             "status": "ready" if stage2_ready else (
-                "blocked" if not ok or generation_mismatch or upstream_unavailable else (
+                "blocked" if not ok or generation_mismatch or context_mismatch or upstream_unavailable else (
                     "command_ready" if answers_current else "needs_user"
                 )
             ),
@@ -354,11 +407,16 @@ def inspect_workflow(
             "unapplied_answer_count": current_answer_count if answers_current else 0,
             "integrity_valid": ok,
             "generation_mismatch": generation_mismatch,
+            "context_mismatch": context_mismatch,
+            "context_schema_valid": context_ok,
         }
         artifacts["allocation"] = {
             "path": str(allocation_path),
             "integrity_fingerprint": str(alloc_fp),
             "source_extraction_fingerprint": str(allocation.get("source_extraction_fingerprint", "")),
+            "source_project_context_file": str(context_path),
+            "source_project_context_sha256": expected_context_sha,
+            "actual_project_context_sha256": actual_context_sha,
         }
         if not ok:
             integrity_blocked = True
@@ -370,8 +428,7 @@ def inspect_workflow(
                 missing=["current project context file"],
             ), priority=100)
         elif generation_mismatch:
-            context_path = pdir.parent / "project-context.json"
-            if context_path.is_file():
+            if context_ok:
                 set_next(next_step(
                     "command",
                     "allocation",
@@ -381,11 +438,28 @@ def inspect_workflow(
                 ))
             else:
                 set_next(next_step(
-                    "needs_user",
+                    "blocked",
                     "allocation",
-                    "Extraction changed; recreate project-context.json before regenerating allocation.",
+                    "Extraction changed, but the project context is missing or invalid. Rewrite it internally "
+                    "from the applicant's notes using assets/project-context-template.json.",
+                    missing=[f"canonical project context: {context_reason}"],
+                ))
+        elif context_mismatch:
+            if context_ok:
+                set_next(next_step(
+                    "command",
+                    "allocation",
+                    "Project context changed after allocation; regenerate Stage 2 and recompose all answers.",
                     operation="allocate",
-                    missing=["current project context file"],
+                    parameters={"context": str(context_path)},
+                ))
+            else:
+                set_next(next_step(
+                    "blocked",
+                    "allocation",
+                    "The recorded project context disappeared or is invalid. Rewrite the canonical context "
+                    "internally before rerunning allocation.",
+                    missing=[f"canonical project context: {context_reason}"],
                 ))
         elif answers_current:
             set_next(next_step(

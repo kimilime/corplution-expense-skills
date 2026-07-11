@@ -126,8 +126,8 @@ def main(argv: list[str] | None = None) -> int:
     extraction_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"Updated {extraction_path}")
     print(f"Overlay saved: {xc.overlay_path(process_dir)} (replayed automatically on extractor re-runs)")
-    print("Next: re-run scripts/allocate_expenses.py, then REGENERATE the answers template —")
-    print("unit ids may have shifted; old answers files must not be replayed.")
+    print("Next: re-run scripts/allocate_expenses.py, then RECOMPOSE decisions with compose_answers.py —")
+    print("item bindings may have shifted; old answers files must not be replayed.")
     return 0
 
 

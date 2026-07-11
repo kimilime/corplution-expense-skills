@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a canonical allocation-answers template from stage-2 allocation JSON."""
+"""Build a read-only schema preview from stage-2 allocation JSON."""
 
 from __future__ import annotations
 
@@ -240,14 +240,14 @@ def build_template(payload: dict[str, Any], allocation_path: Path, include_advis
     _questions, question_ids_by_unit = question_maps(payload, include_advisory)
     units = selected_units(payload, question_ids_by_unit)
     return {
-        "schema_version": "allocation_answers.v1",
+        "schema_version": "allocation_answers_diagnostic.v1",
+        "diagnostic_only": True,
         "generated_at": datetime.now().replace(microsecond=0).isoformat(),
         "source_allocation_file": str(allocation_path),
-        "fill_instructions": [
-            "Fill this canonical template from the user's natural-language answers.",
-            "Replace every <...> placeholder before running apply_allocation_answers.py.",
-            "Keep unit_updates as the only place for per-item changes; do not invent answers[].allocations or patch expense-allocation.json directly.",
-            "Use unit_no in generated answers. Do not expose internal unit_id values to the applicant in chat.",
+        "inspection_instructions": [
+            "This file is diagnostic only and is intentionally rejected by the updater.",
+            "Do not fill, rename, or submit it as allocation-answers.json.",
+            "Create allocation_decisions.v1 and run compose_answers.py for every real update.",
         ],
         "review_context": [
             review_context(unit, question_ids_by_unit.get(clean(unit.get("unit_id")), []))
@@ -264,9 +264,9 @@ def build_template(payload: dict[str, Any], allocation_path: Path, include_advis
 
 def main(argv: list[str] | None = None) -> int:
     configure_stdio()
-    parser = argparse.ArgumentParser(description="Build a canonical allocation answers template.")
+    parser = argparse.ArgumentParser(description="Build a read-only allocation answers schema preview.")
     parser.add_argument("--allocation", required=True, help="Path to process/expense-allocation.json.")
-    parser.add_argument("--output", required=True, help="Path to write allocation-answers.template.json.")
+    parser.add_argument("--output", required=True, help="Path to write the diagnostic schema preview.")
     parser.add_argument("--include-advisory", action="store_true", help="Also include advisory questions.")
     args = parser.parse_args(argv)
 
@@ -278,11 +278,11 @@ def main(argv: list[str] | None = None) -> int:
     output_path = Path(args.output)
     write_json(output_path, template)
     print(f"Wrote {output_path}")
-    print(f"Template unit updates: {len(template['unit_updates'])}")
+    print(f"Diagnostic unit previews: {len(template['unit_updates'])}")
     if not template["unit_updates"]:
-        print("No open or draft allocation units need an answers template.")
+        print("No open or draft allocation units need inspection.")
     else:
-        print("Fill placeholders, save as process/allocation-answers.json, then run apply_allocation_answers.py.")
+        print("DIAGNOSTIC ONLY: do not fill or apply this file. Use allocation_decisions.v1 + Composer.")
     return 0
 
 

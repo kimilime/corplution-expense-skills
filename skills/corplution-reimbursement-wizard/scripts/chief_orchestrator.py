@@ -30,7 +30,6 @@ RUN_METADATA = {
     "extract": ("stage1", "extract_invoices.py"),
     "correct-extraction": ("stage1-correction", "apply_extraction_corrections.py"),
     "allocate": ("stage2", "allocate_expenses.py"),
-    "template": ("stage2-control", "build_allocation_answers_template.py"),
     "compose": ("stage2-control", "compose_answers.py"),
     "apply": ("stage2-update", "apply_allocation_answers.py"),
     "trace": ("stage2-query", "trace_expense_item.py"),
@@ -47,7 +46,7 @@ def configure_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             try:
-                stream.reconfigure(errors="replace")
+                stream.reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
 
@@ -68,9 +67,6 @@ def add_run_parsers(run_parser: argparse.ArgumentParser) -> None:
 
     allocate = stages.add_parser("allocate", help="Run Stage 2 with project context.")
     allocate.add_argument("--context", required=True)
-
-    template = stages.add_parser("template", help="Generate the current canonical answers template.")
-    template.add_argument("--include-advisory", action="store_true")
 
     compose = stages.add_parser("compose", help="Compose and dry-run allocation answers.")
     compose.add_argument("--set", action="append", default=[], dest="specs")
@@ -127,7 +123,6 @@ def canonical_paths(args: argparse.Namespace) -> dict[str, Path]:
         "process": pdir,
         "extraction": pdir / "invoice-extraction.json",
         "allocation": pdir / "expense-allocation.json",
-        "answers_template": pdir / "allocation-answers.template.json",
         "answers": pdir / "allocation-answers.json",
         "final_rows": pdir / "final-expense-rows.json",
     }
@@ -181,13 +176,6 @@ def build_child_command(args: argparse.Namespace) -> tuple[str, str, list[str]]:
             "--context", args.context,
             "--output", str(paths["process"]),
         ])
-    elif stage == "template":
-        child.extend([
-            "--allocation", str(paths["allocation"]),
-            "--output", str(paths["answers_template"]),
-        ])
-        if args.include_advisory:
-            child.append("--include-advisory")
     elif stage == "compose":
         if not args.specs and not args.decisions:
             raise OrchestratorError("compose requires at least one --set or --decisions input")
@@ -406,8 +394,24 @@ def inspect(args: argparse.Namespace) -> tuple[dict[str, Any], dict[str, Any]]:
     return state, enrich_next(state, args.journal)
 
 
+def invoked_as_bundled_script() -> bool:
+    try:
+        return Path(sys.argv[0]).resolve() == Path(__file__).resolve()
+    except OSError:
+        return False
+
+
 def main(argv: list[str] | None = None) -> int:
     configure_stdio()
+    if not invoked_as_bundled_script():
+        direct = [sys.executable, str(Path(__file__).resolve()), *sys.argv[1:]]
+        print(
+            "ERROR: chief_orchestrator.py was imported through a wrapper/launcher. "
+            "Do not create run_chief.py, modify sys.path, copy the script, or call chief_orchestrator.main().",
+            file=sys.stderr,
+        )
+        print(f"NEXT: execute the bundled Chief directly:\n{format_command(direct)}", file=sys.stderr)
+        raise SystemExit(2)
     parser = build_parser()
     args = parser.parse_args(argv)
 
