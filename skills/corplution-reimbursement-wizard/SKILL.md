@@ -76,9 +76,23 @@ Before translating the user's natural-language answers into JSON, generate a cur
 python scripts/build_allocation_answers_template.py --allocation process/expense-allocation.json --output process/allocation-answers.template.json
 ```
 
-When the user answers allocation questions, fill the template into `process/allocation-answers.json`, validate it with the bundled updater, then apply it. Repeat until no blocking questions remain. Do not create ad hoc patch scripts to mutate `expense-allocation.json`; the updater refreshes notes, closes questions, preserves change history, and runs accounting checks. After ANY allocation re-run, regenerate the template before applying — the updater verifies the answers file was built against the current allocation generation and rejects stale ones, because unit ids may have shifted and replaying old answers would write data onto the wrong units.
+When the user answers allocation questions, compile the confirmed decisions into `process/allocation-answers.json`, run the bundled updater, and repeat until no blocking questions remain. Do not create ad hoc patch scripts to mutate `expense-allocation.json`; the updater refreshes notes, closes questions, preserves change history, and runs accounting checks. After ANY allocation re-run, regenerate allocation answers because unit ids may have shifted and replaying old answers would write data onto the wrong units.
 
-Writing a helper script to GENERATE the answers file is allowed and even recommended for large batches (it is less error-prone than hand-writing JSON for dozens of units), as long as the result still goes through build-template + apply as usual. But helper scripts are one-off work products: save them in the session working directory, NEVER inside this skill's folder — a batch-specific script (with hardcoded project/city tables) left in `scripts/` will be mistaken for a bundled tool by future sessions and applied to the wrong batch. Direct mutation of process JSONs by helper scripts remains forbidden regardless of where the script lives.
+### Batch Answers
+
+For batch confirmations, use the bundled composer instead of writing a helper script. It resolves current unit numbers, writes the live allocation fingerprint, validates field aliases and text safety, dry-runs the updater, and publishes `allocation-answers.json` only after that dry-run passes.
+
+```bash
+# Use --set only for compact values without whitespace or shell-sensitive characters.
+python scripts/compose_answers.py --allocation process/expense-allocation.json \
+    --set "3,5,7-12: status=confirmed client=山西信托 city=太原 note=出差餐费"
+
+# Use a UTF-8 decisions file for any space, quote, path, long note, or uncertain console encoding.
+python scripts/compose_answers.py --allocation process/expense-allocation.json \
+    --decisions process/batch-decisions.json
+```
+
+The composer writes no process JSON. It produces answers only; `apply_allocation_answers.py` remains the sole Stage 2 writer. Use a one-off helper only when the composer cannot express the required update. Keep any such helper in the session working directory, never inside this skill's folder, and follow `references/batch-answer-helpers.md`.
 
 ```bash
 python scripts/apply_allocation_answers.py --allocation process/expense-allocation.json --answers process/allocation-answers.json --dry-run

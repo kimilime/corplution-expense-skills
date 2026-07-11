@@ -74,7 +74,7 @@ python skills/corplution-reimbursement-wizard/scripts/check_dependencies.py --st
 
 如果缺少 OCR 工具，提取器应将纯扫描/图片输入标记为 `manual_review`，并要求确认，而不是编造发票字段。
 
-如果 Windows/Git Bash 终端输出乱码或截断，不要另写临时提取脚本绕过流程；直接读取脚本已写出的 UTF-8 Markdown 过程文件，例如 `process/invoice-extraction.md`、`process/expense-allocation.md` 或 `process/final-expense-rows.md`。批量修正 allocation 时，应先生成并填写 `allocation-answers.template.json`，再将结果保存为 `allocation-answers.json` 并运行 `apply_allocation_answers.py`；不要直接 patch `expense-allocation.json`。
+如果 Windows/Git Bash 终端输出乱码或截断，不要另写临时提取脚本绕过流程；直接读取脚本已写出的 UTF-8 Markdown 过程文件，例如 `process/invoice-extraction.md`、`process/expense-allocation.md` 或 `process/final-expense-rows.md`。批量确认 allocation 时，优先使用 `compose_answers.py` 从简洁决议生成 `allocation-answers.json`，它会自动 dry-run updater；不要直接 patch `expense-allocation.json`。
 
 ## Scripts
 
@@ -89,6 +89,11 @@ python skills/corplution-reimbursement-wizard/scripts/allocate_expenses.py \
 python skills/corplution-reimbursement-wizard/scripts/build_allocation_answers_template.py \
   --allocation process/expense-allocation.json \
   --output process/allocation-answers.template.json
+
+# Compact values without spaces only; use --decisions for complex text.
+python skills/corplution-reimbursement-wizard/scripts/compose_answers.py \
+  --allocation process/expense-allocation.json \
+  --set "3,5-7: status=confirmed client=山西信托 city=太原 note=出差餐费"
 
 python skills/corplution-reimbursement-wizard/scripts/apply_allocation_answers.py \
   --allocation process/expense-allocation.json \
@@ -145,17 +150,17 @@ python skills/corplution-reimbursement-wizard/scripts/package_reimbursement_file
 - Same-proof support files receive `-2`, `-3`, and later suffixes rather than overwriting one another. Packaging replaces the old package only after a complete fresh staging build, so stale evidence cannot survive a rerun.
 - Any integrity failure in `check_workflow_status.py` is `BLOCKED`. Follow its recovery instruction and regenerate the affected stage instead of editing process JSON by hand.
 
-## 批量 Answers Helper 的编码安全
+## 批量 Answers 的编码安全
 
-- 批量 helper 只允许从本次生成的 `allocation-answers.template.json` 填充既有 `unit_updates`，再生成 `allocation-answers.json`；绝不能直接修改任何 `process/*.json`。
-- helper 必须显式以 `utf-8-sig` 读取模板、以 UTF-8 写出 JSON。不要把中文值经由 PowerShell inline Python、`-Command` 或控制台管道传入；应使用 UTF-8 的 Python/JSON 文件，或在受限 inline 值中使用 Unicode escape。
-- 先运行官方 updater 的 `--dry-run`，再 apply。updater、Stage 3 和保存后的 Excel 均会拒绝连续 `??`、替换字符及常见乱码标记；单个 ASCII `?` 的正常英文说明允许保留。失败后修 helper 输入并重新生成 answers，不要补丁式修改 allocation 或 workbook。
+- 默认使用 `compose_answers.py`，而不是每批临时写 Python helper。它使用当前 allocation 指纹、校验 unit 编号和字段、自动 dry-run updater，且只有验证通过才发布 `allocation-answers.json`。
+- `--set` 只适用于不含空格或 shell 敏感字符的短值。只要出现空格、引号、文件路径、长备注或不确定的控制台编码，就用 UTF-8 `--decisions` JSON 文件。
+- composer 表达不了的少数更新才允许一次性 helper；它绝不能直接修改任何 `process/*.json`，且必须按 `references/batch-answer-helpers.md` 使用显式 UTF-8 和 updater dry-run。
 
-## Batch Answers Helper Encoding Safety
+## Batch Answers Encoding Safety
 
-- A batch helper may only fill existing `unit_updates` in the current `allocation-answers.template.json` and then generate `allocation-answers.json`; it must never edit any `process/*.json` directly.
-- Read the template as `utf-8-sig` and write JSON as UTF-8. Do not route Chinese text through PowerShell inline Python, `-Command`, or a console pipeline; use UTF-8 Python/JSON files or Unicode escapes for constrained inline values.
-- Run the official updater with `--dry-run` before apply. The updater, Stage 3, and the saved workbook reject consecutive `??`, replacement characters, and common mojibake markers; a single ASCII `?` in legitimate English free text is allowed. Repair the helper input and regenerate answers instead of patching allocation or workbook files.
+- Use `compose_answers.py` by default instead of writing a Python helper for every batch. It uses the live allocation fingerprint, validates unit numbers and fields, dry-runs the updater, and publishes `allocation-answers.json` only after that validation passes.
+- Use `--set` only for compact values without whitespace or shell-sensitive characters. Use a UTF-8 `--decisions` JSON file for spaces, quotes, file paths, long notes, or uncertain terminal encoding.
+- A one-off helper is allowed only when the composer cannot express an update. It must never edit any `process/*.json` directly and must follow `references/batch-answer-helpers.md` for explicit UTF-8 handling and updater dry-run.
 
 ## Notes
 
@@ -241,7 +246,7 @@ python skills/corplution-reimbursement-wizard/scripts/check_dependencies.py --st
 
 If OCR tools are missing, the extractor should mark scan-only/image inputs as `manual_review` and ask for confirmation instead of inventing invoice fields.
 
-If Windows/Git Bash terminal output is garbled or truncated, do not write temporary extraction scripts to bypass the workflow; read the UTF-8 Markdown process files already written by the scripts, such as `process/invoice-extraction.md`, `process/expense-allocation.md`, or `process/final-expense-rows.md`. For bulk allocation corrections, generate and fill `allocation-answers.template.json`, save the filled result as `allocation-answers.json`, and run `apply_allocation_answers.py` instead of directly patching `expense-allocation.json`.
+If Windows/Git Bash terminal output is garbled or truncated, do not write temporary extraction scripts to bypass the workflow; read the UTF-8 Markdown process files already written by the scripts, such as `process/invoice-extraction.md`, `process/expense-allocation.md`, or `process/final-expense-rows.md`. For bulk allocation confirmations, use `compose_answers.py` to turn compact decisions into `allocation-answers.json`; it automatically dry-runs the updater. Do not directly patch `expense-allocation.json`.
 
 ## Scripts
 
@@ -256,6 +261,11 @@ python skills/corplution-reimbursement-wizard/scripts/allocate_expenses.py \
 python skills/corplution-reimbursement-wizard/scripts/build_allocation_answers_template.py \
   --allocation process/expense-allocation.json \
   --output process/allocation-answers.template.json
+
+# Compact values without spaces only; use --decisions for complex text.
+python skills/corplution-reimbursement-wizard/scripts/compose_answers.py \
+  --allocation process/expense-allocation.json \
+  --set "3,5-7: status=confirmed client=山西信托 city=太原 note=出差餐费"
 
 python skills/corplution-reimbursement-wizard/scripts/apply_allocation_answers.py \
   --allocation process/expense-allocation.json \

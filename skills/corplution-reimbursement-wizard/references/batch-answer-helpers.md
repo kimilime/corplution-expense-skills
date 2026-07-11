@@ -1,6 +1,6 @@
 # Batch Allocation-Answers Helper Guide
 
-Use this reference only when a large batch of confirmed natural-language answers makes manual editing of `allocation-answers.json` impractical.
+Use the bundled `scripts/compose_answers.py` for normal batch confirmations. Read this reference only when the composer cannot express a required update and a one-off answers generator is genuinely necessary.
 
 ## Boundary
 
