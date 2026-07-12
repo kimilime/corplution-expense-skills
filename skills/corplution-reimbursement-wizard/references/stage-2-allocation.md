@@ -152,6 +152,7 @@ Each allocation unit should carry:
 - formal invoice issue date when available
 - reliable expense date or date range, plus `date_source` and `date_required`
 - city, origin, destination, route, seller, and note evidence
+- railway leg fields when applicable, plus `journey_chain_id`, ordered position, whole-chain route, confidence, assignment rule, and whole-chain confirmation status after transfer detection
 - raw remarks
 - linked support documents
 
@@ -191,12 +192,13 @@ Use type-specific pre-allocation rules. Do not apply one generic city/date rule 
 - Meal amount column and `Expense Nature` are form-over-substance: decide `meal`/local versus `travel`/business trip by the invoice/restaurant city, not by the assigned project. Shanghai meal invoices go to `meal`/local even when allocated to a business-trip project; non-Shanghai meal invoices go to `travel`/business trip.
 - Taxi/Didi/Gaode: allocate to the project journey the ride supports. Ordinary non-local city rides may match by city/date. Shanghai/base-city rides must not be auto-assigned to a Shanghai local project merely because city and date match; require explicit client/project evidence in the ride endpoint, route note, user note, or context keyword. Airport/station transfers belong to the upcoming destination project when the next project starts within the travel buffer. Transfers from one project city to a station/airport for the next city belong to the project being traveled to.
 - Taxi/Didi/Gaode amount column and `Expense Nature` are also form-over-substance: decide `taxi`/local versus `travel`/business trip by ride city, not by the assigned project. A Shanghai ride to an airport or railway station can belong to an out-of-town project while staying in the `taxi` column.
-- Flight/rail: match by route destination and travel date, allowing a reasonable +/- 1 day project buffer.
+- Railway: before per-ticket matching, group connected ticket segments into a journey chain when travel dates/times are ordered and each intermediate destination station/city matches the next origin station/city. Allocate the chain as one journey; do not treat a transfer station as a separate project destination.
+- Standalone flight/rail: match by route destination and travel date, allowing a reasonable +/- 1 day project buffer.
 - For taxi/ride transfers, do not require the ride city to equal the project city when the ride is clearly to/from an airport or railway station. A Shanghai ride to Hongqiao station/airport can belong to the out-of-town destination project if it supports that journey.
 - Never assign unmatched taxi/travel/hotel/meal to `CORP-2026-ADMIN`, Client `通讯费`, or the mobile amount column. If transfer logic does not identify a project, ask the user.
 - Other and unknown: do not pre-match by invoice city. Ask the user for accounting note and project/admin matter because issuer city can be misleading for SaaS, online meeting, association, platform, or generic service expenses. For pure `other`, temporarily use the invoice issue date as Date and advise the user to confirm/correct it; for `unknown`, ask for the actual date until reclassified.
 
-Record deterministic pre-allocation in `auto_project_match` with values such as `hotel_stay_dates`, `hotel_unique_city`, `unique_non_shanghai_city`, `taxi_explicit_project_evidence`, `taxi_transfer_to_next_project`, `taxi_transfer_matches_travel_unit`, `taxi_city_date`, `travel_destination_date`, or `travel_route_date`, and explain the basis in `match_reason`.
+Record deterministic pre-allocation in `auto_project_match` with values such as `hotel_stay_dates`, `hotel_unique_city`, `unique_non_shanghai_city`, `taxi_explicit_project_evidence`, `taxi_transfer_to_next_project`, `taxi_transfer_matches_travel_unit`, `taxi_city_date`, `rail_transfer_chain_destination`, `rail_transfer_chain_return`, `travel_destination_date`, or `travel_route_date`, and explain the basis in `match_reason`.
 
 ## Expense-Type Rules
 
@@ -247,6 +249,17 @@ Determine `origin_place_type` and `destination_place_type` before finalizing the
 ### Railway And Flight Travel
 
 Match by route, destination city, and travel date. Travel is usually high-confidence when the destination city and travel date align with a project city/date range, allowing a reasonable +/- 1 day buffer.
+
+Before applying that rule ticket by ticket, build railway journey chains:
+
+- Same-day rail tickets, or tightly connected cross-date tickets with usable times, form a chain when the earlier destination station matches the later origin station. Treat directional station variants in the same city, such as `周口东` and `周口`, as connectable when the remaining evidence is consistent.
+- `上海虹桥 -> 周口东` plus `周口东 -> 郑州东` is one journey to Zhengzhou. Both tickets belong to the Zhengzhou project even when Zhoukou also has a project context; Zhoukou is only a transfer unless there is evidence of actual work, lodging, or a deliberate long stop there.
+- Local/home -> project: assign every segment to the terminal/upcoming project.
+- Project A -> project B: assign every segment to project B, the project being traveled to.
+- Project -> local/home: assign every segment to the project just completed.
+- Preserve each ticket as a separate allocation unit, proof, amount, and final Note such as `高铁（上海虹桥-周口东）`; share only `journey_chain_id` and project assignment.
+- Show a resolved chain once as an advisory review item. Do not ask about each intermediate destination. Ask one blocking whole-chain question only if station continuity/time order is ambiguous, the whole chain has multiple plausible projects, or the applicant says an intermediate city was an actual stop.
+- When the applicant corrects a chain assignment, include every displayed item number in one Composer decision. The updater clears the whole-chain gate only when all active legs share the same Client, Code, and project context; a partial or split update remains blocking.
 
 When travel connects two project cities, assign it to the project being traveled to. Return travel without a following project usually belongs to the project just completed. If route direction is unclear, ask in the travel batch question. Do not assign a train/flight to the origin project merely because the departure station city matches it.
 
@@ -676,6 +689,21 @@ Write `process/expense-allocation.json`:
       "room_shared_with": "",
       "room_share_note": "",
       "route": "",
+      "train_no": "",
+      "origin_station": "",
+      "destination_station": "",
+      "rail_departure_time": "",
+      "rail_departure_datetime": "",
+      "journey_chain_id": "",
+      "journey_chain_route": "",
+      "journey_chain_position": "",
+      "journey_chain_length": "",
+      "journey_chain_unit_ids": [],
+      "journey_chain_confidence": "",
+      "journey_chain_assignment_rule": "",
+      "journey_chain_match_reason": "",
+      "journey_chain_project_context_id": "",
+      "journey_chain_needs_confirmation": false,
       "origin_place_type": "",
       "destination_place_type": "",
       "place_type_confidence": "",

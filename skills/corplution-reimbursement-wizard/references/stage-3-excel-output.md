@@ -30,7 +30,8 @@ Do not write the final workbook until:
 - No included unit has `date_required: true`, and no included unit has a blank `expense_date`. Pure `other` rows may use a provisional invoice-date `expense_date` when `date_is_provisional: true`; this is advisory, not blocking.
 - No non-mobile row uses Client `通讯费`, final column `mobile`, or a note containing `通讯费`.
 - No taxi/travel row is assigned to `CORP-2026-ADMIN`. Admin is not a fallback for unmatched transport.
-- If a flight/rail route destination uniquely matches a project context, the row is assigned to that destination project, not the origin project.
+- Standalone flight/rail whose route destination uniquely matches a project context is assigned to that destination project, not the origin project.
+- Every active railway journey chain has at least two continuous ticket segments, one shared project assignment, no open whole-chain question, and current length/member/route metadata. A dropped or corrected segment requires Stage 2 to rebuild the chain. Skip per-ticket destination-project enforcement for intermediate transfer segments; validate the chain as a whole instead.
 - Substitute invoices either have approval screenshot paths or explicit missing-screenshot issues.
 - Didi/Gaode summary invoices linked to trip reports are not duplicated as standalone expense rows.
 
@@ -453,6 +454,21 @@ Create or update:
       "seller_name": "",
       "attendees": "",
       "meal_context": "business_trip",
+      "train_no": "",
+      "origin_station": "",
+      "destination_station": "",
+      "rail_departure_time": "",
+      "rail_departure_datetime": "",
+      "journey_chain_id": "",
+      "journey_chain_route": "",
+      "journey_chain_position": "",
+      "journey_chain_length": "",
+      "journey_chain_unit_ids": [],
+      "journey_chain_confidence": "",
+      "journey_chain_assignment_rule": "",
+      "journey_chain_match_reason": "",
+      "journey_chain_project_context_id": "",
+      "journey_chain_needs_confirmation": false,
       "meal_cap_policy": "business_trip_meal",
       "meal_daily_cap": "150.00",
       "meal_policy_basis": [
@@ -478,6 +494,7 @@ Create or update:
       "corrected_fields": []
     }
   ],
+  "rail_journey_chains": [],
   "project_blocks": [
     {
       "project_key": "Client|Client Charge Code",
@@ -608,7 +625,8 @@ Before delivering the workbook:
 - Taxi/Didi/Gaode amount columns follow the ride city rule: Shanghai -> `taxi`; non-Shanghai -> `travel`.
 - Taxi/Didi/Gaode final notes do not contain literal `出发地类型` or `目的地类型` placeholders.
 - Hotel final notes do not contain literal `X晚`, `入住日`, or `离店日` placeholders.
-- Flight/rail between two project cities belongs to the destination/project being traveled to.
+- Standalone flight/rail between two project cities belongs to the destination/project being traveled to.
+- Connected railway tickets retain separate rows/proofs/Notes but share one project assignment. Adjacent stations must still connect, and a transfer station must not split the chain into another project.
 - `Expense Nature` follows the formal Shanghai/non-Shanghai rule.
 - All substitute invoice notes include `（抵）`.
 - Meal daily cap checks are present and have been shown in chat. Any over-cap day with attendees is advisory only; any over-cap day without attendees must be resolved or explicitly acknowledged before final submission.

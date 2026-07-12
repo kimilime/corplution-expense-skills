@@ -510,25 +510,51 @@ def note_for_invoice(text: str, invoice: dict[str, str], category: str, subtype:
     return clean(seller or line_item)
 
 
-def railway_note(text: str) -> str:
+def parse_railway_leg(text: str) -> dict[str, Any]:
     compact_text = clean(text)
     train = regex_first(r"\b([GDCZTK]\d{1,5})\b", compact_text)
-    travel_dt = date_from_chinese(regex_first(r"(\d{4}\s*\u5e74\s*\d{1,2}\s*\u6708\s*\d{1,2}\s*\u65e5\s*\d{1,2}:\d{2})", compact_text))
+    travel_date = date_from_chinese(regex_first(r"(\d{4}\s*\u5e74\s*\d{1,2}\s*\u6708\s*\d{1,2}\s*\u65e5\s*\d{1,2}:\d{2})", compact_text))
     time_part = regex_first(r"\d{4}\s*\u5e74\s*\d{1,2}\s*\u6708\s*\d{1,2}\s*\u65e5\s*(\d{1,2}:\d{2})", compact_text)
-    seat = regex_first(r"(\u4e00\u7b49\u5ea7|\u4e8c\u7b49\u5ea7|\u5546\u52a1\u5ea7|\u786c\u5ea7|\u786c\u5367|\u8f6f\u5367)", compact_text)
-    route = ""
+    origin = ""
+    destination = ""
     if train:
         route_match = re.search(r"([\u4e00-\u9fffA-Za-z]{2,30})\s+" + re.escape(train) + r"\s+([\u4e00-\u9fffA-Za-z]{2,30})", compact_text)
         if route_match:
-            route = f"{clean(route_match.group(1))} -> {clean(route_match.group(2))}"
+            origin = clean(route_match.group(1))
+            destination = clean(route_match.group(2))
     refund = "\u9000\u7968" in compact_text or "refund" in compact_text.lower()
-    parts = [part for part in [train, route, f"{travel_dt} {time_part}".strip(), seat, "\u9000\u7968\u8d39" if refund else ""] if part]
+    return {
+        "train_no": train,
+        "travel_date": travel_date,
+        "departure_time": time_part,
+        "departure_datetime": f"{travel_date} {time_part}".strip() if travel_date else "",
+        "origin_station": origin,
+        "destination_station": destination,
+        "route": f"{origin}-{destination}" if origin and destination else "",
+        "is_refund_fee": refund,
+    }
+
+
+def railway_note(text: str) -> str:
+    leg = parse_railway_leg(text)
+    seat = regex_first(r"(\u4e00\u7b49\u5ea7|\u4e8c\u7b49\u5ea7|\u5546\u52a1\u5ea7|\u786c\u5ea7|\u786c\u5367|\u8f6f\u5367)", clean(text))
+    route = leg["route"].replace("-", " -> ", 1) if leg["route"] else ""
+    parts = [
+        part
+        for part in [
+            leg["train_no"],
+            route,
+            leg["departure_datetime"],
+            seat,
+            "\u9000\u7968\u8d39" if leg["is_refund_fee"] else "",
+        ]
+        if part
+    ]
     return clean(", ".join(parts))
 
 
 def railway_travel_date(text: str) -> str:
-    value = regex_first(r"(\d{4}\s*\u5e74\s*\d{1,2}\s*\u6708\s*\d{1,2}\s*\u65e5)\s*\d{1,2}:\d{2}", text)
-    return date_from_chinese(value)
+    return clean(parse_railway_leg(text).get("travel_date"))
 
 
 def parse_invoice(text: str, tables: list[list[list[str]]], subtype: str) -> dict[str, str]:
@@ -749,7 +775,8 @@ def extract_document(document_id: str, path: Path) -> dict[str, Any]:
         expense_date = ""
         expense_date_source = ""
         if subtype == "railway_e_ticket":
-            expense_date = railway_travel_date(text)
+            railway_leg = parse_railway_leg(text)
+            expense_date = clean(railway_leg.get("travel_date"))
             expense_date_source = "railway_travel_date" if expense_date else ""
         doc["classification"] = {
             "expense_category": category,
@@ -758,6 +785,8 @@ def extract_document(document_id: str, path: Path) -> dict[str, Any]:
             "expense_note": invoice_note,
             "reason": reason,
         }
+        if subtype == "railway_e_ticket":
+            doc["classification"]["railway_leg"] = railway_leg
         required = ["invoice_no", "issue_date", "total_amount"]
         if subtype != "railway_e_ticket":
             required.append("seller_name")
@@ -1131,6 +1160,14 @@ def write_markdown(output_dir: Path, payload: dict[str, Any]) -> Path:
         lines.append(f"- Amount: {invoice.get('total_amount', '')}")
         lines.append(f"- Category: {classification.get('expense_category', '')}")
         lines.append(f"- Expense note: {classification.get('expense_note', '')}")
+        railway_leg = classification.get("railway_leg") or {}
+        if railway_leg:
+            lines.append(
+                "- Railway leg: "
+                f"{railway_leg.get('train_no', '') or '-'} | "
+                f"{railway_leg.get('origin_station', '') or '-'} -> {railway_leg.get('destination_station', '') or '-'} | "
+                f"{railway_leg.get('departure_datetime', '') or railway_leg.get('travel_date', '') or '-'}"
+            )
         lines.append(f"- Raw remarks: {invoice.get('raw_remarks', '')}")
         lines.append(f"- Confidence: {doc.get('confidence', '')}")
         lines.append(f"- Issues: {len(doc.get('issues', []))}")

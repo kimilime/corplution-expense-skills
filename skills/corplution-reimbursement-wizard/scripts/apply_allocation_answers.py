@@ -819,6 +819,89 @@ def close_answered_questions(payload: dict[str, Any], touched_units: set[str]) -
             question["status"] = "answered"
 
 
+def current_rail_chain_route(chain_units: list[dict[str, Any]]) -> str:
+    ordered = sorted(chain_units, key=lambda unit: int(unit.get("journey_chain_position") or 0))
+    routes = [
+        route_from_text(unit.get("route"))
+        or route_from_text(unit.get("source_note"))
+        or route_from_text(unit.get("expense_note"))
+        or route_from_text(unit.get("final_note"))
+        for unit in ordered
+    ]
+    if not routes or any(not route or "-" not in route for route in routes):
+        return ""
+    first_origin = routes[0].split("-", 1)[0]
+    destinations = [route.split("-", 1)[1] for route in routes]
+    return " -> ".join([first_origin, *destinations])
+
+
+def refresh_rail_chain_assignments(payload: dict[str, Any], touched_units: set[str]) -> None:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for unit in payload.get("allocation_units", []):
+        chain_id = clean(unit.get("journey_chain_id"))
+        if chain_id:
+            groups.setdefault(chain_id, []).append(unit)
+
+    for chain_id, chain_units in groups.items():
+        chain_unit_ids = {clean(unit.get("unit_id")) for unit in chain_units}
+        if not chain_unit_ids.intersection(touched_units):
+            continue
+        refreshed_route = current_rail_chain_route(chain_units)
+        if refreshed_route:
+            for unit in chain_units:
+                unit["journey_chain_route"] = refreshed_route
+        active_units = [
+            unit for unit in chain_units
+            if clean(unit.get("status")) not in {"dropped", "excluded", "non_reimbursable"}
+        ]
+        if len(active_units) < 2:
+            for unit in chain_units:
+                unit.update({
+                    "journey_chain_id": "",
+                    "journey_chain_route": "",
+                    "journey_chain_position": "",
+                    "journey_chain_length": "",
+                    "journey_chain_unit_ids": [],
+                    "journey_chain_confidence": "",
+                    "journey_chain_assignment_rule": "",
+                    "journey_chain_match_reason": "",
+                    "journey_chain_project_context_id": "",
+                    "journey_chain_needs_confirmation": False,
+                })
+            continue
+        assignments = {
+            (
+                clean(unit.get("project_context_id")),
+                clean(unit.get("client_name")),
+                clean(unit.get("client_charge_code")),
+            )
+            for unit in active_units
+        }
+        complete = (
+            len(assignments) == 1
+            and all(clean(unit.get("client_name")) and clean(unit.get("client_charge_code")) for unit in active_units)
+        )
+        if complete:
+            project_context_id, client_name, client_charge_code = next(iter(assignments))
+            for unit in chain_units:
+                unit["journey_chain_project_context_id"] = project_context_id
+                unit["journey_chain_needs_confirmation"] = False
+                unit["journey_chain_assignment_rule"] = "rail_transfer_chain_user_confirmed"
+                if unit in active_units:
+                    unit["status"] = "confirmed"
+                    unit["confidence"] = "high"
+                unit["journey_chain_match_reason"] = (
+                    f"User-confirmed whole-chain assignment to {client_name}/{client_charge_code}."
+                )
+        else:
+            for unit in chain_units:
+                unit["journey_chain_needs_confirmation"] = True
+                unit["journey_chain_match_reason"] = (
+                    f"{chain_id} was only partially updated or now has inconsistent project assignments; "
+                    "update every leg in the chain together."
+                )
+
+
 def sync_admin_client_advisories(payload: dict[str, Any]) -> None:
     questions = payload.setdefault("questions", [])
     existing = {
@@ -988,6 +1071,7 @@ def apply_answers(
                 raise ValueError(signal_error)
             touched_units.add(unit["unit_id"])
 
+    refresh_rail_chain_assignments(payload, touched_units)
     for unit in payload.get("allocation_units", []):
         normalize_admin_client(unit)
 

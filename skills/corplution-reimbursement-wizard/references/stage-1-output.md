@@ -100,6 +100,19 @@ Classification fields:
 - `expense_note`
 - `reason`
 
+For `railway_e_ticket`, also write `classification.railway_leg`:
+
+- `train_no`
+- `travel_date`
+- `departure_time`
+- `departure_datetime`
+- `origin_station`
+- `destination_station`
+- `route`
+- `is_refund_fee`
+
+These structured fields support Stage 2 transfer-chain detection. Keep the readable railway `expense_note` as evidence and allow old extractions without `railway_leg` to fall back to parsing that note.
+
 Keep `invoice.issue_date` as the formal invoice date. Do not copy it into `classification.expense_date` for ordinary invoices, meal invoices, taxi summary invoices, hotel invoices without stay dates, or `other`/`unknown` invoices. Stage 2 will ask the applicant for the actual date when it is not reliable.
 
 Didi/Gaode trip reports additionally need:

@@ -174,7 +174,7 @@ Didi/Gaode tax invoices are summary invoices. Link them to trip reports by total
 
 Stage 1 can build provisional `expense_note` from useful operational evidence:
 
-- Railway: train number, route, travel date/time, seat/cabin.
+- Railway: extract structured `train_no`, `origin_station`, `destination_station`, `travel_date`, `departure_time`, `departure_datetime`, `route`, and refund status under `classification.railway_leg`; also retain the readable evidence note.
 - Didi/Gaode: city, origin, destination.
 - Hotel: seller or hotel name, city if inferable, quantity or nights.
 - Meal: seller/restaurant and meal service.
@@ -197,7 +197,10 @@ Read `references/stage-2-allocation.md` before allocating expenses. Keep these c
 - Match taxi and Didi/Gaode ride items by the project journey they support: city/date for ordinary rides, airport/station transfer to the upcoming destination project, and project-to-project station/airport transfers to the project being traveled to.
 - Treat Shanghai/local projects conservatively. A local project such as KEEWAY must not receive Shanghai taxi/travel items merely because city and date match. Auto-assign a Shanghai local project only when the ride endpoint, route note, user note, or explicit project keyword names that local client/project; otherwise station/airport transfers inherit the adjacent out-of-town travel project or remain a blocking question.
 - For taxi/Didi/Gaode amount columns, use form over substance by ride city: Shanghai rides stay in `taxi` even when allocated to an out-of-town project; non-Shanghai rides go to `travel`.
-- Match railway and flight travel by route destination and travel date with a reasonable +/- 1 day project buffer.
+- Before matching individual railway tickets, group same-day or tightly connected ticket segments into a railway journey chain when dates/times are ordered and one segment's destination station/city matches the next segment's origin station/city. Treat intermediate stops as transfer nodes, not independent project destinations.
+- Allocate the whole railway chain together: local/home -> project uses the terminal/upcoming project; project A -> project B uses project B; project -> local/home uses the project just completed. Keep every ticket as a separate expense row, proof number, amount, and segment-specific Note while sharing one project assignment and `journey_chain_id`.
+- Show automatically inferred railway chains as one non-blocking review line in chat. Ask one whole-chain question only when the chain does not point to a unique project, the station/time sequence is ambiguous, or the user says an intermediate city was an actual stop/project rather than a transfer.
+- Match standalone railway tickets and flight travel by route destination and travel date with a reasonable +/- 1 day project buffer.
 - When travel connects two project cities, assign it to the destination/project being traveled to, not the origin project. Never override this merely because the origin station city matches a previous project.
 - Do not pre-match `other` or `unknown` by invoice city. Ask the user; invoice issuer city can be misleading for SaaS, online meetings, associations, and other services.
 - Allocate mobile expenses to `CORP-2026-ADMIN` with `client_name = 通讯费`, not `Admin`; fill Date as that month's last day.
@@ -236,6 +239,7 @@ Read `references/stage-3-excel-output.md` before writing the reimbursement workb
 - If any stage script exits with code `4`, a process JSON failed its integrity check (modified outside the sanctioned flow); follow the printed recovery steps and do not patch further.
 - If `write_reimbursement_template.py` exits with code `3`, the workbook and final row files were written, but the `STAGE 3 REVIEW SUMMARY TO SHOW IN CHAT` block contains blocking meal/hotel policy checks that must be shown to the applicant and resolved before final submission.
 - Assign overall proof numbers by substantive proof order: flight/rail, hotel, taxi/Didi, Gaode, meal, mobile, other.
+- Stage 3 must keep every active railway journey chain on one project and reject a stale/broken chain whose adjacent stations no longer connect. Per-ticket destination validation must not override the chain assignment at an intermediate transfer station.
 - Split Didi/Gaode trip reports into one row per ride, but reuse the same overall proof number for all rides supported by the same invoice.
 - Write rows as project blocks; each block gets a subtotal row, then workbook-level column totals, Total, Grand Total, and Status formulas.
 

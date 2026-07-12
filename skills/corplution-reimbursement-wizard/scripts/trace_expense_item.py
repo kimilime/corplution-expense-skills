@@ -131,6 +131,11 @@ def trace_payload(allocation: dict[str, Any], extraction: dict[str, Any], item: 
             "origin": unit.get("origin", ""),
             "destination": unit.get("destination", ""),
             "source_note": unit.get("source_note", ""),
+            "journey_chain_id": unit.get("journey_chain_id", ""),
+            "journey_chain_route": unit.get("journey_chain_route", ""),
+            "journey_chain_position": unit.get("journey_chain_position", ""),
+            "journey_chain_length": unit.get("journey_chain_length", ""),
+            "journey_chain_unit_ids": unit.get("journey_chain_unit_ids", []),
             "client_name": unit.get("client_name", ""),
             "client_charge_code": unit.get("client_charge_code", ""),
             "status": unit.get("status", ""),
@@ -151,6 +156,11 @@ def print_text(payload: dict[str, Any]) -> None:
         print(f"行程信息: {unit.get('origin') or '-'} -> {unit.get('destination') or '-'}, 城市 {unit.get('city') or '-'}")
     if unit.get("source_note"):
         print(f"识别备注: {unit.get('source_note')}")
+    if unit.get("journey_chain_id"):
+        print(
+            f"换乘链: {unit.get('journey_chain_id')}，第{unit.get('journey_chain_position')}/"
+            f"{unit.get('journey_chain_length')}段，整条路线 {unit.get('journey_chain_route') or '-'}"
+        )
     print("")
     print("来源文件:")
     for doc in payload["source_documents"]:

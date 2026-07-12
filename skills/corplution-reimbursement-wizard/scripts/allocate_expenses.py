@@ -21,6 +21,9 @@ import integrity
 
 _POLICY = load_policy()
 
+RAIL_CHAIN_MAX_DEPARTURE_GAP_HOURS = 18
+RAIL_CHAIN_HIGH_CONFIDENCE_HOURS = 12
+
 
 C = {
     "local": "\u672c\u5730",
@@ -707,6 +710,9 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
             city = infer_city_from_text(text_for_city)
             col = final_column(source_category, city)
             source_note = classification.get("expense_note", "")
+            railway_leg = classification.get("railway_leg") or {}
+            if not isinstance(railway_leg, dict):
+                railway_leg = {}
             billing_period = ""
             match = re.search(r"(\d{6})", invoice.get("raw_remarks", "") + " " + source_note)
             if source_category == "mobile" and match:
@@ -749,7 +755,22 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
                 "document_subtype": subtype,
                 "final_template_column": col,
                 "city": city,
-                "route": route_from_note(source_note),
+                "route": clean(railway_leg.get("route")) or route_from_note(source_note),
+                "train_no": clean(railway_leg.get("train_no")),
+                "origin_station": clean(railway_leg.get("origin_station")),
+                "destination_station": clean(railway_leg.get("destination_station")),
+                "rail_departure_time": clean(railway_leg.get("departure_time")),
+                "rail_departure_datetime": clean(railway_leg.get("departure_datetime")),
+                "journey_chain_id": "",
+                "journey_chain_route": "",
+                "journey_chain_position": "",
+                "journey_chain_length": "",
+                "journey_chain_unit_ids": [],
+                "journey_chain_confidence": "",
+                "journey_chain_assignment_rule": "",
+                "journey_chain_match_reason": "",
+                "journey_chain_project_context_id": "",
+                "journey_chain_needs_confirmation": False,
                 "origin": "",
                 "destination": "",
                 "origin_place_type": "",
@@ -1075,6 +1096,287 @@ def normalize_taxi_column_for_context(unit: dict[str, Any], ctx: dict[str, Any],
     if clean(unit.get("source_category")) not in {"taxi", "travel"} or not is_ride_unit(unit):
         return
     normalize_taxi_column(unit)
+
+
+def is_rail_unit(unit: dict[str, Any]) -> bool:
+    return clean(unit.get("document_subtype")) == "railway_e_ticket" or bool(clean(unit.get("train_no")))
+
+
+def rail_station_key(value: Any) -> str:
+    text = clean(value).lower().replace(" ", "")
+    for suffix in ["火车站", "高铁站", "铁路站", "站"]:
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+            break
+    return text
+
+
+def rail_station_city_key(value: Any) -> str:
+    text = rail_station_key(value)
+    if len(text) >= 3 and text[-1:] in {"东", "西", "南", "北"}:
+        text = text[:-1]
+    return text.replace("市", "")
+
+
+def rail_stations_connect(destination: Any, origin: Any) -> bool:
+    destination_station = rail_station_key(destination)
+    origin_station = rail_station_key(origin)
+    if not destination_station or not origin_station:
+        return False
+    return (
+        destination_station == origin_station
+        or rail_station_city_key(destination_station) == rail_station_city_key(origin_station)
+    )
+
+
+def rail_leg_endpoints(unit: dict[str, Any]) -> tuple[str, str]:
+    origin = clean(unit.get("origin_station"))
+    destination = clean(unit.get("destination_station"))
+    if origin and destination:
+        return origin, destination
+    return route_endpoints(unit)
+
+
+def rail_leg_departure_datetime(unit: dict[str, Any]) -> datetime | None:
+    values = [
+        clean(unit.get("rail_departure_datetime")),
+        clean(unit.get("source_note")),
+        clean(unit.get("expense_note")),
+    ]
+    date_value = clean(unit.get("expense_date"))
+    time_value = clean(unit.get("rail_departure_time"))
+    if date_value and time_value:
+        values.insert(0, f"{date_value} {time_value}")
+    for value in values:
+        match = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\s+(\d{1,2}):(\d{2})", value)
+        if not match:
+            continue
+        try:
+            return datetime(*(int(part) for part in match.groups()))
+        except ValueError:
+            continue
+    return None
+
+
+def rail_temporal_link(first: dict[str, Any], second: dict[str, Any]) -> tuple[bool, str]:
+    first_date = parse_date(clean(first.get("expense_date")))
+    second_date = parse_date(clean(second.get("expense_date")))
+    if not first_date or not second_date:
+        return False, ""
+    date_gap = (second_date - first_date).days
+    if date_gap < 0 or date_gap > 1:
+        return False, ""
+
+    first_dt = rail_leg_departure_datetime(first)
+    second_dt = rail_leg_departure_datetime(second)
+    if first_dt and second_dt:
+        gap_hours = (second_dt - first_dt).total_seconds() / 3600
+        if gap_hours <= 0 or gap_hours > RAIL_CHAIN_MAX_DEPARTURE_GAP_HOURS:
+            return False, ""
+        confidence = "high" if gap_hours <= RAIL_CHAIN_HIGH_CONFIDENCE_HOURS else "medium"
+        return True, confidence
+
+    if date_gap == 0:
+        return True, "medium"
+    return False, ""
+
+
+def rail_leg_sort_key(unit: dict[str, Any]) -> tuple[str, str, int]:
+    departure = rail_leg_departure_datetime(unit)
+    departure_key = departure.isoformat() if departure else clean(unit.get("expense_date"))
+    try:
+        user_no = int(unit.get("user_no") or 0)
+    except (TypeError, ValueError):
+        user_no = 0
+    return clean(unit.get("expense_date")), departure_key, user_no
+
+
+def build_rail_journey_chains(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    legs = [
+        unit for unit in units
+        if is_rail_unit(unit)
+        and not is_refund_fee(unit)
+        and all(rail_leg_endpoints(unit))
+        and parse_date(clean(unit.get("expense_date")))
+    ]
+    legs.sort(key=rail_leg_sort_key)
+    by_id = {clean(unit.get("unit_id")): unit for unit in legs}
+    outgoing: dict[str, list[tuple[str, str]]] = {unit_id: [] for unit_id in by_id}
+    incoming: dict[str, list[tuple[str, str]]] = {unit_id: [] for unit_id in by_id}
+
+    for first in legs:
+        first_id = clean(first.get("unit_id"))
+        _, first_destination = rail_leg_endpoints(first)
+        for second in legs:
+            second_id = clean(second.get("unit_id"))
+            if first_id == second_id:
+                continue
+            second_origin, _ = rail_leg_endpoints(second)
+            if not rail_stations_connect(first_destination, second_origin):
+                continue
+            linked, confidence = rail_temporal_link(first, second)
+            if not linked:
+                continue
+            outgoing[first_id].append((second_id, confidence))
+            incoming[second_id].append((first_id, confidence))
+
+    unique_next: dict[str, tuple[str, str]] = {}
+    for unit_id, candidates in outgoing.items():
+        if len(candidates) != 1:
+            continue
+        next_id, confidence = candidates[0]
+        if len(incoming.get(next_id, [])) == 1:
+            unique_next[unit_id] = (next_id, confidence)
+
+    linked_targets = {next_id for next_id, _ in unique_next.values()}
+    starts = [
+        unit_id for unit_id in by_id
+        if unit_id in unique_next
+        and unit_id not in linked_targets
+        and not incoming.get(unit_id)
+    ]
+    starts.sort(key=lambda unit_id: rail_leg_sort_key(by_id[unit_id]))
+    chains: list[dict[str, Any]] = []
+    consumed: set[str] = set()
+    for start_id in starts:
+        if start_id in consumed:
+            continue
+        chain_ids = [start_id]
+        link_confidences: list[str] = []
+        cursor = start_id
+        seen = {start_id}
+        while cursor in unique_next:
+            next_id, confidence = unique_next[cursor]
+            if next_id in seen:
+                break
+            chain_ids.append(next_id)
+            link_confidences.append(confidence)
+            seen.add(next_id)
+            cursor = next_id
+        if len(chain_ids) < 2:
+            continue
+        if outgoing.get(cursor):
+            # The apparent final leg has multiple plausible continuations, so
+            # this is only a partial path rather than a safely closed journey.
+            continue
+        consumed.update(chain_ids)
+        chains.append({
+            "units": [by_id[unit_id] for unit_id in chain_ids],
+            "confidence": "high" if link_confidences and all(value == "high" for value in link_confidences) else "medium",
+        })
+    return chains
+
+
+def rail_chain_route(chain_units: list[dict[str, Any]]) -> str:
+    if not chain_units:
+        return ""
+    first_origin, _ = rail_leg_endpoints(chain_units[0])
+    stations = [first_origin]
+    for unit in chain_units:
+        _, destination = rail_leg_endpoints(unit)
+        stations.append(destination)
+    return " -> ".join(station for station in stations if station)
+
+
+def rail_context_date_matches(chain_units: list[dict[str, Any]], ctx: dict[str, Any]) -> bool:
+    start = context_start(ctx)
+    end = context_end(ctx)
+    if not start or not end:
+        return False
+    buffer = max(int(ctx.get("travel_buffer_days") or 0), 1)
+    return any(
+        start - timedelta(days=buffer) <= unit_date <= end + timedelta(days=buffer)
+        for unit_date in (parse_date(clean(unit.get("expense_date"))) for unit in chain_units)
+        if unit_date
+    )
+
+
+def unique_rail_station_context(
+    station: str,
+    chain_units: list[dict[str, Any]],
+    contexts: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    candidates = [
+        ctx for ctx in non_admin_contexts(contexts)
+        if not is_local_context(ctx)
+        and rail_context_date_matches(chain_units, ctx)
+        and context_city_in_text(ctx, station)
+    ]
+    context_ids = {clean(ctx.get("context_id")) for ctx in candidates}
+    return candidates[0] if len(context_ids) == 1 else None
+
+
+def rail_chain_context(
+    chain_units: list[dict[str, Any]],
+    contexts: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str, str]:
+    contexts_by_id = {clean(ctx.get("context_id")): ctx for ctx in contexts}
+    hinted_ids = {
+        clean(unit.get("project_context_id"))
+        for unit in chain_units
+        if unit.get("auto_project_match") == "user_context_expense_hint"
+        and clean(unit.get("project_context_id"))
+    }
+    if len(hinted_ids) > 1:
+        return None, "rail_transfer_chain_conflicting_user_hints", "Different user hints assign connected rail legs to different projects."
+    if len(hinted_ids) == 1:
+        context_id = next(iter(hinted_ids))
+        ctx = contexts_by_id.get(context_id)
+        if ctx:
+            return ctx, "rail_transfer_chain_user_hint", f"A user-provided expense hint assigns this connected rail journey to {context_id}."
+
+    origin, _ = rail_leg_endpoints(chain_units[0])
+    _, destination = rail_leg_endpoints(chain_units[-1])
+    destination_ctx = unique_rail_station_context(destination, chain_units, contexts)
+    if destination_ctx:
+        return (
+            destination_ctx,
+            "rail_transfer_chain_destination",
+            f"The connected rail journey terminates in project context {destination_ctx.get('context_id', '')}; intermediate stations are transfers.",
+        )
+
+    if is_shanghai_city(destination):
+        origin_ctx = unique_rail_station_context(origin, chain_units, contexts)
+        if origin_ctx:
+            return (
+                origin_ctx,
+                "rail_transfer_chain_return",
+                f"The connected rail journey returns to Shanghai from project context {origin_ctx.get('context_id', '')}.",
+            )
+
+    return None, "rail_transfer_chain_unresolved", "Connected rail legs were detected, but the whole journey does not point to one unique project."
+
+
+def apply_rail_journey_chain_matches(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -> None:
+    for index, chain in enumerate(build_rail_journey_chains(units), start=1):
+        chain_units = chain["units"]
+        chain_id = f"RAIL-CHAIN-{index:03d}"
+        route = rail_chain_route(chain_units)
+        unit_ids = [clean(unit.get("unit_id")) for unit in chain_units]
+        ctx, rule, reason = rail_chain_context(chain_units, contexts)
+        unresolved = ctx is None
+        for position, unit in enumerate(chain_units, start=1):
+            unit.update({
+                "journey_chain_id": chain_id,
+                "journey_chain_route": route,
+                "journey_chain_position": position,
+                "journey_chain_length": len(chain_units),
+                "journey_chain_unit_ids": unit_ids,
+                "journey_chain_confidence": chain["confidence"],
+                "journey_chain_assignment_rule": rule,
+                "journey_chain_match_reason": reason,
+                "journey_chain_project_context_id": clean(ctx.get("context_id")) if ctx else "",
+                "journey_chain_needs_confirmation": unresolved,
+            })
+            if ctx:
+                apply_context_match(
+                    unit,
+                    ctx,
+                    confidence="high",
+                    status="confirmed",
+                    auto_project_match=rule,
+                    reason=f"Rail journey chain {chain_id}: {reason}",
+                )
 
 
 def match_hotel(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
@@ -1629,6 +1931,7 @@ def apply_expense_hints(units: list[dict[str, Any]], contexts: list[dict[str, An
 def apply_matches(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     contexts_by_id = {clean(ctx.get("context_id")): ctx for ctx in contexts if clean(ctx.get("context_id"))}
     apply_expense_hints(units, contexts)
+    apply_rail_journey_chain_matches(units, contexts)
     for unit in units:
         if unit.get("source_category") == "mobile":
             unit.update({
@@ -1642,6 +1945,11 @@ def apply_matches(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -
             normalize_admin_client(unit)
             continue
         if unit.get("auto_project_match") == "user_context_expense_hint" and unit.get("client_charge_code"):
+            normalize_admin_client(unit)
+            continue
+        if unit.get("journey_chain_id"):
+            # Connected rail legs are allocated as one journey. Do not let the
+            # ordinary per-ticket destination matcher split them at a transfer.
             normalize_admin_client(unit)
             continue
         if unit.get("source_category") in {"other", "unknown"}:
@@ -2067,6 +2375,83 @@ def add_provisional_other_date_review(questions: list[dict[str, Any]], units: li
     })
 
 
+def rail_chain_groups(units: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for unit in units:
+        chain_id = clean(unit.get("journey_chain_id"))
+        if chain_id:
+            groups.setdefault(chain_id, []).append(unit)
+    for chain_units in groups.values():
+        chain_units.sort(key=lambda unit: int(unit.get("journey_chain_position") or 0))
+    return groups
+
+
+def rail_chain_summary_line(chain_id: str, chain_units: list[dict[str, Any]]) -> str:
+    numbers = "/".join(str(unit_user_no(unit)) for unit in chain_units)
+    files = " / ".join(clean(unit.get("source_filename")) or "-" for unit in chain_units)
+    first = chain_units[0]
+    client = clean(first.get("client_name")) or "待确认"
+    code = clean(first.get("client_charge_code")) or "待确认"
+    confidence = clean(first.get("journey_chain_confidence")) or "-"
+    return (
+        f"{chain_id} | 第{numbers}项 | 文件 {files} | 日期 {display_date(first) or '-'} | "
+        f"连续路线 {clean(first.get('journey_chain_route')) or '-'} | 整体归属 {client}/{code} | 链置信度 {confidence}"
+    )
+
+
+def add_unresolved_rail_chain_questions(
+    questions: list[dict[str, Any]],
+    units: list[dict[str, Any]],
+) -> set[str]:
+    unresolved_ids: set[str] = set()
+    for chain_id, chain_units in rail_chain_groups(units).items():
+        if not any(unit.get("journey_chain_needs_confirmation") for unit in chain_units):
+            continue
+        unresolved_ids.add(chain_id)
+        questions.append({
+            "question_id": f"Q-RAIL-CHAIN-{len(questions) + 1:03d}",
+            "question_type": "rail_journey_chain_assignment",
+            "unit_ids": [clean(unit.get("unit_id")) for unit in chain_units],
+            "user_nos": [unit_user_no(unit) for unit in chain_units],
+            "question": (
+                "以下高铁票已识别为一条连续换乘行程，但整条行程仍有多个可能项目。"
+                "请按整条路线确认归属；如果中间站不是换乘而是实际停留/项目活动，也请说明从哪一段开始拆开。\n"
+                + rail_chain_summary_line(chain_id, chain_units)
+            ),
+            "why_it_matters": (
+                "连续换乘票段必须整体判断；中间站默认只是交通节点，不能机械地按每张票的目的地拆成不同项目。"
+            ),
+            "status": "open",
+            "blocking": True,
+        })
+    return unresolved_ids
+
+
+def add_auto_matched_rail_chain_review(questions: list[dict[str, Any]], units: list[dict[str, Any]]) -> None:
+    resolved = [
+        (chain_id, chain_units)
+        for chain_id, chain_units in rail_chain_groups(units).items()
+        if not any(unit.get("journey_chain_needs_confirmation") for unit in chain_units)
+        and all(clean(unit.get("client_charge_code")) for unit in chain_units)
+    ]
+    if not resolved:
+        return
+    questions.append({
+        "question_id": f"Q-ADV-RAIL-CHAIN-{len(questions) + 1:03d}",
+        "question_type": "auto_matched_rail_journey_chain_review",
+        "unit_ids": [clean(unit.get("unit_id")) for _, chain_units in resolved for unit in chain_units],
+        "user_nos": [unit_user_no(unit) for _, chain_units in resolved for unit in chain_units],
+        "question": (
+            "以下多张高铁票已按日期、时间顺序和车站衔接识别为连续换乘行程，并按整条行程统一归属。"
+            "中间站按换乘节点处理，不需要逐段确认；如果实际在中间城市停留办事或项目归属不对，请按编号更正。\n"
+            + "\n".join(rail_chain_summary_line(chain_id, chain_units) for chain_id, chain_units in resolved)
+        ),
+        "why_it_matters": "每张票仍保留独立金额、编号和高铁 Note，但同一换乘行程的全部票段共享项目归属。",
+        "status": "advisory",
+        "blocking": False,
+    })
+
+
 def date_prompt_for_unit(unit: dict[str, Any]) -> tuple[str, str] | None:
     if not unit.get("date_required") or unit.get("expense_date") or is_mobile_admin_unit(unit):
         return None
@@ -2097,6 +2482,7 @@ def date_prompt_for_unit(unit: dict[str, Any]) -> tuple[str, str] | None:
 
 def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]]) -> list[dict[str, Any]]:
     questions = [normalize_existing_question(q) for q in existing]
+    unresolved_rail_chains = add_unresolved_rail_chain_questions(questions, units)
     for unit in units:
         source_category = unit.get("source_category")
         has_project = bool(unit.get("client_charge_code"))
@@ -2122,12 +2508,13 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
             prompts.append(date_prompt)
 
         if not has_project and source_category != "mobile":
-            prompts.append(
-                (
-                    "这张/这笔费用暂未匹配到项目。请直接回复应归属的客户、项目编号、城市和日期范围；如果不用报销，也请说明 drop。",
-                    "Excel 必须填写 Client 和 Client Charge Code；无法确认时不能直接进最终表。",
+            if clean(unit.get("journey_chain_id")) not in unresolved_rail_chains:
+                prompts.append(
+                    (
+                        "这张/这笔费用暂未匹配到项目。请直接回复应归属的客户、项目编号、城市和日期范围；如果不用报销，也请说明 drop。",
+                        "Excel 必须填写 Client 和 Client Charge Code；无法确认时不能直接进最终表。",
+                    )
                 )
-            )
         elif unit.get("status") == "needs_confirmation" or unit.get("confidence") == "medium":
             admin_matter_only = (
                 source_category == "other"
@@ -2222,6 +2609,7 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
             )
     questions = group_open_questions(questions, units)
     add_auto_matched_meal_review(questions, units)
+    add_auto_matched_rail_chain_review(questions, units)
     add_provisional_other_date_review(questions, units)
     return questions
 
@@ -2248,10 +2636,17 @@ def unit_review_line(unit: dict[str, Any]) -> str:
             status = "待确认"
     if category == "other" and not (is_admin_code(code) and unit.get("status") == "confirmed"):
         status = "待确认"
-    return (
+    line = (
         f"{unit_label(unit)} | 文件 {source} | 开具方/服务方 {seller} | 日期 {date_value} | "
         f"金额 {amount} | 分类 {category}->{column} | 归属 {client}/{code} | 状态 {status}"
     )
+    if clean(unit.get("journey_chain_id")):
+        line += (
+            f" | 换乘链 {clean(unit.get('journey_chain_id'))} "
+            f"({unit.get('journey_chain_position')}/{unit.get('journey_chain_length')}: "
+            f"{clean(unit.get('journey_chain_route'))})"
+        )
+    return line
 
 
 def print_applicant_review_list(payload: dict[str, Any]) -> None:
@@ -2361,6 +2756,23 @@ def build_markdown(payload: dict[str, Any]) -> str:
             f"{unit.get('client_name','')} | {unit.get('client_charge_code','')} | {unit.get('final_template_column','')} | "
             f"{unit.get('confidence','')} | {unit.get('status','')} |"
         )
+    chains = rail_chain_groups(payload["allocation_units"])
+    if chains:
+        lines += [
+            "",
+            "## Railway Journey Chains",
+            "",
+            "| Chain | Items | Route | Project | Code | Confidence | Needs Confirmation |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for chain_id, chain_units in chains.items():
+            first = chain_units[0]
+            lines.append(
+                f"| {chain_id} | {', '.join(str(unit_user_no(unit)) for unit in chain_units)} | "
+                f"{clean(first.get('journey_chain_route'))} | {clean(first.get('client_name'))} | "
+                f"{clean(first.get('client_charge_code'))} | {clean(first.get('journey_chain_confidence'))} | "
+                f"{'Yes' if first.get('journey_chain_needs_confirmation') else 'No'} |"
+            )
     lines += [
         "",
         "## Applicant Review List",

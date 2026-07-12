@@ -93,6 +93,8 @@ ALLOCATION_TEXT_FIELDS = {
     "expenses_nature",
     "final_note",
     "hotel_city",
+    "journey_chain_match_reason",
+    "journey_chain_route",
     "origin",
     "origin_place_type",
     "room_share_note",
@@ -657,6 +659,144 @@ def route_endpoints(unit: dict[str, Any]) -> tuple[str, str]:
     return "", ""
 
 
+def rail_station_key(value: Any) -> str:
+    text = clean(value).lower().replace(" ", "")
+    for suffix in ["火车站", "高铁站", "铁路站", "站"]:
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+            break
+    return text
+
+
+def rail_station_city_key(value: Any) -> str:
+    text = rail_station_key(value)
+    if len(text) >= 3 and text[-1:] in {"东", "西", "南", "北"}:
+        text = text[:-1]
+    return text.replace("市", "")
+
+
+def rail_stations_connect(destination: Any, origin: Any) -> bool:
+    destination_station = rail_station_key(destination)
+    origin_station = rail_station_key(origin)
+    if not destination_station or not origin_station:
+        return False
+    return (
+        destination_station == origin_station
+        or rail_station_city_key(destination_station) == rail_station_city_key(origin_station)
+    )
+
+
+def rail_chain_groups(units: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for unit in units:
+        chain_id = clean(unit.get("journey_chain_id"))
+        if chain_id and clean(unit.get("status")) not in {"dropped", "excluded", "non_reimbursable"}:
+            groups[chain_id].append(unit)
+    for chain_units in groups.values():
+        chain_units.sort(key=lambda unit: integer_or_zero(unit.get("journey_chain_position")))
+    return dict(groups)
+
+
+def rail_chain_route(chain_units: list[dict[str, Any]]) -> str:
+    if not chain_units:
+        return ""
+    first_origin, _ = route_endpoints(chain_units[0])
+    destinations = [route_endpoints(unit)[1] for unit in chain_units]
+    if not first_origin or any(not destination for destination in destinations):
+        return ""
+    return " -> ".join([first_origin, *destinations])
+
+
+def integer_or_zero(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def rail_chain_ready_errors(units: list[dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    for chain_id, chain_units in rail_chain_groups(units).items():
+        if len(chain_units) < 2:
+            errors.append(f"{chain_id} has fewer than two active rail legs; rerun Stage 2 to rebuild journey chains")
+            continue
+        if any(unit.get("journey_chain_needs_confirmation") for unit in chain_units):
+            errors.append(f"{chain_id} still needs one whole-journey project decision")
+
+        assignments = {
+            (
+                clean(unit.get("project_context_id")),
+                clean(unit.get("client_name")),
+                clean(unit.get("client_charge_code")),
+            )
+            for unit in chain_units
+        }
+        if len(assignments) != 1:
+            numbers = ", ".join(str(unit.get("user_no") or unit.get("unit_id")) for unit in chain_units)
+            errors.append(
+                f"{chain_id} items {numbers} are one connected rail journey but have different project assignments; "
+                "update all legs together or rerun Stage 2 if the chain itself is wrong"
+            )
+
+        expected_positions = list(range(1, len(chain_units) + 1))
+        actual_positions = [integer_or_zero(unit.get("journey_chain_position")) for unit in chain_units]
+        if actual_positions != expected_positions:
+            errors.append(f"{chain_id} has stale or duplicate leg positions; rerun Stage 2")
+
+        declared_lengths = {
+            integer_or_zero(unit.get("journey_chain_length"))
+            for unit in chain_units
+        }
+        if declared_lengths != {len(chain_units)}:
+            errors.append(
+                f"{chain_id} has stale chain length metadata, usually because a leg was dropped; rerun Stage 2"
+            )
+
+        active_unit_ids = [clean(unit.get("unit_id")) for unit in chain_units]
+        declared_member_lists = {
+            tuple(clean(unit_id) for unit_id in (unit.get("journey_chain_unit_ids") or []))
+            for unit in chain_units
+        }
+        if declared_member_lists != {tuple(active_unit_ids)}:
+            errors.append(
+                f"{chain_id} has stale chain member metadata, usually because a leg was dropped; rerun Stage 2"
+            )
+
+        current_route = rail_chain_route(chain_units)
+        declared_routes = {clean(unit.get("journey_chain_route")) for unit in chain_units}
+        if not current_route or declared_routes != {current_route}:
+            errors.append(f"{chain_id} has stale whole-journey route metadata; rerun Stage 2")
+
+        for first, second in zip(chain_units, chain_units[1:]):
+            _, first_destination = route_endpoints(first)
+            second_origin, _ = route_endpoints(second)
+            if not rail_stations_connect(first_destination, second_origin):
+                errors.append(
+                    f"{chain_id} is no longer continuous at {first_destination or '?'} -> {second_origin or '?'}; "
+                    "a route correction invalidated the chain, so rerun Stage 2"
+                )
+    return errors
+
+
+def rail_chain_summaries(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for chain_id, chain_units in rail_chain_groups(units).items():
+        first = chain_units[0]
+        summaries.append({
+            "journey_chain_id": chain_id,
+            "route": clean(first.get("journey_chain_route")),
+            "unit_ids": [clean(unit.get("unit_id")) for unit in chain_units],
+            "user_nos": [unit.get("user_no", "") for unit in chain_units],
+            "project_context_id": clean(first.get("project_context_id")),
+            "client_name": clean(first.get("client_name")),
+            "client_charge_code": clean(first.get("client_charge_code")),
+            "confidence": clean(first.get("journey_chain_confidence")),
+            "assignment_rule": clean(first.get("journey_chain_assignment_rule")),
+            "needs_confirmation": any(unit.get("journey_chain_needs_confirmation") for unit in chain_units),
+        })
+    return summaries
+
+
 def assignment_matches_context(unit: dict[str, Any], ctx: dict[str, Any]) -> bool:
     if clean(unit.get("project_context_id")) and clean(unit.get("project_context_id")) == clean(ctx.get("context_id")):
         return True
@@ -687,6 +827,7 @@ def travel_destination_context(unit: dict[str, Any], contexts: list[dict[str, An
 def require_ready(allocation: dict[str, Any], allow_unconfirmed: bool) -> list[str]:
     errors: list[str] = []
     contexts = allocation.get("project_contexts", [])
+    errors.extend(rail_chain_ready_errors(allocation.get("allocation_units", [])))
     open_questions = [q for q in allocation.get("questions", []) if q.get("status", "open") == "open"]
     if open_questions and not allow_unconfirmed:
         errors.append(f"{len(open_questions)} open allocation question(s) remain.")
@@ -716,7 +857,7 @@ def require_ready(allocation: dict[str, Any], allow_unconfirmed: bool) -> list[s
             errors.append(f"{unit.get('unit_id')} note conflict: {note_error}.")
         for rule_error in stage3_rule_errors(unit):
             errors.append(f"{unit.get('unit_id')} stage-3 rule conflict: {rule_error}.")
-        destination_ctx = travel_destination_context(unit, contexts)
+        destination_ctx = None if clean(unit.get("journey_chain_id")) else travel_destination_context(unit, contexts)
         if destination_ctx and not assignment_matches_context(unit, destination_ctx):
             errors.append(
                 f"{unit.get('unit_id')} travel route destination points to "
@@ -900,6 +1041,21 @@ def make_rows(units: list[dict[str, Any]], requester: str) -> list[dict[str, Any
             "seller_name": unit.get("seller_name", ""),
             "attendees": unit.get("attendees", ""),
             "meal_context": unit.get("meal_context", ""),
+            "train_no": unit.get("train_no", ""),
+            "origin_station": unit.get("origin_station", ""),
+            "destination_station": unit.get("destination_station", ""),
+            "rail_departure_time": unit.get("rail_departure_time", ""),
+            "rail_departure_datetime": unit.get("rail_departure_datetime", ""),
+            "journey_chain_id": unit.get("journey_chain_id", ""),
+            "journey_chain_route": unit.get("journey_chain_route", ""),
+            "journey_chain_position": unit.get("journey_chain_position", ""),
+            "journey_chain_length": unit.get("journey_chain_length", ""),
+            "journey_chain_unit_ids": unit.get("journey_chain_unit_ids", []),
+            "journey_chain_confidence": unit.get("journey_chain_confidence", ""),
+            "journey_chain_assignment_rule": unit.get("journey_chain_assignment_rule", ""),
+            "journey_chain_match_reason": unit.get("journey_chain_match_reason", ""),
+            "journey_chain_project_context_id": unit.get("journey_chain_project_context_id", ""),
+            "journey_chain_needs_confirmation": bool(unit.get("journey_chain_needs_confirmation")),
             "hotel_city": unit.get("hotel_city", ""),
             "hotel_city_tier": unit.get("hotel_city_tier", ""),
             "hotel_nights": unit.get("hotel_nights", ""),
@@ -1683,6 +1839,21 @@ def build_markdown(payload: dict[str, Any], workbook: Path) -> str:
             f"| {block['project_key']} | {block['first_detail_row']}:{block['last_detail_row']} | "
             f"{block['subtotal_row']} | {block['subtotal_formula']} |"
         )
+    chains = payload.get("rail_journey_chains", [])
+    if chains:
+        lines += [
+            "",
+            "## Railway Journey Chains",
+            "",
+            "| Chain | Items | Route | Project | Code | Rule | Needs Confirmation |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for chain in chains:
+            lines.append(
+                f"| {chain.get('journey_chain_id', '')} | {', '.join(str(value) for value in chain.get('user_nos', []))} | "
+                f"{chain.get('route', '')} | {chain.get('client_name', '')} | {chain.get('client_charge_code', '')} | "
+                f"{chain.get('assignment_rule', '')} | {chain.get('needs_confirmation', False)} |"
+            )
     meal_rule = payload.get("meal_policy_rule", {})
     lines += [
         "",
@@ -1946,6 +2117,7 @@ def main(argv: list[str] | None = None) -> int:
         "workbook": str(Path(args.output)),
         "proof_groups": [{k: v for k, v in group.items() if k != "units"} for group in proof_groups],
         "rows": rows,
+        "rail_journey_chains": rail_chain_summaries(units),
         "project_blocks": project_blocks,
         "summary_rows": summary_rows,
         "meal_policy_rule": meal_policy_rule(),
