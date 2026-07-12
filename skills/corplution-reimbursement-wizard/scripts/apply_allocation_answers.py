@@ -33,11 +33,27 @@ ALLOWED_ROOT_FIELDS = {
     "source_allocation_fingerprint",
     "source_allocation_file",
     "unit_updates",
+    "expense_hint_resolutions",
     "question_updates",
     "project_contexts",
     "confirm_units",
     "drop_units",
     "exclude_units",
+}
+
+HINT_RESOLUTION_ACTIONS = {
+    "matched_existing",
+    "covered_by_invoice",
+    "not_reimbursed",
+    "pending_invoice",
+}
+HINT_RESOLUTION_FIELDS = {
+    "question_id",
+    "record_ref",
+    "hint_id",
+    "action",
+    "unit_ids",
+    "note",
 }
 
 META_FIELDS = {
@@ -503,7 +519,8 @@ def placeholder_paths(value: Any, path: str = "$") -> list[str]:
 def validate_answers_root(answers: Any) -> None:
     if isinstance(answers, list):
         raise ValueError(
-            "Answers must be a JSON object with top-level unit_updates/question_updates/project_contexts. "
+            "Answers must be a JSON object with top-level unit_updates/question_updates/"
+            "project_contexts/expense_hint_resolutions. "
             "Use compose_answers.py to compile allocation_decisions.v1 instead of passing a bare list."
         )
     if not isinstance(answers, dict):
@@ -559,7 +576,9 @@ def resolve_unit_ref(ref: Any, by_id: dict[str, dict[str, Any]], by_no: dict[str
     return None
 
 
-def normalize_answers(answers: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+def normalize_answers(
+    answers: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     validate_answers_root(answers)
 
     unit_updates = [
@@ -581,7 +600,11 @@ def normalize_answers(answers: Any) -> tuple[list[dict[str, Any]], list[dict[str
         dict(item)
         for item in answers.get("project_contexts", [])
     ]
-    if not unit_updates and not question_updates and not context_updates:
+    hint_resolutions = [
+        dict(item)
+        for item in answers.get("expense_hint_resolutions", [])
+    ]
+    if not unit_updates and not question_updates and not context_updates and not hint_resolutions:
         raise ValueError(
             "Answers file contains no actionable updates. Correct the allocation_decisions.v1 input and "
             "rerun compose_answers.py."
@@ -594,7 +617,21 @@ def normalize_answers(answers: Any) -> tuple[list[dict[str, Any]], list[dict[str
         paths = placeholder_paths(update, f"project_contexts[{idx}]")
         if paths:
             raise ValueError("Unfilled template placeholder(s): " + ", ".join(paths))
-    return unit_updates, question_updates, context_updates
+    for idx, update in enumerate(hint_resolutions, start=1):
+        paths = placeholder_paths(update, f"expense_hint_resolutions[{idx}]")
+        if paths:
+            raise ValueError("Unfilled template placeholder(s): " + ", ".join(paths))
+        unknown = sorted(set(update) - HINT_RESOLUTION_FIELDS)
+        if unknown:
+            raise ValueError(
+                f"expense_hint_resolutions[{idx}] unsupported field(s): {', '.join(unknown)}"
+            )
+        if clean(update.get("action")) not in HINT_RESOLUTION_ACTIONS:
+            raise ValueError(
+                f"expense_hint_resolutions[{idx}].action must be one of: "
+                + ", ".join(sorted(HINT_RESOLUTION_ACTIONS))
+            )
+    return unit_updates, question_updates, context_updates, hint_resolutions
 
 
 def add_issue(unit: dict[str, Any], field: str, problem: str) -> None:
@@ -808,10 +845,6 @@ def merge_contexts(payload: dict[str, Any], context_updates: list[dict[str, Any]
 
 def apply_question_updates(payload: dict[str, Any], updates: list[dict[str, Any]]) -> None:
     questions = {q.get("question_id"): q for q in payload.get("questions", [])}
-    hint_records: dict[str, list[dict[str, Any]]] = {}
-    for item in payload.get("expense_hint_reconciliation", []):
-        if item.get("question_id"):
-            hint_records.setdefault(item["question_id"], []).append(item)
     for update in updates:
         question_id = update.get("question_id")
         if question_id not in questions:
@@ -819,37 +852,121 @@ def apply_question_updates(payload: dict[str, Any], updates: list[dict[str, Any]
         question = questions[question_id]
         status = update.get("status", "answered")
         answer = clean(update.get("answer"))
-        if (
-            question.get("requires_explicit_answer")
-            and status not in OPEN_STATUSES
-            and not answer
-        ):
+        if question.get("question_type") == "expense_hint_reconciliation" and status not in OPEN_STATUSES:
             raise ValueError(
-                f"{question_id} is an expense-record completeness decision and cannot be closed "
-                "without an explicit answer (matched item, merged invoice, will supplement, or not reimbursed)."
+                f"{question_id} is an expense-record completeness question. Do not close it with free text; "
+                "use expense_hint_resolutions so matched, dropped, and pending-invoice outcomes remain distinct."
             )
-        if question.get("requires_explicit_answer") and status not in OPEN_STATUSES:
-            answer_lower = answer.lower()
-            missing_tokens = [
-                clean(token)
-                for token in question.get("required_answer_tokens", [])
-                if clean(token) and clean(token).lower() not in answer_lower
-            ]
-            if missing_tokens:
-                raise ValueError(
-                    f"{question_id} is a grouped expense-record completeness decision. The answer must "
-                    "explicitly address every displayed record token: " + ", ".join(missing_tokens)
-                )
+        if question.get("requires_explicit_answer") and status not in OPEN_STATUSES and not answer:
+            raise ValueError(f"{question_id} cannot be closed without an explicit answer.")
         question["status"] = status
         if "answer" in update:
             question["answer"] = update["answer"]
-        for record in hint_records.get(question_id, []):
-            if status in OPEN_STATUSES:
-                record["resolution_status"] = "open"
-                record["resolution_answer"] = ""
-            else:
-                record["resolution_status"] = "resolved"
-                record["resolution_answer"] = answer
+
+
+def sync_expense_hint_questions(payload: dict[str, Any]) -> None:
+    records_by_question: dict[str, list[dict[str, Any]]] = {}
+    for record in payload.get("expense_hint_reconciliation", []):
+        question_id = clean(record.get("question_id"))
+        if question_id:
+            records_by_question.setdefault(question_id, []).append(record)
+    for question in payload.get("questions", []):
+        if question.get("question_type") != "expense_hint_reconciliation":
+            continue
+        records = records_by_question.get(clean(question.get("question_id")), [])
+        if not records:
+            continue
+        unresolved = [
+            record for record in records
+            if clean(record.get("resolution_status")) not in {"not_required", "resolved"}
+        ]
+        summaries = []
+        for record in records:
+            ref = clean(record.get("display_ref")) or clean(record.get("hint_id"))
+            action = clean(record.get("resolution_action")) or clean(record.get("resolution_status"))
+            note = clean(record.get("resolution_answer"))
+            summaries.append(f"{ref}: {action}" + (f" ({note})" if note else ""))
+        question["answer"] = "; ".join(summaries)
+        question["status"] = "open" if unresolved else "answered"
+
+
+def apply_expense_hint_resolutions(
+    payload: dict[str, Any],
+    resolutions: list[dict[str, Any]],
+) -> None:
+    if not resolutions:
+        return
+    records = [
+        item for item in payload.get("expense_hint_reconciliation", [])
+        if isinstance(item, dict)
+    ]
+    by_hint_id = {
+        clean(item.get("hint_id")): item for item in records if clean(item.get("hint_id"))
+    }
+    units = {
+        clean(unit.get("unit_id")): unit
+        for unit in payload.get("allocation_units", [])
+        if clean(unit.get("unit_id"))
+    }
+    seen_hints: set[str] = set()
+    for idx, resolution in enumerate(resolutions, start=1):
+        hint_id = clean(resolution.get("hint_id"))
+        record = by_hint_id.get(hint_id)
+        if record is None:
+            raise ValueError(f"expense_hint_resolutions[{idx}] references unknown hint_id {hint_id!r}")
+        if hint_id in seen_hints:
+            raise ValueError(f"expense_hint_resolutions[{idx}] duplicates hint_id {hint_id!r}")
+        seen_hints.add(hint_id)
+        question_id = clean(resolution.get("question_id"))
+        record_ref = clean(resolution.get("record_ref"))
+        if question_id != clean(record.get("question_id")) or record_ref != clean(record.get("display_ref")):
+            raise ValueError(
+                f"expense_hint_resolutions[{idx}] no longer matches the current question/record reference; "
+                "rerun Composer against the current allocation"
+            )
+        action = clean(resolution.get("action"))
+        unit_ids = [clean(value) for value in as_list(resolution.get("unit_ids")) if clean(value)]
+        note = clean(resolution.get("note"))
+        if action in {"matched_existing", "covered_by_invoice"}:
+            if not unit_ids:
+                raise ValueError(f"expense_hint_resolutions[{idx}] action {action!r} requires unit_ids")
+            inactive = [
+                unit_id for unit_id in unit_ids
+                if unit_id not in units or clean(units[unit_id].get("status")) in {
+                    "dropped", "excluded", "non_reimbursable"
+                }
+            ]
+            if inactive:
+                raise ValueError(
+                    f"expense_hint_resolutions[{idx}] references missing or inactive unit(s): "
+                    + ", ".join(inactive)
+                )
+            record["match_status"] = "matched" if action == "matched_existing" else "covered"
+            record["matched_unit_ids"] = unit_ids
+            record["matched_user_nos"] = [unit_no(units[unit_id]) for unit_id in unit_ids]
+            record["resolution_status"] = "resolved"
+        elif action == "not_reimbursed":
+            if unit_ids:
+                raise ValueError(f"expense_hint_resolutions[{idx}] not_reimbursed must not reference units")
+            record["match_status"] = "not_reimbursed"
+            record["matched_unit_ids"] = []
+            record["matched_user_nos"] = []
+            record["resolution_status"] = "resolved"
+        elif action == "pending_invoice":
+            if unit_ids:
+                raise ValueError(f"expense_hint_resolutions[{idx}] pending_invoice must not reference units")
+            record["match_status"] = "pending_invoice"
+            record["matched_unit_ids"] = []
+            record["matched_user_nos"] = []
+            record["resolution_status"] = "pending_evidence"
+        else:
+            raise ValueError(
+                f"expense_hint_resolutions[{idx}].action must be one of: "
+                + ", ".join(sorted(HINT_RESOLUTION_ACTIONS))
+            )
+        record["resolution_action"] = action
+        record["resolution_answer"] = note or action
+    sync_expense_hint_questions(payload)
 
 
 def close_answered_questions(payload: dict[str, Any], touched_units: set[str]) -> None:
@@ -884,7 +1001,10 @@ def refresh_expense_hint_reconciliation(payload: dict[str, Any], touched_units: 
         matched_ids = {clean(value) for value in record.get("matched_unit_ids", []) if clean(value)}
         if not matched_ids.intersection(touched_units):
             continue
-        if record.get("resolution_status") == "resolved":
+        if (
+            record.get("resolution_status") == "resolved"
+            and record.get("resolution_action") == "not_reimbursed"
+        ):
             continue
         active_ids = [
             unit_id for unit_id in matched_ids
@@ -903,6 +1023,7 @@ def refresh_expense_hint_reconciliation(payload: dict[str, Any], touched_units: 
         record["resolution_status"] = "open"
         record["question_id"] = question_id
         record["resolution_answer"] = ""
+        record["resolution_action"] = ""
         questions.append({
             "question_id": question_id,
             "question_type": "expense_hint_reconciliation",
@@ -1146,12 +1267,13 @@ def apply_answers(
             "would silently write data onto the wrong units. Rerun Composer against the CURRENT "
             "allocation and apply only its newly published answers. Never reuse an old answers file."
         )
-    unit_updates, question_updates, context_updates = normalize_answers(answers)
+    unit_updates, question_updates, context_updates, hint_resolutions = normalize_answers(answers)
     answer_text_issues = text_safety.find_suspect_text(
         {
             "unit_updates": unit_updates,
             "question_updates": question_updates,
             "project_contexts": context_updates,
+            "expense_hint_resolutions": hint_resolutions,
         },
         path="answers",
     )
@@ -1194,6 +1316,7 @@ def apply_answers(
         normalize_admin_client(unit)
 
     apply_question_updates(payload, question_updates)
+    apply_expense_hint_resolutions(payload, hint_resolutions)
     close_answered_questions(payload, touched_units)
     sync_admin_client_advisories(payload)
     allocation_text_issues = text_safety.find_suspect_text(
@@ -1221,6 +1344,7 @@ def apply_answers(
         "unit_update_count": len(unit_updates),
         "question_update_count": len(question_updates),
         "context_update_count": len(context_updates),
+        "expense_hint_resolution_count": len(hint_resolutions),
         "changes": changes,
     })
 

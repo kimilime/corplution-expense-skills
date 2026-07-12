@@ -32,7 +32,7 @@ Do not write the final workbook until:
 - No taxi/travel row is assigned to `CORP-2026-ADMIN`. Admin is not a fallback for unmatched transport.
 - Standalone flight/rail whose route destination uniquely matches a project context is assigned to that destination project, not the origin project.
 - Every active railway journey chain has at least two continuous ticket segments, one shared project assignment, no open whole-chain question, and current length/member/route metadata. A dropped or corrected segment requires Stage 2 to rebuild the chain. Skip per-ticket destination-project enforcement for intermediate transfer segments; validate the chain as a whole instead.
-- Every applicant expense hint has a current reverse-reconciliation entry. Unmatched/ambiguous hints require an explicit matched-item, combined-invoice, supplement-later, or not-reimbursed answer; a matched hint whose unit was dropped must be resolved again.
+- Every applicant expense hint has a current reverse-reconciliation entry. Valid final outcomes are active evidence matched through `matched_existing`, identified `covered_by_invoice`, automatic unique matching, or `not_reimbursed`. `pending_invoice` remains blocking; a matched hint whose unit was dropped must be resolved again.
 - Substitute invoices either have approval screenshot paths or explicit missing-screenshot issues.
 - Didi/Gaode summary invoices linked to trip reports are not duplicated as standalone expense rows.
 

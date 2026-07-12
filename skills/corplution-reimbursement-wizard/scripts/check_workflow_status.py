@@ -148,6 +148,7 @@ def validate_package_manifest(
 FINAL_UNIT_STATUSES = {"confirmed", "fixed", "dropped", "excluded", "non_reimbursable"}
 ANSWER_ACTION_FIELDS = (
     "unit_updates",
+    "expense_hint_resolutions",
     "question_updates",
     "project_contexts",
     "confirm_units",

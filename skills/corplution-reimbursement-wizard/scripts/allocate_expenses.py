@@ -1991,6 +1991,7 @@ def hint_reconciliation_record(hint: dict[str, Any]) -> dict[str, Any]:
         "candidate_units": [],
         "question_id": "",
         "resolution_answer": "",
+        "resolution_action": "",
     }
 
 
@@ -2631,10 +2632,12 @@ def add_expense_hint_reconciliation_questions(
                 f"你提供的以下 {category} 费用记录没有找到唯一对应发票，不能静默忽略。\n"
                 + "\n".join(record_lines)
                 + "\n请逐条保留 R 编号回复：它对应第几项/哪张发票，是否被某张汇总发票合并覆盖，"
-                "是否稍后补票，还是这条记录不报销、可以排除。"
+                "是否稍后补票，还是这条记录不报销、可以排除。稍后补票会保留为待补凭证并继续阻断写表；"
+                "确认不报销则关闭这条记录，不会强制要求补票。"
             ),
             "why_it_matters": (
-                "用户费用记录是本批应有费用的完整性清单。每条记录必须与凭证对应，或留下明确的补票/合并/不报销决定。"
+                "用户费用记录是本批应有费用的完整性清单。每条记录必须与凭证对应，或留下明确的合并/不报销决定；"
+                "待补票记录可以保存，但凭证补齐或改为不报销前不能进入最终交付。"
             ),
             "status": "open",
             "blocking": True,

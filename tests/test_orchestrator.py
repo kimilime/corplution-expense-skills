@@ -179,6 +179,10 @@ class WorkflowStateTests(unittest.TestCase):
                 "source_allocation_fingerprint": allocation["integrity"]["fingerprint"],
                 "unit_updates": [],
                 "question_updates": [{"question_id": "Q-001", "status": "resolved"}],
+                "expense_hint_resolutions": [{
+                    "hint_id": "H-001",
+                    "action": "pending_invoice",
+                }],
                 "confirm_units": ["UNIT-001"],
             }),
             encoding="utf-8",
@@ -186,7 +190,7 @@ class WorkflowStateTests(unittest.TestCase):
         state = self.inspect()
         self.assertEqual("command", state["next"]["kind"])
         self.assertEqual("apply", state["next"]["operation"])
-        self.assertEqual(2, state["stages"]["allocation"]["unapplied_answer_count"])
+        self.assertEqual(3, state["stages"]["allocation"]["unapplied_answer_count"])
 
     def test_ready_rows_yield_package_command(self) -> None:
         extraction = self.fixture.extraction()

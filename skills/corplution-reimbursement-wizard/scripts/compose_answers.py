@@ -2,7 +2,7 @@
 """Compose canonical allocation answers from compact, UTF-8 decisions.
 
 This is the only normal bridge from applicant/agent judgment to
-allocation-answers.json. It resolves current user-facing item numbers, binds
+allocation-answers.json. It resolves current user-facing item and record numbers, binds
 the live allocation fingerprint, validates the decision schema, invokes the
 official updater in dry-run mode, and publishes the answers file atomically.
 
@@ -35,6 +35,7 @@ DECISIONS_SCHEMA_VERSION = "allocation_decisions.v1"
 DECISIONS_ROOT_FIELDS = {
     "schema_version",
     "decisions",
+    "expense_hint_resolutions",
     "question_updates",
     "project_contexts",
     "confirm_units",
@@ -43,6 +44,13 @@ DECISIONS_ROOT_FIELDS = {
 }
 DECISION_FIELDS = {"units", "set"}
 QUESTION_UPDATE_FIELDS = {"question_id", "status", "answer"}
+HINT_RESOLUTION_FIELDS = {"question_id", "record_ref", "hint_id", "action", "units", "note"}
+HINT_RESOLUTION_ACTIONS = {
+    "matched_existing",
+    "covered_by_invoice",
+    "not_reimbursed",
+    "pending_invoice",
+}
 CONTEXT_UPDATE_FIELDS = {
     "context_id",
     "date_start",
@@ -209,14 +217,22 @@ def validate_fields(fields: dict[str, Any]) -> list[str]:
 def validate_supplemental_actions(
     data: dict[str, Any],
     allocation: dict[str, Any],
-) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     question_updates = require_object_list(data.get("question_updates"), "question_updates")
     context_updates = require_object_list(data.get("project_contexts"), "project_contexts")
+    hint_resolutions = require_object_list(
+        data.get("expense_hint_resolutions"), "expense_hint_resolutions"
+    )
     errors: list[str] = []
     known_questions = {
         str(item.get("question_id", "")).strip()
         for item in allocation.get("questions", [])
         if str(item.get("question_id", "")).strip()
+    }
+    questions_by_id = {
+        str(item.get("question_id", "")).strip(): item
+        for item in allocation.get("questions", [])
+        if isinstance(item, dict) and str(item.get("question_id", "")).strip()
     }
     known_contexts = {
         str(item.get("context_id", "")).strip(): item
@@ -232,6 +248,14 @@ def validate_supplemental_actions(
             errors.append(f"question_updates[{idx - 1}] requires question_id")
         elif question_id not in known_questions:
             errors.append(f"question_updates[{idx - 1}] references unknown question_id {question_id!r}")
+        elif (
+            questions_by_id[question_id].get("question_type") == "expense_hint_reconciliation"
+            and str(item.get("status", "answered")).strip() not in {"open", "needs_confirmation", "draft"}
+        ):
+            errors.append(
+                f"question_updates[{idx - 1}] cannot close expense-record question {question_id!r}; "
+                "use expense_hint_resolutions so pending invoices remain blocking"
+            )
     for idx, item in enumerate(context_updates, start=1):
         unknown = sorted(set(item) - CONTEXT_UPDATE_FIELDS)
         if unknown:
@@ -263,9 +287,79 @@ def validate_supplemental_actions(
             and parsed_dates["date_end"] < parsed_dates["date_start"]
         ):
             errors.append(f"project_contexts[{idx - 1}].date_end cannot be earlier than date_start")
+    records = [
+        item for item in allocation.get("expense_hint_reconciliation", [])
+        if isinstance(item, dict)
+    ]
+    by_hint_id = {
+        str(item.get("hint_id", "")).strip(): item
+        for item in records if str(item.get("hint_id", "")).strip()
+    }
+    by_question_ref = {
+        (
+            str(item.get("question_id", "")).strip(),
+            str(item.get("display_ref", "")).strip().upper(),
+        ): item
+        for item in records
+        if str(item.get("question_id", "")).strip() and str(item.get("display_ref", "")).strip()
+    }
+    seen_hints: set[str] = set()
+    normalized_hint_resolutions: list[dict[str, Any]] = []
+    known_units, known_ids = current_unit_maps(allocation)
+    for idx, item in enumerate(hint_resolutions, start=1):
+        unknown = sorted(set(item) - HINT_RESOLUTION_FIELDS)
+        if unknown:
+            errors.append(
+                f"expense_hint_resolutions[{idx - 1}] unsupported field(s): {', '.join(unknown)}"
+            )
+        question_id = str(item.get("question_id", "")).strip()
+        record_ref = str(item.get("record_ref", "")).strip().upper()
+        hint_id = str(item.get("hint_id", "")).strip()
+        record = by_hint_id.get(hint_id) if hint_id else by_question_ref.get((question_id, record_ref))
+        if record is None:
+            errors.append(
+                f"expense_hint_resolutions[{idx - 1}] must identify a current record by hint_id or "
+                "question_id + record_ref"
+            )
+            continue
+        canonical_hint_id = str(record.get("hint_id", "")).strip()
+        if canonical_hint_id in seen_hints:
+            errors.append(
+                f"expense_hint_resolutions[{idx - 1}] duplicates record {canonical_hint_id!r}"
+            )
+            continue
+        seen_hints.add(canonical_hint_id)
+        action = str(item.get("action", "")).strip()
+        if action not in HINT_RESOLUTION_ACTIONS:
+            errors.append(
+                f"expense_hint_resolutions[{idx - 1}].action must be one of: "
+                + ", ".join(sorted(HINT_RESOLUTION_ACTIONS))
+            )
+            continue
+        try:
+            numbers = action_numbers(item.get("units"), known_units, known_ids, "expense_hint_resolutions.units")
+        except ValueError as exc:
+            errors.append(str(exc))
+            continue
+        if action in {"matched_existing", "covered_by_invoice"} and not numbers:
+            errors.append(
+                f"expense_hint_resolutions[{idx - 1}] action {action!r} requires current item number(s) in units"
+            )
+        if action in {"not_reimbursed", "pending_invoice"} and numbers:
+            errors.append(
+                f"expense_hint_resolutions[{idx - 1}] action {action!r} must not reference units"
+            )
+        normalized_hint_resolutions.append({
+            "question_id": str(record.get("question_id", "")).strip(),
+            "record_ref": str(record.get("display_ref", "")).strip(),
+            "hint_id": canonical_hint_id,
+            "action": action,
+            "unit_ids": [known_units[number] for number in numbers],
+            "note": str(item.get("note", "")).strip(),
+        })
     if errors:
         raise ValueError("; ".join(errors))
-    return question_updates, context_updates
+    return question_updates, context_updates, normalized_hint_resolutions
 
 
 def current_unit_maps(allocation: dict[str, Any]) -> tuple[dict[int, str], dict[str, int]]:
@@ -358,7 +452,9 @@ def main(argv: list[str] | None = None) -> int:
         if decisions_path:
             decision_data = load_decisions_file(decisions_path)
             batches.extend(decision_batches(decision_data))
-        question_updates, context_updates = validate_supplemental_actions(decision_data, allocation)
+        question_updates, context_updates, hint_resolutions = validate_supplemental_actions(
+            decision_data, allocation
+        )
     except (ValueError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         print_recovery(decisions_path)
@@ -404,9 +500,10 @@ def main(argv: list[str] | None = None) -> int:
         ],
         "question_updates": question_updates,
         "project_contexts": context_updates,
+        "expense_hint_resolutions": hint_resolutions,
     }
 
-    if not answers["unit_updates"] and not question_updates and not context_updates:
+    if not answers["unit_updates"] and not question_updates and not context_updates and not hint_resolutions:
         errors.append("decisions input contains no actionable updates")
     for finding in text_safety.find_suspect_text(answers, path="decisions"):
         errors.append(
@@ -457,7 +554,10 @@ def main(argv: list[str] | None = None) -> int:
         if staging_path.exists():
             staging_path.unlink()
 
-    action_count = len(answers["unit_updates"]) + len(question_updates) + len(context_updates)
+    action_count = (
+        len(answers["unit_updates"]) + len(question_updates) + len(context_updates)
+        + len(hint_resolutions)
+    )
     print(f"Composed and updater-validated {action_count} action(s) -> {output_path}")
     print(
         "NEXT: python scripts/apply_allocation_answers.py "

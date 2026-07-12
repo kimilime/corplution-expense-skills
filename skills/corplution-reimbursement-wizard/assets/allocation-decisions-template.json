@@ -12,6 +12,15 @@
       }
     }
   ],
+  "expense_hint_resolutions": [
+    {
+      "question_id": "<Q-HINT-...>",
+      "record_ref": "<R1>",
+      "action": "<matched_existing|covered_by_invoice|not_reimbursed|pending_invoice>",
+      "units": "<current item number(s), required for matched_existing/covered_by_invoice>",
+      "note": "<applicant decision or evidence note>"
+    }
+  ],
   "question_updates": [],
   "project_contexts": [],
   "confirm_units": [],

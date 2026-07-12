@@ -131,7 +131,7 @@ The allocation script scores these hints against extracted units using amount, d
 - Merchant can be brand/store text supplied by the applicant even when the invoice seller is a franchisee, platform merchant, or individual business.
 - Date is the actual meal/expense date from the applicant's note. For ordinary meal invoices, invoice issue date is only weak evidence and must not replace the actual meal date.
 - Auto-apply a hint only when one extracted unit is the unique high-confidence match. If several units have similar evidence, show the candidates in the chat and ask the user to confirm by item number.
-- Reconcile in the reverse direction too. Every distinct hint becomes one `expense_hint_reconciliation` record. Group unresolved records by expense type in chat, label each `R1`, `R2`, and so on, and show the original record plus any candidates. Require an explicit answer for every displayed R token: matched item, combined-invoice coverage, later invoice supplementation, or not reimbursed. An empty or partial grouped answer cannot close this gate.
+- Reconcile in the reverse direction too. Every distinct hint becomes one `expense_hint_reconciliation` record. Group unresolved records by expense type in chat, label each `R1`, `R2`, and so on, and show the original record plus any candidates. Convert each answer into `expense_hint_resolutions` with `matched_existing`, `covered_by_invoice`, `not_reimbursed`, or `pending_invoice`. A pending invoice records progress but does not close the gate; an erroneous/out-of-scope note may close as not reimbursed. Never close this question using a free-text `question_updates` answer.
 - If a matched allocation unit is later dropped/excluded/non-reimbursable, reopen the related hint gate. Deleting a row must not silently delete the applicant's original expected-expense record.
 
 Use hints to preserve attendee details even when a meal does not exceed the cap.
@@ -594,23 +594,45 @@ The root action arrays are also supported:
 - `drop_units`: list of user-facing item numbers or internal unit IDs to drop.
 - `exclude_units`: list of user-facing item numbers or internal unit IDs to exclude.
 - `question_updates`: explicit question status/answer updates.
+- `expense_hint_resolutions`: structured outcomes for each displayed `R` record; evidence actions require current item numbers in `units`.
 - `project_contexts`: controlled context additions/updates.
 
-For a grouped user-record completeness question, preserve every displayed R token in the answer so the updater can prove that no record was skipped:
+For a grouped user-record completeness question, write one structured entry per displayed R token. A mixed answer may close some records while leaving a missing invoice pending:
 
 ```json
 {
-  "question_updates": [
+  "expense_hint_resolutions": [
     {
       "question_id": "Q-HINT-001",
-      "status": "answered",
-      "answer": "R1 对应第16项；R2 由第20项汇总发票覆盖；R3 稍后补票；R4 不报销"
+      "record_ref": "R1",
+      "action": "matched_existing",
+      "units": "16",
+      "note": "对应第16项"
+    },
+    {
+      "question_id": "Q-HINT-001",
+      "record_ref": "R2",
+      "action": "covered_by_invoice",
+      "units": "20",
+      "note": "由第20项汇总发票覆盖"
+    },
+    {
+      "question_id": "Q-HINT-001",
+      "record_ref": "R3",
+      "action": "pending_invoice",
+      "note": "商户稍后补开；本条继续阻断"
+    },
+    {
+      "question_id": "Q-HINT-001",
+      "record_ref": "R4",
+      "action": "not_reimbursed",
+      "note": "记录有误，本次不报销"
     }
   ]
 }
 ```
 
-Composer/updater rejects an empty answer or one that omits any R token required by that grouped question.
+Composer resolves each R token against the current fingerprint-bound ledger. The updater closes only evidence-backed or not-reimbursed records and keeps the grouped question open while any record is `pending_evidence`.
 
 Run Composer, then apply only its published output:
 
@@ -688,7 +710,8 @@ Write `process/expense-allocation.json`:
       "source_category": "meal",
       "summary": "2026-06-01 德克士 RMB 61.80",
       "match_status": "matched|ambiguous|unmatched|matched_unit_closed",
-      "resolution_status": "not_required|open|resolved",
+      "resolution_status": "not_required|open|pending_evidence|resolved",
+      "resolution_action": "|matched_existing|covered_by_invoice|not_reimbursed|pending_invoice",
       "matched_unit_ids": [],
       "matched_user_nos": [],
       "candidate_units": [],
@@ -796,7 +819,7 @@ Stage 2 is complete when:
 - The user-provided project context has been structured and confirmed enough to allocate expenses.
 - Every allocation unit has a project assignment, fixed admin assignment, or open question.
 - Every included allocation unit has a reliable `expense_date`, a pure-`other` provisional invoice-date `expense_date` with an advisory review item, or a blocking open question asking the applicant for the actual date to record.
-- Every distinct applicant hint is represented once in `expense_hint_reconciliation` and is either uniquely matched to an active unit or explicitly resolved with a non-empty answer.
+- Every distinct applicant hint is represented once in `expense_hint_reconciliation` and is either uniquely matched to active evidence, covered by an identified invoice, or explicitly marked `not_reimbursed`; `pending_invoice` is not Stage 2 complete.
 - Meals have actual date/project/attendee details when needed.
 - `CORP-2026-BD` collisions are separated by client/city/date context.
 - Substitute invoices are marked and screenshot requirements are recorded.

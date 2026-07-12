@@ -850,7 +850,7 @@ def expense_hint_reconciliation_errors(allocation: dict[str, Any]) -> list[str]:
         hint_id = clean(record.get("hint_id")) or "<unknown hint>"
         resolution_status = clean(record.get("resolution_status"))
         match_status = clean(record.get("match_status"))
-        if resolution_status not in {"not_required", "open", "resolved"}:
+        if resolution_status not in {"not_required", "open", "pending_evidence", "resolved"}:
             errors.append(
                 f"User expense record {hint_id} has invalid resolution status {resolution_status!r}; rerun Stage 2."
             )
@@ -860,13 +860,25 @@ def expense_hint_reconciliation_errors(allocation: dict[str, Any]) -> list[str]:
                 f"User expense record {hint_id} ({record.get('summary', '')}) has no unique invoice match or explicit resolution."
             )
             continue
-        if resolution_status == "resolved" and not clean(record.get("resolution_answer")):
-            errors.append(f"User expense record {hint_id} was closed without an explicit resolution answer.")
+        if resolution_status == "pending_evidence":
+            errors.append(
+                f"User expense record {hint_id} ({record.get('summary', '')}) is still waiting for an invoice; "
+                "supply the evidence or explicitly mark the record not reimbursed."
+            )
+            continue
+        if resolution_status == "resolved":
+            action = clean(record.get("resolution_action"))
+            if action not in {"matched_existing", "covered_by_invoice", "not_reimbursed"}:
+                errors.append(
+                    f"User expense record {hint_id} has no valid structured resolution action; resolve it again in Stage 2."
+                )
+            if not clean(record.get("resolution_answer")):
+                errors.append(f"User expense record {hint_id} was closed without an explicit resolution answer.")
         if resolution_status == "not_required" and match_status != "matched":
             errors.append(
                 f"User expense record {hint_id} skips explicit resolution without a unique matched unit."
             )
-        if match_status == "matched":
+        if match_status in {"matched", "covered"}:
             matched_ids = [clean(value) for value in record.get("matched_unit_ids", []) if clean(value)]
             active_matches = [
                 unit_id for unit_id in matched_ids

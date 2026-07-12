@@ -207,6 +207,51 @@ class ComposerTests(unittest.TestCase):
         self.assertEqual("Q-001", answers["question_updates"][0]["question_id"])
         self.assertEqual("CTX-001", answers["project_contexts"][0]["context_id"])
 
+    def test_composer_structures_pending_invoice_without_closing_gate(self) -> None:
+        allocation = json.loads(self.allocation_path.read_text(encoding="utf-8"))
+        allocation["expense_hint_reconciliation"] = [{
+            "hint_id": "CTX-001:expense_hints:1",
+            "question_id": "Q-HINT-001",
+            "display_ref": "R1",
+            "summary": "2026-06-01 未开票费用 RMB 88.00",
+            "match_status": "unmatched",
+            "resolution_status": "open",
+            "resolution_action": "",
+            "resolution_answer": "",
+        }]
+        allocation["questions"] = [{
+            "question_id": "Q-HINT-001",
+            "question_type": "expense_hint_reconciliation",
+            "status": "open",
+            "requires_explicit_answer": True,
+            "required_answer_tokens": ["R1"],
+        }]
+        integrity.stamp(allocation, "test")
+        write_json(self.allocation_path, allocation)
+
+        result, output = self.compose({
+            "schema_version": "allocation_decisions.v1",
+            "decisions": [],
+            "expense_hint_resolutions": [{
+                "question_id": "Q-HINT-001",
+                "record_ref": "R1",
+                "action": "pending_invoice",
+                "note": "商户承诺稍后补开",
+            }],
+            "question_updates": [],
+            "project_contexts": [],
+            "confirm_units": [],
+            "drop_units": [],
+            "exclude_units": [],
+        })
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        answers = json.loads(output.read_text(encoding="utf-8"))
+        resolution = answers["expense_hint_resolutions"][0]
+        self.assertEqual("CTX-001:expense_hints:1", resolution["hint_id"])
+        self.assertEqual("pending_invoice", resolution["action"])
+        self.assertEqual([], resolution["unit_ids"])
+
     def test_old_guessed_decisions_shape_is_rejected_without_output(self) -> None:
         result, output = self.compose({
             "decisions": [{"units": "1", "set": {"status": "confirmed"}}],

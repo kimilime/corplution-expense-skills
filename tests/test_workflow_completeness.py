@@ -120,17 +120,19 @@ class ExpenseHintCompletenessTests(unittest.TestCase):
         }
         self.assertTrue(writer.expense_hint_reconciliation_errors(allocation))
 
-    def test_hint_question_cannot_close_without_answer(self) -> None:
+    def test_hint_question_requires_structured_not_reimbursed_resolution(self) -> None:
         payload = {
             "expense_hint_reconciliation": [{
                 "hint_id": "CTX-001:meal_hints:1",
                 "question_id": "Q-HINT-001",
+                "display_ref": "R1",
                 "match_status": "unmatched",
                 "resolution_status": "open",
                 "resolution_answer": "",
             }],
             "questions": [{
                 "question_id": "Q-HINT-001",
+                "question_type": "expense_hint_reconciliation",
                 "status": "open",
                 "requires_explicit_answer": True,
             }],
@@ -138,12 +140,24 @@ class ExpenseHintCompletenessTests(unittest.TestCase):
         with self.assertRaises(ValueError):
             updater.apply_question_updates(payload, [{"question_id": "Q-HINT-001", "status": "answered"}])
 
-        updater.apply_question_updates(payload, [{
+        with self.assertRaises(ValueError):
+            updater.apply_question_updates(payload, [{
+                "question_id": "Q-HINT-001",
+                "status": "answered",
+                "answer": "这条记录不报销，可以排除",
+            }])
+        updater.apply_expense_hint_resolutions(payload, [{
             "question_id": "Q-HINT-001",
-            "status": "answered",
-            "answer": "这条记录不报销，可以排除",
+            "record_ref": "R1",
+            "hint_id": "CTX-001:meal_hints:1",
+            "action": "not_reimbursed",
+            "unit_ids": [],
+            "note": "商户未开票，本次不报销",
         }])
         self.assertEqual("resolved", payload["expense_hint_reconciliation"][0]["resolution_status"])
+        self.assertEqual("not_reimbursed", payload["expense_hint_reconciliation"][0]["resolution_action"])
+        self.assertEqual("answered", payload["questions"][0]["status"])
+        self.assertEqual([], writer.expense_hint_reconciliation_errors(payload))
 
     def test_unmatched_hints_are_grouped_but_every_record_token_is_required(self) -> None:
         context = context_with_hint(date="2026-06-02", amount="999.00", merchant="未找到一号")
@@ -164,18 +178,77 @@ class ExpenseHintCompletenessTests(unittest.TestCase):
             "expense_hint_reconciliation": records,
             "questions": hint_questions,
         }
-        with self.assertRaises(ValueError):
-            updater.apply_question_updates(payload, [{
-                "question_id": hint_questions[0]["question_id"],
-                "status": "answered",
-                "answer": "R1 不报销",
-            }])
-        updater.apply_question_updates(payload, [{
+        updater.apply_expense_hint_resolutions(payload, [{
             "question_id": hint_questions[0]["question_id"],
-            "status": "answered",
-            "answer": "R1 不报销；R2 稍后补票",
+            "record_ref": "R1",
+            "hint_id": records[0]["hint_id"],
+            "action": "not_reimbursed",
+            "unit_ids": [],
+            "note": "记录有误，不报销",
+        }, {
+            "question_id": hint_questions[0]["question_id"],
+            "record_ref": "R2",
+            "hint_id": records[1]["hint_id"],
+            "action": "pending_invoice",
+            "unit_ids": [],
+            "note": "商户稍后补开",
+        }])
+        self.assertEqual(["resolved", "pending_evidence"], [record["resolution_status"] for record in records])
+        self.assertEqual("open", hint_questions[0]["status"])
+        self.assertTrue(writer.expense_hint_reconciliation_errors({
+            "project_contexts": [context],
+            "allocation_units": [meal_unit()],
+            "expense_hint_reconciliation": records,
+        }))
+
+        updater.apply_expense_hint_resolutions(payload, [{
+            "question_id": hint_questions[0]["question_id"],
+            "record_ref": "R2",
+            "hint_id": records[1]["hint_id"],
+            "action": "not_reimbursed",
+            "unit_ids": [],
+            "note": "最终确认不报销",
         }])
         self.assertEqual({"resolved"}, {record["resolution_status"] for record in records})
+        self.assertEqual("answered", hint_questions[0]["status"])
+
+    def test_matched_existing_resolution_links_active_unit(self) -> None:
+        unit = meal_unit()
+        payload = {
+            "allocation_units": [unit],
+            "expense_hint_reconciliation": [{
+                "hint_id": "CTX-001:meal_hints:1",
+                "question_id": "Q-HINT-001",
+                "display_ref": "R1",
+                "match_status": "ambiguous",
+                "resolution_status": "open",
+                "resolution_answer": "",
+            }],
+            "questions": [{
+                "question_id": "Q-HINT-001",
+                "question_type": "expense_hint_reconciliation",
+                "status": "open",
+            }],
+        }
+        updater.apply_expense_hint_resolutions(payload, [{
+            "question_id": "Q-HINT-001",
+            "record_ref": "R1",
+            "hint_id": "CTX-001:meal_hints:1",
+            "action": "matched_existing",
+            "unit_ids": ["UNIT-001"],
+            "note": "对应第1项",
+        }])
+
+        record = payload["expense_hint_reconciliation"][0]
+        self.assertEqual("resolved", record["resolution_status"])
+        self.assertEqual(["UNIT-001"], record["matched_unit_ids"])
+        self.assertEqual(["1"], record["matched_user_nos"])
+
+        unit["status"] = "dropped"
+        updater.refresh_expense_hint_reconciliation(payload, {"UNIT-001"})
+        self.assertEqual("open", record["resolution_status"])
+        self.assertEqual("", record["resolution_action"])
+        self.assertEqual("matched_unit_closed", record["match_status"])
 
     def test_dropping_matched_unit_reopens_hint_completeness_gate(self) -> None:
         unit = {**meal_unit(), "status": "dropped"}

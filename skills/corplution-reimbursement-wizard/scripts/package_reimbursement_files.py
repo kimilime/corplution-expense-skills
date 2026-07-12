@@ -238,8 +238,9 @@ def build_package(
     recorded_unresolved = int(final_rows.get("unresolved_expense_hint_count", -1) or 0)
     if unresolved_hint_records or recorded_unresolved != len(unresolved_hint_records):
         print(
-            f"ERROR: {len(unresolved_hint_records)} user expense record(s) still lack a unique invoice match "
-            "or explicit supplement/merge/not-reimbursed decision. NEXT: relay the hint reconciliation "
+            f"ERROR: {len(unresolved_hint_records)} user expense record(s) still lack a deliverable resolution. "
+            "A pending-invoice decision records progress but remains blocking; supply the evidence or mark the "
+            "record not reimbursed. NEXT: relay the hint reconciliation "
             "questions, resolve them through Composer/updater, rerun Stage 3, then package.",
             file=sys.stderr,
         )
