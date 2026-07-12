@@ -60,11 +60,21 @@ import extraction_corrections as xc
 import integrity
 
 
+def configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def load_json(path: Path) -> dict[str, Any]:
     return json.loads(path.read_text(encoding="utf-8-sig"))
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_stdio()
     parser = argparse.ArgumentParser(description="Apply extraction corrections via the sanctioned overlay.")
     parser.add_argument("--extraction", required=True, help="Path to process/invoice-extraction.json")
     parser.add_argument("--corrections", required=True, help="Path to a corrections JSON file (see module docstring)")

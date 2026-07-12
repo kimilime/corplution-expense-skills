@@ -26,7 +26,7 @@ def configure_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             try:
-                stream.reconfigure(errors="replace")
+                stream.reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
 
@@ -47,6 +47,14 @@ def sha256_file(path: Path) -> str:
         for chunk in iter(lambda: handle.read(1024 * 1024), b""):
             digest.update(chunk)
     return digest.hexdigest()
+
+
+def is_hidden_package_artifact(path: Path, root: Path) -> bool:
+    try:
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    return any(part.startswith(".") for part in relative.parts[:-1])
 
 
 def validate_project_context(path: Path) -> tuple[bool, str]:
@@ -82,6 +90,7 @@ def validate_package_manifest(
     workbook: Path,
     expected_workbook_sha: str,
     final_rows_fingerprint: str,
+    expected_hint_count: int,
 ) -> tuple[bool, str]:
     ok, reason = integrity.check(manifest)
     if not ok:
@@ -94,6 +103,12 @@ def validate_package_manifest(
         return False, "manifest workbook hash does not match current final rows"
     if str(manifest.get("final_rows_fingerprint", "")) != final_rows_fingerprint:
         return False, "manifest belongs to an older or different final-rows generation"
+    try:
+        manifest_hint_count = int(manifest.get("expense_hint_reconciliation_count", -1))
+    except (TypeError, ValueError):
+        return False, "manifest expense_hint_reconciliation_count is invalid"
+    if manifest_hint_count != expected_hint_count:
+        return False, "manifest applicant expense-record count does not match current final rows"
     issues = manifest.get("issues", [])
     if not isinstance(issues, list):
         return False, "manifest issues field is malformed"
@@ -230,7 +245,12 @@ def inspect_workflow(
             for item in unresolved_inputs[:10]:
                 lines.append(f"    * {item.get('filename', '?')}")
         for d in pending[:10]:
-            lines.append(f"  - 待识别: {Path(str(d.get('source_file', '?'))).name}")
+            duplicate = any(
+                "duplicate" in str(issue.get("problem", "")).lower()
+                for issue in (d.get("issues") or [])
+            )
+            label = "重复凭证待 Stage 1 排除确认" if duplicate else "待识别"
+            lines.append(f"  - {label}: {Path(str(d.get('source_file', '?'))).name}")
         stage1_status = "ready" if ok and not unresolved_inputs and not pending else (
             "blocked" if not ok else "needs_user"
         )
@@ -264,10 +284,24 @@ def inspect_workflow(
                 missing=[f"resolution for {item.get('filename', '?')}" for item in unresolved_inputs],
             ))
         elif pending:
+            duplicate_names = [
+                Path(str(item.get("source_file", "?"))).name
+                for item in pending
+                if any(
+                    "duplicate" in str(issue.get("problem", "")).lower()
+                    for issue in (item.get("issues") or [])
+                )
+            ]
             set_next(next_step(
                 "needs_user",
                 "extraction",
-                "Resolve every unidentified or review-required document through vision/OCR or applicant confirmation.",
+                (
+                    "Resolve every unidentified or review-required document through vision/OCR or applicant confirmation. "
+                    "Duplicate files must be excluded in Stage 1 through apply_extraction_corrections.py; "
+                    "do not drop their Stage 2 expense units instead."
+                    if duplicate_names else
+                    "Resolve every unidentified or review-required document through vision/OCR or applicant confirmation."
+                ),
                 operation="correct-extraction",
                 missing=[Path(str(item.get("source_file", "?"))).name for item in pending],
             ))
@@ -334,6 +368,16 @@ def inspect_workflow(
         closed = [u for u in units if u.get("status") in {"dropped", "excluded", "non_reimbursable"}]
         unconfirmed = [u for u in units if u.get("status") not in FINAL_UNIT_STATUSES]
         open_qs = [q for q in allocation.get("questions", []) if q.get("status", "open") == "open"]
+        contexts_have_hints = any(
+            context.get(field)
+            for context in allocation.get("project_contexts", [])
+            for field in ("meal_hints", "expense_hints")
+        )
+        hint_ledger_missing = contexts_have_hints and "expense_hint_reconciliation" not in allocation
+        unresolved_hints = [
+            record for record in allocation.get("expense_hint_reconciliation", [])
+            if record.get("resolution_status") not in {"not_required", "resolved"}
+        ]
         answers_path = pdir / "allocation-answers.json"
         answers = load(answers_path)
         if answers:
@@ -375,8 +419,8 @@ def inspect_workflow(
             not context_ok or actual_context_sha != expected_context_sha
         )
         upstream_unavailable = not stage1_ready
-        stage2_state = "BLOCKED" if not ok or generation_mismatch or context_mismatch or upstream_unavailable else (
-            "✓" if not open_qs and not unconfirmed and not answers_current else "…"
+        stage2_state = "BLOCKED" if not ok or generation_mismatch or context_mismatch or upstream_unavailable or hint_ledger_missing else (
+            "✓" if not open_qs and not unconfirmed and not answers_current and not unresolved_hints else "…"
         )
         stamp_note = "" if ok else f" [INTEGRITY FAILED: {reason}]"
         if generation_mismatch:
@@ -385,11 +429,16 @@ def inspect_workflow(
             stamp_note += " [STALE: project context changed, disappeared, or became invalid]"
         if upstream_unavailable and not generation_mismatch:
             stamp_note += " [BLOCKED: extraction is not ready]"
+        if hint_ledger_missing:
+            stamp_note += " [STALE: user expense-record reconciliation ledger missing]"
         answer_note = f"，待应用答案 {current_answer_count} 项" if answers_current else ""
+        hint_count_text = "未知（台账缺失）" if hint_ledger_missing else f"{len(unresolved_hints)} 条"
         lines.append(f"Stage 2 归集: {stage2_state} 单元 {len(confirmed)}/{len(units)} 已确认"
-                     f"（另排除 {len(closed)}），阻断问题 {len(open_qs)} 个{answer_note}{stamp_note}")
+                     f"（另排除 {len(closed)}），阻断问题 {len(open_qs)} 个，未对应用户记录 {hint_count_text}"
+                     f"{answer_note}{stamp_note}")
         stage2_ready = (
             ok and not generation_mismatch and not context_mismatch and not upstream_unavailable
+            and not hint_ledger_missing and not unresolved_hints
             and not open_qs and not unconfirmed and not answers_current
         )
         stages["allocation"] = {
@@ -404,6 +453,8 @@ def inspect_workflow(
             "closed_count": len(closed),
             "unconfirmed_count": len(unconfirmed),
             "open_question_count": len(open_qs),
+            "unresolved_expense_hint_count": len(unresolved_hints),
+            "expense_hint_ledger_missing": hint_ledger_missing,
             "unapplied_answer_count": current_answer_count if answers_current else 0,
             "integrity_valid": ok,
             "generation_mismatch": generation_mismatch,
@@ -459,6 +510,22 @@ def inspect_workflow(
                     "allocation",
                     "The recorded project context disappeared or is invalid. Rewrite the canonical context "
                     "internally before rerunning allocation.",
+                    missing=[f"canonical project context: {context_reason}"],
+                ))
+        elif hint_ledger_missing:
+            if context_ok:
+                set_next(next_step(
+                    "command",
+                    "allocation",
+                    "User expense hints exist but the reverse reconciliation ledger is missing; regenerate Stage 2.",
+                    operation="allocate",
+                    parameters={"context": str(context_path)},
+                ))
+            else:
+                set_next(next_step(
+                    "blocked",
+                    "allocation",
+                    "The expense-record ledger is missing and project context is unavailable; restore the canonical context first.",
                     missing=[f"canonical project context: {context_reason}"],
                 ))
         elif answers_current:
@@ -531,6 +598,11 @@ def inspect_workflow(
             preview_open_questions = int(rows.get("open_allocation_questions", 0) or 0)
         except (TypeError, ValueError):
             preview_open_questions = 1
+        hint_ledger_present = "expense_hint_reconciliation" in rows
+        try:
+            unresolved_hint_count = int(rows.get("unresolved_expense_hint_count", -1))
+        except (TypeError, ValueError):
+            unresolved_hint_count = -1
         preview = bool(rows.get("generated_with_allow_unconfirmed")) or preview_open_questions > 0
         stale = bool(alloc_fp) and rows_fp != alloc_fp
         upstream_unavailable = not stage2_ready
@@ -553,12 +625,16 @@ def inspect_workflow(
             state = "✗ 上游 allocation 未就绪"
         elif not workbook_sha:
             state = "✗ 缺少工作簿哈希，不能验证或打包"
+        elif not hint_ledger_present or unresolved_hint_count < 0:
+            state = "✗ 缺少用户费用记录完整性台账，需重跑 Stage 3"
         elif stale:
             state = "✗ 已过期（allocation 在其生成后被修改）"
         elif preview:
             state = "✗ 预览件越过了开放关卡，不能交付"
         elif blocking:
             state = "… 有阻断的政策检查"
+        elif unresolved_hint_count:
+            state = f"… 有 {unresolved_hint_count} 条用户费用记录尚未对应凭证/明确排除"
         elif not workbook_exists:
             state = "✗ 记录中的工作簿不存在"
         elif workbook_mismatch:
@@ -569,9 +645,9 @@ def inspect_workflow(
         lines.append(f"Stage 3 报销表: {state}，行数 {len(rows.get('rows', []))}，未决餐费/酒店检查 {blocking} 个")
         if rows_ready:
             stage3_status = "ready"
-        elif not rows_ok or upstream_unavailable or not workbook_sha or stale or preview:
+        elif not rows_ok or upstream_unavailable or not workbook_sha or not hint_ledger_present or unresolved_hint_count < 0 or stale or preview:
             stage3_status = "blocked"
-        elif blocking:
+        elif blocking or unresolved_hint_count:
             stage3_status = "needs_user"
         else:
             stage3_status = "blocked"
@@ -580,6 +656,8 @@ def inspect_workflow(
             "status": stage3_status,
             "row_count": len(rows.get("rows", [])),
             "blocking_policy_check_count": blocking,
+            "unresolved_expense_hint_count": max(unresolved_hint_count, 0),
+            "expense_hint_ledger_present": hint_ledger_present,
             "preview": preview,
             "integrity_valid": rows_ok,
             "allocation_stale": stale,
@@ -611,7 +689,7 @@ def inspect_workflow(
                 "workbook",
                 "The upstream allocation is not ready; resolve the earlier stage before regenerating Stage 3.",
             ))
-        elif not workbook_sha or stale or preview or not workbook_exists or workbook_mismatch:
+        elif not workbook_sha or not hint_ledger_present or unresolved_hint_count < 0 or stale or preview or not workbook_exists or workbook_mismatch:
             requester = str(rows.get("requester", ""))
             write_parameters = {"requester": requester, "output": recorded_workbook}
             missing_write_source: list[str] = []
@@ -637,7 +715,7 @@ def inspect_workflow(
                     operation="write",
                     missing=["requester", "workbook output path", *missing_write_source],
                 ))
-        elif blocking:
+        elif blocking or unresolved_hint_count:
             if answers_current:
                 set_next(next_step(
                     "command",
@@ -657,8 +735,12 @@ def inspect_workflow(
                 ))
 
     # Stage 4: require a current, stamped manifest and every listed package file.
-    candidates = sorted(p for p in root.glob("**/*.xlsx")) if root.exists() else []
+    candidates = sorted(
+        path for path in root.glob("**/*.xlsx")
+        if not is_hidden_package_artifact(path, root)
+    ) if root.exists() else []
     expected_sha = str((rows or {}).get("workbook_sha256", ""))
+    expected_hint_count = len((rows or {}).get("expense_hint_reconciliation", []))
     verified = None
     incomplete: tuple[Path, str] | None = None
     orphan: Path | None = None
@@ -674,7 +756,13 @@ def inspect_workflow(
             if manifest_path.exists() and mf is None:
                 incomplete = (c, "manifest integrity failed: manifest JSON cannot be parsed")
             elif mf is not None:
-                ok, reason = validate_package_manifest(mf, c, expected_sha, rows_fingerprint)
+                ok, reason = validate_package_manifest(
+                    mf,
+                    c,
+                    expected_sha,
+                    rows_fingerprint,
+                    expected_hint_count,
+                )
                 if ok:
                     verified = c
                     break

@@ -113,14 +113,17 @@ When the user provides concrete meal or expense notes, translate them into struc
   ],
   "expense_hints": [
     {
-      "source_category": "meal",
+      "source_category": "other",
       "date": "YYYY-MM-DD",
-      "amount": "117.00",
-      "attendees": "姚"
+      "amount": "299.00",
+      "merchant": "腾讯会议",
+      "description": "项目线上会议服务费"
     }
   ]
 }
 ```
+
+One concrete applicant record belongs in exactly one array: use `meal_hints` for meals and `expense_hints` for other categories. Never copy the same meal into both arrays. For backward compatibility, Stage 2 deduplicates a legacy `meal_hints` + `expense_hints` pair only when context, category, date, amount, and any supplied merchant evidence identify one unambiguous cross-array duplicate; conflicting merchants remain separate. It does not deduplicate two same-array records because two real expenses may share a date and amount.
 
 The allocation script scores these hints against extracted units using amount, date, merchant text, and optional city. Treat these fields as evidence, not strict filters:
 
@@ -128,6 +131,8 @@ The allocation script scores these hints against extracted units using amount, d
 - Merchant can be brand/store text supplied by the applicant even when the invoice seller is a franchisee, platform merchant, or individual business.
 - Date is the actual meal/expense date from the applicant's note. For ordinary meal invoices, invoice issue date is only weak evidence and must not replace the actual meal date.
 - Auto-apply a hint only when one extracted unit is the unique high-confidence match. If several units have similar evidence, show the candidates in the chat and ask the user to confirm by item number.
+- Reconcile in the reverse direction too. Every distinct hint becomes one `expense_hint_reconciliation` record. Group unresolved records by expense type in chat, label each `R1`, `R2`, and so on, and show the original record plus any candidates. Require an explicit answer for every displayed R token: matched item, combined-invoice coverage, later invoice supplementation, or not reimbursed. An empty or partial grouped answer cannot close this gate.
+- If a matched allocation unit is later dropped/excluded/non-reimbursable, reopen the related hint gate. Deleting a row must not silently delete the applicant's original expected-expense record.
 
 Use hints to preserve attendee details even when a meal does not exceed the cap.
 
@@ -305,6 +310,8 @@ Carry these fields when known:
 - `shared_room`
 - `room_shared_with`
 - `room_share_note`
+
+For hotel units, `city` and `hotel_city` describe the same policy city. The updater mirrors either field into the other when only one is supplied and rejects conflicting values. Correct the city once; do not repeat the same applicant answer under a second field name just to make hotel-cap logic see it.
 
 If the user says only the cap amount should be reimbursed, keep `amount` / `invoice_amount` as the invoice amount and write the amount to claim in `reimbursable_amount`.
 
@@ -589,6 +596,22 @@ The root action arrays are also supported:
 - `question_updates`: explicit question status/answer updates.
 - `project_contexts`: controlled context additions/updates.
 
+For a grouped user-record completeness question, preserve every displayed R token in the answer so the updater can prove that no record was skipped:
+
+```json
+{
+  "question_updates": [
+    {
+      "question_id": "Q-HINT-001",
+      "status": "answered",
+      "answer": "R1 对应第16项；R2 由第20项汇总发票覆盖；R3 稍后补票；R4 不报销"
+    }
+  ]
+}
+```
+
+Composer/updater rejects an empty answer or one that omits any R token required by that grouped question.
+
 Run Composer, then apply only its published output:
 
 ```bash
@@ -655,6 +678,24 @@ Write `process/expense-allocation.json`:
   "generated_at": "YYYY-MM-DDTHH:mm:ss",
   "source_extraction_file": "process/invoice-extraction.json",
   "project_contexts": [],
+  "expense_hint_reconciliation": [
+    {
+      "hint_id": "CTX-001:meal_hints:1",
+      "source_fields": ["meal_hints"],
+      "project_context_id": "CTX-001",
+      "client_name": "",
+      "client_charge_code": "",
+      "source_category": "meal",
+      "summary": "2026-06-01 德克士 RMB 61.80",
+      "match_status": "matched|ambiguous|unmatched|matched_unit_closed",
+      "resolution_status": "not_required|open|resolved",
+      "matched_unit_ids": [],
+      "matched_user_nos": [],
+      "candidate_units": [],
+      "question_id": "",
+      "resolution_answer": ""
+    }
+  ],
   "allocation_units": [
     {
       "unit_id": "UNIT-001",
@@ -755,6 +796,7 @@ Stage 2 is complete when:
 - The user-provided project context has been structured and confirmed enough to allocate expenses.
 - Every allocation unit has a project assignment, fixed admin assignment, or open question.
 - Every included allocation unit has a reliable `expense_date`, a pure-`other` provisional invoice-date `expense_date` with an advisory review item, or a blocking open question asking the applicant for the actual date to record.
+- Every distinct applicant hint is represented once in `expense_hint_reconciliation` and is either uniquely matched to an active unit or explicitly resolved with a non-empty answer.
 - Meals have actual date/project/attendee details when needed.
 - `CORP-2026-BD` collisions are separated by client/city/date context.
 - Substitute invoices are marked and screenshot requirements are recorded.

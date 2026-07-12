@@ -148,7 +148,7 @@ def configure_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             try:
-                stream.reconfigure(errors="replace")
+                stream.reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
 
@@ -705,8 +705,22 @@ def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: boo
     if errors:
         raise ValueError("; ".join(errors))
 
-    before = {field: unit.get(field) for field in ALLOWED_UNIT_FIELDS if field in update}
-    for field, value in update.items():
+    effective_update = dict(update)
+    if clean(unit.get("source_category")) == "hotel" or clean(update.get("source_category")) == "hotel":
+        updated_city = clean(update.get("city")) if "city" in update else ""
+        updated_hotel_city = clean(update.get("hotel_city")) if "hotel_city" in update else ""
+        if updated_city and updated_hotel_city and updated_city != updated_hotel_city:
+            raise ValueError(
+                f"{unit.get('unit_id')} hotel city conflict: city={updated_city!r} but "
+                f"hotel_city={updated_hotel_city!r}; provide one consistent city."
+            )
+        if "city" in update and "hotel_city" not in update:
+            effective_update["hotel_city"] = update.get("city")
+        elif "hotel_city" in update and "city" not in update:
+            effective_update["city"] = update.get("hotel_city")
+
+    before = {field: unit.get(field) for field in ALLOWED_UNIT_FIELDS if field in effective_update}
+    for field, value in effective_update.items():
         if field in META_FIELDS:
             continue
         if field not in ALLOWED_UNIT_FIELDS:
@@ -750,7 +764,7 @@ def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: boo
     if accounting_errors:
         raise ValueError(f"{unit.get('unit_id')} accounting conflict: " + "; ".join(accounting_errors))
 
-    after = {field: unit.get(field) for field in ALLOWED_UNIT_FIELDS if field in update}
+    after = {field: unit.get(field) for field in ALLOWED_UNIT_FIELDS if field in effective_update}
     changed_fields = [
         field for field in after
         if before.get(field) != after.get(field) and field not in CORRECTION_META_FIELDS
@@ -794,14 +808,48 @@ def merge_contexts(payload: dict[str, Any], context_updates: list[dict[str, Any]
 
 def apply_question_updates(payload: dict[str, Any], updates: list[dict[str, Any]]) -> None:
     questions = {q.get("question_id"): q for q in payload.get("questions", [])}
+    hint_records: dict[str, list[dict[str, Any]]] = {}
+    for item in payload.get("expense_hint_reconciliation", []):
+        if item.get("question_id"):
+            hint_records.setdefault(item["question_id"], []).append(item)
     for update in updates:
         question_id = update.get("question_id")
         if question_id not in questions:
             continue
         question = questions[question_id]
-        question["status"] = update.get("status", "answered")
+        status = update.get("status", "answered")
+        answer = clean(update.get("answer"))
+        if (
+            question.get("requires_explicit_answer")
+            and status not in OPEN_STATUSES
+            and not answer
+        ):
+            raise ValueError(
+                f"{question_id} is an expense-record completeness decision and cannot be closed "
+                "without an explicit answer (matched item, merged invoice, will supplement, or not reimbursed)."
+            )
+        if question.get("requires_explicit_answer") and status not in OPEN_STATUSES:
+            answer_lower = answer.lower()
+            missing_tokens = [
+                clean(token)
+                for token in question.get("required_answer_tokens", [])
+                if clean(token) and clean(token).lower() not in answer_lower
+            ]
+            if missing_tokens:
+                raise ValueError(
+                    f"{question_id} is a grouped expense-record completeness decision. The answer must "
+                    "explicitly address every displayed record token: " + ", ".join(missing_tokens)
+                )
+        question["status"] = status
         if "answer" in update:
             question["answer"] = update["answer"]
+        for record in hint_records.get(question_id, []):
+            if status in OPEN_STATUSES:
+                record["resolution_status"] = "open"
+                record["resolution_answer"] = ""
+            else:
+                record["resolution_status"] = "resolved"
+                record["resolution_answer"] = answer
 
 
 def close_answered_questions(payload: dict[str, Any], touched_units: set[str]) -> None:
@@ -812,11 +860,65 @@ def close_answered_questions(payload: dict[str, Any], touched_units: set[str]) -
     for question in payload.get("questions", []):
         if question.get("status", "open") not in OPEN_STATUSES:
             continue
+        if question.get("requires_explicit_answer"):
+            continue
         unit_ids = set(question.get("unit_ids", []))
         if not unit_ids or not unit_ids.intersection(touched_units):
             continue
         if all(unit_status.get(unit_id) in CLOSED_UNIT_STATUSES for unit_id in unit_ids):
             question["status"] = "answered"
+
+
+def refresh_expense_hint_reconciliation(payload: dict[str, Any], touched_units: set[str]) -> None:
+    if not touched_units:
+        return
+    units = {
+        clean(unit.get("unit_id")): unit
+        for unit in payload.get("allocation_units", [])
+        if clean(unit.get("unit_id"))
+    }
+    questions = payload.setdefault("questions", [])
+    known_question_ids = {clean(question.get("question_id")) for question in questions}
+    reopen_index = 1
+    for record in payload.get("expense_hint_reconciliation", []):
+        matched_ids = {clean(value) for value in record.get("matched_unit_ids", []) if clean(value)}
+        if not matched_ids.intersection(touched_units):
+            continue
+        if record.get("resolution_status") == "resolved":
+            continue
+        active_ids = [
+            unit_id for unit_id in matched_ids
+            if unit_id in units and clean(units[unit_id].get("status")) not in {
+                "dropped", "excluded", "non_reimbursable"
+            }
+        ]
+        if active_ids:
+            continue
+        while f"Q-HINT-REOPEN-{reopen_index:03d}" in known_question_ids:
+            reopen_index += 1
+        question_id = f"Q-HINT-REOPEN-{reopen_index:03d}"
+        reopen_index += 1
+        known_question_ids.add(question_id)
+        record["match_status"] = "matched_unit_closed"
+        record["resolution_status"] = "open"
+        record["question_id"] = question_id
+        record["resolution_answer"] = ""
+        questions.append({
+            "question_id": question_id,
+            "question_type": "expense_hint_reconciliation",
+            "hint_id": record.get("hint_id", ""),
+            "unit_ids": sorted(matched_ids),
+            "user_nos": record.get("matched_user_nos", []),
+            "question": (
+                f"用户费用记录「{record.get('summary') or record.get('hint_id')}」原来对应的费用项已被 "
+                "drop/exclude，完整性对应关系失效。请明确它改为对应哪一项、是否会补票/被其他发票合并覆盖，"
+                "或确认这条记录本身不报销。"
+            ),
+            "why_it_matters": "删除费用项不能顺带静默删除用户原始费用记录，必须留下明确决定。",
+            "status": "open",
+            "blocking": True,
+            "requires_explicit_answer": True,
+        })
 
 
 def current_rail_chain_route(chain_units: list[dict[str, Any]]) -> str:
@@ -971,6 +1073,21 @@ def build_markdown(payload: dict[str, Any]) -> str:
             f"{unit.get('client_name','')} | {unit.get('client_charge_code','')} | {unit.get('final_template_column','')} | "
             f"{unit.get('confidence','')} | {unit.get('status','')} |"
         )
+    hint_records = payload.get("expense_hint_reconciliation", [])
+    if hint_records:
+        lines += [
+            "",
+            "## User Expense Record Reconciliation",
+            "",
+            "| Hint | Record | Match | Resolution | Answer |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+        for record in hint_records:
+            lines.append(
+                f"| {record.get('hint_id', '')} | {record.get('summary', '')} | "
+                f"{record.get('match_status', '')} | {record.get('resolution_status', '')} | "
+                f"{record.get('resolution_answer', '')} |"
+            )
     lines += [
         "",
         "## Questions For User",
@@ -1072,6 +1189,7 @@ def apply_answers(
             touched_units.add(unit["unit_id"])
 
     refresh_rail_chain_assignments(payload, touched_units)
+    refresh_expense_hint_reconciliation(payload, touched_units)
     for unit in payload.get("allocation_units", []):
         normalize_admin_client(unit)
 
@@ -1086,6 +1204,7 @@ def apply_answers(
             "project_contexts": text_safety.pick_fields(
                 payload.get("project_contexts", []), ENCODING_CHECK_CONTEXT_FIELDS
             ),
+            "expense_hint_reconciliation": payload.get("expense_hint_reconciliation", []),
         },
         path="allocation",
     )

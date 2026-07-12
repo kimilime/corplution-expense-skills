@@ -242,6 +242,8 @@ Create `document_links` for:
 - `duplicate_source_file`
 - `possible_duplicate_invoice_no`
 
+Both exact SHA-256 duplicates and repeated invoice numbers are Stage 1 review decisions. Keep the canonical source document and use `apply_extraction_corrections.py` with `action: exclude`, the duplicate document SHA-256, and the applicant's reason for the copy that should not proceed. Do not defer this to Stage 2 or drop an allocation unit: that would close a reimbursement row without resolving the source-evidence ledger.
+
 For Didi/Gaode, link summary invoice and trip report when total amounts match. Generate later reimbursement rows from the trip items, not from the summary invoice, when a matching trip report exists.
 
 ## Completion Criteria
@@ -250,6 +252,7 @@ Stage 1 is complete only when:
 
 - Every input file appears either in the document index or in `unresolved_input_files`.
 - No `unresolved_input_files` entry remains `open`; the user has recorded an exclusion reason or a readable replacement file.
+- No exact-file or invoice-number duplicate remains `needs_review`; the duplicate copy has an explicit Stage 1 keep/exclude decision.
 - Every invoice-like file has extracted fields or review issues.
 - Every Didi/Gaode trip report has parsed trip items and a reported total when available.
 - Didi/Gaode summary invoices are linked to matching trip reports when possible.

@@ -30,6 +30,15 @@ SYSTEM_TOOLS = {
 }
 
 
+def configure_stdio() -> None:
+    for stream in (sys.stdout, sys.stderr):
+        if hasattr(stream, "reconfigure"):
+            try:
+                stream.reconfigure(encoding="utf-8", errors="replace")
+            except Exception:
+                pass
+
+
 def requirements_path() -> Path:
     return Path(__file__).resolve().parents[1] / "requirements.txt"
 
@@ -62,6 +71,7 @@ def install_requirements(requirements: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_stdio()
     parser = argparse.ArgumentParser(description="Check Corplution reimbursement skill dependencies.")
     parser.add_argument("--install", action="store_true", help="Install missing Python dependencies from requirements.txt.")
     parser.add_argument("--strict-ocr", action="store_true", help="Fail if OCR system tools are missing.")

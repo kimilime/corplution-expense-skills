@@ -235,7 +235,7 @@ def configure_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             try:
-                stream.reconfigure(errors="replace")
+                stream.reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
 
@@ -824,10 +824,69 @@ def travel_destination_context(unit: dict[str, Any], contexts: list[dict[str, An
     return None
 
 
+def expense_hint_reconciliation_errors(allocation: dict[str, Any]) -> list[str]:
+    contexts_have_hints = any(
+        context.get(field)
+        for context in allocation.get("project_contexts", [])
+        for field in ("meal_hints", "expense_hints")
+    )
+    if "expense_hint_reconciliation" not in allocation:
+        if contexts_have_hints:
+            return [
+                "User expense hints exist but the reverse reconciliation ledger is missing; rerun Stage 2."
+            ]
+        return []
+    records = allocation.get("expense_hint_reconciliation")
+    if not isinstance(records, list):
+        return ["User expense hint reconciliation must be a list; rerun Stage 2."]
+
+    units_by_id = {
+        clean(unit.get("unit_id")): unit
+        for unit in allocation.get("allocation_units", [])
+        if clean(unit.get("unit_id"))
+    }
+    errors: list[str] = []
+    for record in records:
+        hint_id = clean(record.get("hint_id")) or "<unknown hint>"
+        resolution_status = clean(record.get("resolution_status"))
+        match_status = clean(record.get("match_status"))
+        if resolution_status not in {"not_required", "open", "resolved"}:
+            errors.append(
+                f"User expense record {hint_id} has invalid resolution status {resolution_status!r}; rerun Stage 2."
+            )
+            continue
+        if resolution_status == "open":
+            errors.append(
+                f"User expense record {hint_id} ({record.get('summary', '')}) has no unique invoice match or explicit resolution."
+            )
+            continue
+        if resolution_status == "resolved" and not clean(record.get("resolution_answer")):
+            errors.append(f"User expense record {hint_id} was closed without an explicit resolution answer.")
+        if resolution_status == "not_required" and match_status != "matched":
+            errors.append(
+                f"User expense record {hint_id} skips explicit resolution without a unique matched unit."
+            )
+        if match_status == "matched":
+            matched_ids = [clean(value) for value in record.get("matched_unit_ids", []) if clean(value)]
+            active_matches = [
+                unit_id for unit_id in matched_ids
+                if unit_id in units_by_id
+                and clean(units_by_id[unit_id].get("status")) not in {"dropped", "excluded", "non_reimbursable"}
+            ]
+            if not matched_ids or not active_matches:
+                errors.append(
+                    f"User expense record {hint_id} points only to a missing/dropped expense unit; resolve it again."
+                )
+    return errors
+
+
 def require_ready(allocation: dict[str, Any], allow_unconfirmed: bool) -> list[str]:
     errors: list[str] = []
     contexts = allocation.get("project_contexts", [])
     errors.extend(rail_chain_ready_errors(allocation.get("allocation_units", [])))
+    hint_errors = expense_hint_reconciliation_errors(allocation)
+    if hint_errors and not allow_unconfirmed:
+        errors.extend(hint_errors)
     open_questions = [q for q in allocation.get("questions", []) if q.get("status", "open") == "open"]
     if open_questions and not allow_unconfirmed:
         errors.append(f"{len(open_questions)} open allocation question(s) remain.")
@@ -1039,6 +1098,7 @@ def make_rows(units: list[dict[str, Any]], requester: str) -> list[dict[str, Any
             "date_is_provisional": unit.get("date_is_provisional", False),
             "date_required": unit.get("date_required", False),
             "seller_name": unit.get("seller_name", ""),
+            "city": unit.get("city", ""),
             "attendees": unit.get("attendees", ""),
             "meal_context": unit.get("meal_context", ""),
             "train_no": unit.get("train_no", ""),
@@ -1056,7 +1116,7 @@ def make_rows(units: list[dict[str, Any]], requester: str) -> list[dict[str, Any
             "journey_chain_match_reason": unit.get("journey_chain_match_reason", ""),
             "journey_chain_project_context_id": unit.get("journey_chain_project_context_id", ""),
             "journey_chain_needs_confirmation": bool(unit.get("journey_chain_needs_confirmation")),
-            "hotel_city": unit.get("hotel_city", ""),
+            "hotel_city": unit.get("hotel_city") or unit.get("city", ""),
             "hotel_city_tier": unit.get("hotel_city_tier", ""),
             "hotel_nights": unit.get("hotel_nights", ""),
             "check_in_date": unit.get("check_in_date", ""),
@@ -1854,6 +1914,22 @@ def build_markdown(payload: dict[str, Any], workbook: Path) -> str:
                 f"{chain.get('route', '')} | {chain.get('client_name', '')} | {chain.get('client_charge_code', '')} | "
                 f"{chain.get('assignment_rule', '')} | {chain.get('needs_confirmation', False)} |"
             )
+    hint_records = payload.get("expense_hint_reconciliation", [])
+    if hint_records:
+        lines += [
+            "",
+            "## User Expense Record Reconciliation",
+            "",
+            "| Hint | Record | Match | Resolution | Matched Items | Answer |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+        for record in hint_records:
+            lines.append(
+                f"| {record.get('hint_id', '')} | {record.get('summary', '')} | "
+                f"{record.get('match_status', '')} | {record.get('resolution_status', '')} | "
+                f"{', '.join(str(value) for value in record.get('matched_user_nos', []))} | "
+                f"{record.get('resolution_answer', '')} |"
+            )
     meal_rule = payload.get("meal_policy_rule", {})
     lines += [
         "",
@@ -2118,6 +2194,12 @@ def main(argv: list[str] | None = None) -> int:
         "proof_groups": [{k: v for k, v in group.items() if k != "units"} for group in proof_groups],
         "rows": rows,
         "rail_journey_chains": rail_chain_summaries(units),
+        "expense_hint_reconciliation": allocation.get("expense_hint_reconciliation", []),
+        "unresolved_expense_hint_count": sum(
+            1
+            for record in allocation.get("expense_hint_reconciliation", [])
+            if record.get("resolution_status") not in {"not_required", "resolved"}
+        ),
         "project_blocks": project_blocks,
         "summary_rows": summary_rows,
         "meal_policy_rule": meal_policy_rule(),

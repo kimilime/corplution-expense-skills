@@ -73,9 +73,11 @@ def snapshot_artifacts(process_dir: str | Path, output_root: str | Path) -> dict
         ("allocation", pdir / "expense-allocation.json", {
             "allocation_units": "unit_count",
             "questions": "question_count",
+            "expense_hint_reconciliation": "expense_hint_record_count",
         }),
         ("final_rows", pdir / "final-expense-rows.json", {
             "rows": "row_count",
+            "expense_hint_reconciliation": "expense_hint_record_count",
         }),
     ]
     for name, path, count_fields in specs:
@@ -94,7 +96,10 @@ def snapshot_artifacts(process_dir: str | Path, output_root: str | Path) -> dict
         snapshot["workbook"] = workbook_record
 
     manifests = sorted(
-        root.glob("**/package-manifest.json"),
+        (
+            path for path in root.glob("**/package-manifest.json")
+            if not any(part.startswith(".") for part in path.relative_to(root).parts[:-1])
+        ),
         key=lambda item: item.stat().st_mtime_ns,
     ) if root.exists() else []
     if manifests:
@@ -162,4 +167,3 @@ def record_event(path: str | Path, **kwargs: Any) -> str | None:
     except Exception as exc:  # Logging must never override a stage result.
         return f"workflow journal write failed: {exc}"
     return None
-

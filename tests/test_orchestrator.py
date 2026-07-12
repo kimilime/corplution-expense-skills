@@ -92,6 +92,8 @@ class WorkflowFixture:
             "blocking_policy_checks": blocking,
             "generated_with_allow_unconfirmed": preview,
             "open_allocation_questions": 1 if preview else 0,
+            "expense_hint_reconciliation": [],
+            "unresolved_expense_hint_count": 0,
             "rows": [],
         }
         return self.write_stamped("final-expense-rows.json", payload, "test"), workbook
@@ -308,6 +310,7 @@ class WorkflowStateTests(unittest.TestCase):
             "issues": [],
             "invoice_count": 0,
             "support_count": 0,
+            "expense_hint_reconciliation_count": 0,
             "invoice_files": [],
             "support_files": [],
         }
@@ -319,6 +322,37 @@ class WorkflowStateTests(unittest.TestCase):
         state = self.inspect()
         self.assertTrue(state["complete"])
         self.assertEqual("complete", state["next"]["kind"])
+
+    def test_hidden_staging_package_is_not_treated_as_deliverable(self) -> None:
+        extraction = self.fixture.extraction()
+        allocation = self.fixture.allocation(extraction)
+        rows, workbook = self.fixture.final_rows(allocation)
+        staging = self.fixture.output / ".package.staging-test"
+        staging.mkdir(parents=True)
+        staged_workbook = staging / "reimbursement.xlsx"
+        shutil.copy2(workbook, staged_workbook)
+        manifest = {
+            "schema_version": "reimbursement_package_manifest.v1",
+            "package_root": str(staging),
+            "workbook": staged_workbook.name,
+            "workbook_sha256": rows["workbook_sha256"],
+            "final_rows_fingerprint": rows["integrity"]["fingerprint"],
+            "issues": [],
+            "invoice_count": 0,
+            "support_count": 0,
+            "expense_hint_reconciliation_count": 0,
+            "invoice_files": [],
+            "support_files": [],
+        }
+        integrity.stamp(manifest, "test")
+        (staging / "package-manifest.json").write_text(
+            json.dumps(manifest, ensure_ascii=False),
+            encoding="utf-8",
+        )
+
+        state = self.inspect()
+        self.assertFalse(state["complete"])
+        self.assertEqual("package", state["next"]["operation"])
 
     def test_tampered_package_manifest_sets_integrity_block(self) -> None:
         extraction = self.fixture.extraction()
@@ -338,6 +372,7 @@ class WorkflowStateTests(unittest.TestCase):
             "issues": [],
             "invoice_count": 0,
             "support_count": 0,
+            "expense_hint_reconciliation_count": 0,
             "invoice_files": [],
             "support_files": [],
         }
@@ -360,8 +395,22 @@ class WorkflowStateTests(unittest.TestCase):
             "--process-dir", str(self.fixture.process),
             "--output-root", str(self.fixture.output),
         ]
-        status = subprocess.run([*common, "status", "--json"], capture_output=True, text=True, check=True)
-        next_result = subprocess.run([*common, "next", "--json"], capture_output=True, text=True, check=True)
+        status = subprocess.run(
+            [*common, "status", "--json"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
+        next_result = subprocess.run(
+            [*common, "next", "--json"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
         self.assertEqual(json.loads(status.stdout)["next"], json.loads(next_result.stdout))
 
 
@@ -431,7 +480,7 @@ class JournalTests(unittest.TestCase):
             "--process-dir", str(self.process),
             "--output-root", str(self.output),
             "run", "compose",
-        ], capture_output=True, text=True)
+        ], capture_output=True, text=True, encoding="utf-8", errors="replace")
         self.assertEqual(2, result.returncode)
         journal = self.process / "workflow-journal.jsonl"
         entries = [json.loads(line) for line in journal.read_text(encoding="utf-8").splitlines()]

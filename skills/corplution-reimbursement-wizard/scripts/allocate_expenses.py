@@ -87,7 +87,7 @@ def configure_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             try:
-                stream.reconfigure(errors="replace")
+                stream.reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
 
@@ -1636,9 +1636,37 @@ def decimal_amount(value: Any) -> Decimal | None:
         return None
 
 
+def cross_field_hint_key(hint: dict[str, Any]) -> tuple[str, str, str, str, str] | None:
+    category = clean(hint.get("source_category") or hint.get("category"))
+    date_value = date_hint_value(hint)
+    amount = money(hint.get("amount") or hint.get("recorded_amount"))
+    unit_no = clean(hint.get("unit_no") or hint.get("user_no"))
+    invoice_no = clean(hint.get("invoice_no"))
+    if unit_no or invoice_no:
+        return category, date_value, amount, unit_no, invoice_no
+    if date_value and amount:
+        return category, date_value, amount, "", ""
+    return None
+
+
+def cross_field_hint_merchants_compatible(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    first_terms = [compact_merchant_text(term) for term in merchant_terms(first)]
+    second_terms = [compact_merchant_text(term) for term in merchant_terms(second)]
+    first_terms = [term for term in first_terms if term]
+    second_terms = [term for term in second_terms if term]
+    if not first_terms or not second_terms:
+        return True
+    return any(
+        first_term == second_term or first_term in second_term or second_term in first_term
+        for first_term in first_terms
+        for second_term in second_terms
+    )
+
+
 def expense_hints_from_contexts(contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     hints: list[dict[str, Any]] = []
     for ctx in contexts:
+        context_hints: list[dict[str, Any]] = []
         for field, default_category in [("meal_hints", "meal"), ("expense_hints", "")]:
             for index, raw_hint in enumerate(list_value(ctx.get(field)), start=1):
                 if not isinstance(raw_hint, dict):
@@ -1651,7 +1679,29 @@ def expense_hints_from_contexts(contexts: list[dict[str, Any]]) -> list[dict[str
                 hint.setdefault("client_name", ctx.get("client_name", ""))
                 hint.setdefault("client_charge_code", ctx.get("client_charge_code", ""))
                 hint.setdefault("city", ctx.get("city", ""))
-                hints.append(hint)
+                hint.setdefault("_source_field", field)
+                hint.setdefault("_source_index", index)
+                hint.setdefault("_source_fields", [field])
+                if field == "expense_hints":
+                    dedupe_key = cross_field_hint_key(hint)
+                    matches = [
+                        existing for existing in context_hints
+                        if existing.get("_source_field") == "meal_hints"
+                        and dedupe_key is not None
+                        and cross_field_hint_key(existing) == dedupe_key
+                        and cross_field_hint_merchants_compatible(existing, hint)
+                    ]
+                    if len(matches) == 1:
+                        existing = matches[0]
+                        for key, value in hint.items():
+                            if key.startswith("_"):
+                                continue
+                            if not existing.get(key) and value not in (None, "", []):
+                                existing[key] = value
+                        existing["_source_fields"] = ["meal_hints", "expense_hints"]
+                        continue
+                context_hints.append(hint)
+        hints.extend(context_hints)
     return hints
 
 
@@ -1824,6 +1874,14 @@ def hint_summary(hint: dict[str, Any]) -> str:
     attendees = list_text(hint.get("attendees"))
     if attendees:
         parts.append(f"with {attendees}")
+    description = clean(
+        hint.get("description")
+        or hint.get("note")
+        or hint.get("purpose")
+        or hint.get("business_reason")
+    )
+    if description:
+        parts.append(description)
     return " ".join(parts) or clean(hint.get("hint_id")) or "user expense hint"
 
 
@@ -1872,6 +1930,10 @@ def apply_hint_to_unit(unit: dict[str, Any], hint: dict[str, Any], score: int, r
     unit["hint_match_score"] = score
     unit["hint_match_summary"] = hint_summary(hint)
     unit["hint_match_reasons"] = reasons[:6]
+    matched_hint_ids = unit.setdefault("matched_expense_hint_ids", [])
+    hint_id = clean(hint.get("hint_id"))
+    if hint_id and hint_id not in matched_hint_ids:
+        matched_hint_ids.append(hint_id)
     if unit.get("client_charge_code") and (unit.get("expense_date") or clean(unit.get("source_category")) != "meal"):
         unit["confidence"] = "high"
         unit["status"] = "confirmed"
@@ -1895,12 +1957,55 @@ def scored_hint_candidates(
     return candidates
 
 
-def apply_expense_hints(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -> None:
+def hint_candidate_record(
+    score: int,
+    unit: dict[str, Any],
+    reasons: list[str],
+) -> dict[str, Any]:
+    return {
+        "unit_id": clean(unit.get("unit_id")),
+        "user_no": unit_user_no(unit),
+        "source_filename": clean(unit.get("source_filename") or unit.get("supporting_invoice_filename")),
+        "seller_name": clean(unit.get("seller_name")),
+        "amount": clean(unit.get("amount")),
+        "score": score,
+        "reasons": reasons[:4],
+    }
+
+
+def hint_reconciliation_record(hint: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "hint_id": clean(hint.get("hint_id")),
+        "source_field": clean(hint.get("_source_field")),
+        "source_fields": list_value(hint.get("_source_fields")),
+        "source_index": hint.get("_source_index", ""),
+        "project_context_id": clean(hint.get("project_context_id")),
+        "client_name": clean(hint.get("client_name")),
+        "client_charge_code": clean(hint.get("client_charge_code")),
+        "source_category": clean(hint.get("source_category") or hint.get("category")),
+        "summary": hint_summary(hint),
+        "match_status": "unmatched",
+        "resolution_status": "open",
+        "matched_unit_ids": [],
+        "matched_user_nos": [],
+        "candidate_units": [],
+        "question_id": "",
+        "resolution_answer": "",
+    }
+
+
+def apply_expense_hints(
+    units: list[dict[str, Any]],
+    contexts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     hints = expense_hints_from_contexts(contexts)
     if not hints:
-        return
+        return []
+    reconciliation = [hint_reconciliation_record(hint) for hint in hints]
+    records = {id(hint): record for hint, record in zip(hints, reconciliation)}
     for unit in units:
         unit.pop("hint_candidates", None)
+        unit.pop("matched_expense_hint_ids", None)
     assigned_units: set[str] = set()
     pending = list(hints)
     while pending:
@@ -1909,6 +2014,7 @@ def apply_expense_hints(units: list[dict[str, Any]], contexts: list[dict[str, An
         for hint in pending:
             candidates = scored_hint_candidates(hint, units, assigned_units)
             if not candidates:
+                next_pending.append(hint)
                 continue
             top_score = candidates[0][0]
             top = [item for item in candidates if item[0] == top_score]
@@ -1916,6 +2022,12 @@ def apply_expense_hints(units: list[dict[str, Any]], contexts: list[dict[str, An
                 _, unit, reasons, _ = top[0]
                 apply_hint_to_unit(unit, hint, top_score, reasons)
                 assigned_units.add(unit["unit_id"])
+                record = records[id(hint)]
+                record["match_status"] = "matched"
+                record["resolution_status"] = "not_required"
+                record["matched_unit_ids"] = [clean(unit.get("unit_id"))]
+                record["matched_user_nos"] = [unit_user_no(unit)]
+                record["candidate_units"] = [hint_candidate_record(top_score, unit, reasons)]
                 changed = True
             else:
                 next_pending.append(hint)
@@ -1924,13 +2036,28 @@ def apply_expense_hints(units: list[dict[str, Any]], contexts: list[dict[str, An
             break
         pending = next_pending
     for hint in pending:
-        for score, unit, reasons, _ in scored_hint_candidates(hint, units, assigned_units)[:3]:
+        candidates = scored_hint_candidates(hint, units, assigned_units)[:3]
+        record = records[id(hint)]
+        record["match_status"] = "ambiguous" if candidates else "unmatched"
+        record["candidate_units"] = [
+            hint_candidate_record(score, unit, reasons)
+            for score, unit, reasons, _ in candidates
+        ]
+        for score, unit, reasons, _ in candidates:
             add_hint_candidate(unit, hint, score, reasons)
+    return reconciliation
 
 
-def apply_matches(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def apply_matches(
+    units: list[dict[str, Any]],
+    contexts: list[dict[str, Any]],
+    *,
+    hint_reconciliation: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     contexts_by_id = {clean(ctx.get("context_id")): ctx for ctx in contexts if clean(ctx.get("context_id"))}
-    apply_expense_hints(units, contexts)
+    hint_records = apply_expense_hints(units, contexts)
+    if hint_reconciliation is not None:
+        hint_reconciliation.extend(hint_records)
     apply_rail_journey_chain_matches(units, contexts)
     for unit in units:
         if unit.get("source_category") == "mobile":
@@ -2452,6 +2579,69 @@ def add_auto_matched_rail_chain_review(questions: list[dict[str, Any]], units: l
     })
 
 
+def add_expense_hint_reconciliation_questions(
+    questions: list[dict[str, Any]],
+    reconciliation: list[dict[str, Any]],
+) -> None:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for record in reconciliation:
+        if record.get("resolution_status") == "open":
+            grouped.setdefault(clean(record.get("source_category")) or "unknown", []).append(record)
+    for question_index, (category, records) in enumerate(grouped.items(), start=1):
+        question_id = f"Q-HINT-{question_index:03d}"
+        record_lines: list[str] = []
+        unit_ids: list[str] = []
+        user_nos: list[Any] = []
+        required_tokens: list[str] = []
+        for record_index, record in enumerate(records, start=1):
+            display_ref = f"R{record_index}"
+            required_tokens.append(display_ref)
+            record["question_id"] = question_id
+            record["display_ref"] = display_ref
+            candidates = record.get("candidate_units") or []
+            for candidate in candidates:
+                unit_id = clean(candidate.get("unit_id"))
+                if unit_id and unit_id not in unit_ids:
+                    unit_ids.append(unit_id)
+                user_no = candidate.get("user_no", "")
+                if user_no not in user_nos:
+                    user_nos.append(user_no)
+            if candidates:
+                candidate_text = "；".join(
+                    f"第{candidate.get('user_no')}项 {candidate.get('source_filename') or '-'} "
+                    f"{candidate.get('seller_name') or ''} RMB {candidate.get('amount') or '?'} "
+                    f"(score {candidate.get('score')}: {'; '.join(candidate.get('reasons') or [])})"
+                    for candidate in candidates
+                )
+                match_text = "候选：" + candidate_text
+            else:
+                match_text = "无可信候选"
+            record_lines.append(
+                f"- {display_ref} | {record.get('summary') or record.get('hint_id')} | "
+                f"项目 {record.get('client_name') or '?'} / {record.get('client_charge_code') or '?'} | {match_text}"
+            )
+        questions.append({
+            "question_id": question_id,
+            "question_type": "expense_hint_reconciliation",
+            "hint_ids": [record.get("hint_id", "") for record in records],
+            "unit_ids": unit_ids,
+            "user_nos": user_nos,
+            "required_answer_tokens": required_tokens,
+            "question": (
+                f"你提供的以下 {category} 费用记录没有找到唯一对应发票，不能静默忽略。\n"
+                + "\n".join(record_lines)
+                + "\n请逐条保留 R 编号回复：它对应第几项/哪张发票，是否被某张汇总发票合并覆盖，"
+                "是否稍后补票，还是这条记录不报销、可以排除。"
+            ),
+            "why_it_matters": (
+                "用户费用记录是本批应有费用的完整性清单。每条记录必须与凭证对应，或留下明确的补票/合并/不报销决定。"
+            ),
+            "status": "open",
+            "blocking": True,
+            "requires_explicit_answer": True,
+        })
+
+
 def date_prompt_for_unit(unit: dict[str, Any]) -> tuple[str, str] | None:
     if not unit.get("date_required") or unit.get("expense_date") or is_mobile_admin_unit(unit):
         return None
@@ -2480,7 +2670,11 @@ def date_prompt_for_unit(unit: dict[str, Any]) -> tuple[str, str] | None:
     )
 
 
-def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_questions(
+    units: list[dict[str, Any]],
+    existing: list[dict[str, Any]],
+    hint_reconciliation: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     questions = [normalize_existing_question(q) for q in existing]
     unresolved_rail_chains = add_unresolved_rail_chain_questions(questions, units)
     for unit in units:
@@ -2608,6 +2802,7 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
                 "Admin 的 Client 列用于说明事项，不能笼统写 Admin；但事项名称缺失不是阻塞项。",
             )
     questions = group_open_questions(questions, units)
+    add_expense_hint_reconciliation_questions(questions, hint_reconciliation or [])
     add_auto_matched_meal_review(questions, units)
     add_auto_matched_rail_chain_review(questions, units)
     add_provisional_other_date_review(questions, units)
@@ -2756,6 +2951,25 @@ def build_markdown(payload: dict[str, Any]) -> str:
             f"{unit.get('client_name','')} | {unit.get('client_charge_code','')} | {unit.get('final_template_column','')} | "
             f"{unit.get('confidence','')} | {unit.get('status','')} |"
         )
+    hint_records = payload.get("expense_hint_reconciliation", [])
+    if hint_records:
+        lines += [
+            "",
+            "## User Expense Record Reconciliation",
+            "",
+            "| Hint | Record | Project | Match | Resolution | Matched/Candidate Items |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+        for record in hint_records:
+            matched = record.get("matched_user_nos") or []
+            candidates = [item.get("user_no", "") for item in record.get("candidate_units", [])]
+            numbers = matched or candidates
+            lines.append(
+                f"| {record.get('hint_id', '')} | {record.get('summary', '')} | "
+                f"{record.get('client_name', '')}/{record.get('client_charge_code', '')} | "
+                f"{record.get('match_status', '')} | {record.get('resolution_status', '')} | "
+                f"{', '.join(str(value) for value in numbers)} |"
+            )
     chains = rail_chain_groups(payload["allocation_units"])
     if chains:
         lines += [
@@ -2816,6 +3030,36 @@ def main(argv: list[str] | None = None) -> int:
               "record that decision with apply_extraction_corrections.py (input_resolutions), then re-run "
               "extract_invoices.py before allocation.", file=sys.stderr)
         return 2
+    pending_documents = [
+        document for document in extraction.get("documents", [])
+        if not document.get("excluded_by_user")
+        and (document.get("needs_review") or document.get("document_role") == "unknown")
+    ]
+    if pending_documents:
+        print(
+            "ERROR: allocation is blocked because Stage 1 still has unidentified/review-required documents:",
+            file=sys.stderr,
+        )
+        for document in pending_documents:
+            issues = document.get("issues") or []
+            duplicate = any(
+                "duplicate" in clean(issue.get("problem")).lower()
+                for issue in issues
+            )
+            suffix = " [duplicate decision required at Stage 1]" if duplicate else ""
+            print(
+                f"  - {document.get('document_id', '?')}: "
+                f"{Path(str(document.get('source_file', '?'))).name}{suffix}",
+                file=sys.stderr,
+            )
+        print(
+            "NEXT: resolve these documents with vision/OCR or apply_extraction_corrections.py. "
+            "For a duplicate, keep one source document and record action=exclude with the user's reason "
+            "against the duplicate SHA-256. Do not run Stage 2 and drop the resulting expense unit; "
+            "that does not resolve the extraction evidence ledger.",
+            file=sys.stderr,
+        )
+        return 2
     context_path = Path(args.context) if args.context else None
     try:
         contexts, raw_context, context_questions = load_context(context_path)
@@ -2834,8 +3078,9 @@ def main(argv: list[str] | None = None) -> int:
     print(f"PROJECT CONTEXT VALIDATED: {len(contexts)} canonical context window(s).")
     units, link_questions = create_units(extraction, contexts)
     print_document_reconciliation(extraction, units)
-    apply_matches(units, contexts)
-    questions = build_questions(units, context_questions + link_questions)
+    hint_reconciliation: list[dict[str, Any]] = []
+    apply_matches(units, contexts, hint_reconciliation=hint_reconciliation)
+    questions = build_questions(units, context_questions + link_questions, hint_reconciliation)
 
     payload = {
         "schema_version": "expense_allocation.v1",
@@ -2849,6 +3094,7 @@ def main(argv: list[str] | None = None) -> int:
         "raw_project_context": raw_context,
         "project_contexts": contexts,
         "allocation_units": units,
+        "expense_hint_reconciliation": hint_reconciliation,
         "questions": questions,
         "change_log": [],
     }

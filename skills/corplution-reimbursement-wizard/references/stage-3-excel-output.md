@@ -32,6 +32,7 @@ Do not write the final workbook until:
 - No taxi/travel row is assigned to `CORP-2026-ADMIN`. Admin is not a fallback for unmatched transport.
 - Standalone flight/rail whose route destination uniquely matches a project context is assigned to that destination project, not the origin project.
 - Every active railway journey chain has at least two continuous ticket segments, one shared project assignment, no open whole-chain question, and current length/member/route metadata. A dropped or corrected segment requires Stage 2 to rebuild the chain. Skip per-ticket destination-project enforcement for intermediate transfer segments; validate the chain as a whole instead.
+- Every applicant expense hint has a current reverse-reconciliation entry. Unmatched/ambiguous hints require an explicit matched-item, combined-invoice, supplement-later, or not-reimbursed answer; a matched hint whose unit was dropped must be resolved again.
 - Substitute invoices either have approval screenshot paths or explicit missing-screenshot issues.
 - Didi/Gaode summary invoices linked to trip reports are not duplicated as standalone expense rows.
 
@@ -495,6 +496,8 @@ Create or update:
     }
   ],
   "rail_journey_chains": [],
+  "expense_hint_reconciliation": [],
+  "unresolved_expense_hint_count": 0,
   "project_blocks": [
     {
       "project_key": "Client|Client Charge Code",
@@ -627,6 +630,7 @@ Before delivering the workbook:
 - Hotel final notes do not contain literal `X晚`, `入住日`, or `离店日` placeholders.
 - Standalone flight/rail between two project cities belongs to the destination/project being traveled to.
 - Connected railway tickets retain separate rows/proofs/Notes but share one project assignment. Adjacent stations must still connect, and a transfer station must not split the chain into another project.
+- `expense_hint_reconciliation` contains every distinct user-provided expense record exactly once, and `unresolved_expense_hint_count` is zero.
 - `Expense Nature` follows the formal Shanghai/non-Shanghai rule.
 - All substitute invoice notes include `（抵）`.
 - Meal daily cap checks are present and have been shown in chat. Any over-cap day with attendees is advisory only; any over-cap day without attendees must be resolved or explicitly acknowledged before final submission.

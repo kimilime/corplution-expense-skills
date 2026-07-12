@@ -127,6 +127,7 @@ The manifest should list:
 - every support document copied
 - unresolved issues that must be shown directly to the user before submission
 - current final-rows fingerprint and workbook SHA-256
+- count of reconciled applicant expense records
 - SHA-256 for every copied invoice and support document
 - proof number
 - source document ID
@@ -149,6 +150,7 @@ JSON shape:
   "final_rows_fingerprint": "",
   "invoice_count": 1,
   "support_count": 1,
+  "expense_hint_reconciliation_count": 3,
   "invoice_files": [
     {
       "proof_no": 1,
@@ -178,6 +180,10 @@ The manifest is integrity-stamped after all package files are copied. A package 
 
 Build each package in a fresh sibling staging directory. Only after its workbook, evidence folders, and stamped manifest are complete may the script replace the previous package root for the same requester/date. This replacement is deliberate: a rerun must contain exactly the files named by its new manifest and must not retain stale invoices or support files from an earlier run.
 
+Before copying files, require final rows to carry an `expense_hint_reconciliation` list identical to the current allocation and `unresolved_expense_hint_count: 0`. Missing legacy fields or any open expected-expense record require Stage 2/3 regeneration; packaging must not infer that a note can be ignored merely because no invoice row exists.
+
+On Windows, renaming an existing package can be temporarily blocked by an open workbook, Explorer preview, antivirus scan, or indexer. Retry transient `PermissionError` locks with bounded exponential backoff while preserving the staging/backup rollback. If retries are exhausted, keep the old package intact, attempt to remove staging, warn if Windows also locks cleanup, and tell the agent to close the workbook and package-folder previews before rerunning Stage 4 through Chief. Status and journal discovery ignore hidden `.staging-*`/`.previous-*` folders so an interrupted package cannot masquerade as the deliverable. Direct script invocation does not bypass the lock and must not be presented as the fix.
+
 If `package_reimbursement_files.py` exits with code `3`, it has written a review package and manifest, but `issues` is non-empty. Treat this as a blocking stop: show the issue list in chat, obtain the missing evidence or an explicit applicant decision, then re-run Stage 4. Do not describe that package as complete or submit it.
 
 ## Validation
@@ -194,5 +200,6 @@ Before final delivery:
 - Original source files were copied, not moved.
 - A rerun has no stale invoice or support file outside the current manifest.
 - The integrity-stamped manifest matches the current final-rows fingerprint, workbook hash, file counts, and every listed package file hash.
+- The packaged final rows carry the same applicant expense-record reconciliation as the current allocation, with zero unresolved records.
 - The manifest has no unresolved issues before calling the workflow complete or submitting the package.
 - A concise final package summary has been shown in chat: package folder, workbook filename, and invoice/support-document counts.

@@ -156,7 +156,7 @@ def build_child_command(args: argparse.Namespace) -> tuple[str, str, list[str]]:
     stage = args.run_stage
     journal_stage, script_name = RUN_METADATA[stage]
     paths = canonical_paths(args)
-    child: list[str] = [sys.executable, str(SCRIPT_DIR / script_name)]
+    child: list[str] = [sys.executable, "-X", "utf8", str(SCRIPT_DIR / script_name)]
 
     if stage == "dependencies":
         if args.install:
@@ -282,7 +282,10 @@ def run_child(
     print(f"CHIEF dispatch: {script_name}", flush=True)
     started = time.monotonic()
     try:
-        result = subprocess.run(command)
+        child_env = os.environ.copy()
+        child_env["PYTHONIOENCODING"] = "utf-8"
+        child_env["PYTHONUTF8"] = "1"
+        result = subprocess.run(command, env=child_env)
         exit_code = normalize_child_exit_code(int(result.returncode))
     except KeyboardInterrupt:
         exit_code = 130

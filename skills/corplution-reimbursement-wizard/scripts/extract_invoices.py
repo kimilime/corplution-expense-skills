@@ -114,7 +114,7 @@ def configure_stdio() -> None:
     for stream in (sys.stdout, sys.stderr):
         if hasattr(stream, "reconfigure"):
             try:
-                stream.reconfigure(errors="replace")
+                stream.reconfigure(encoding="utf-8", errors="replace")
             except Exception:
                 pass
 
@@ -820,15 +820,25 @@ def build_links_and_reviews(documents: list[dict[str, Any]]) -> tuple[list[dict[
     seen_hashes: dict[str, str] = {}
     for doc in documents:
         source_hash = doc.get("sha256") or ""
-        if source_hash in seen_hashes:
+        if source_hash and source_hash in seen_hashes:
             links.append({
                 "source_document_id": seen_hashes[source_hash],
                 "target_document_id": doc["document_id"],
                 "relation": "duplicate_source_file",
                 "check": {"sha256": source_hash, "matched": True},
             })
+            doc["issues"].append({
+                "field": "source_file",
+                "problem": f"File content exactly duplicates {seen_hashes[source_hash]} (same SHA-256).",
+                "suggested_action": (
+                    "Confirm which copy to keep, then exclude the duplicate at Stage 1 through "
+                    "apply_extraction_corrections.py; dropping an allocation unit is not equivalent."
+                ),
+            })
+            doc["needs_review"] = True
         else:
-            seen_hashes[source_hash] = doc["document_id"]
+            if source_hash:
+                seen_hashes[source_hash] = doc["document_id"]
 
         invoice = doc.get("invoice") or {}
         invoice_no = invoice.get("invoice_no") or ""
