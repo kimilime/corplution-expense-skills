@@ -54,6 +54,8 @@ python scripts/chief_orchestrator.py next --json
 
 At any point, and ALWAYS when the user asks about progress or status, run the Chief `status` command and relay its output. `next` returns exactly one of `command`, `needs_user`, `blocked`, or `complete`; it emits executable `argv` only when all required parameters are known. Never turn a `needs_user` result into a guessed command. The legacy `python scripts/check_workflow_status.py` command uses the same shared state engine and remains compatible.
 
+If a workflow command fails or the recovery path is unclear, read `references/troubleshooting.md`, run Chief `status`, and follow the one current `CHIEF NEXT` action. Do not improvise a helper, patch a process JSON, or bypass a failed stage.
+
 Runs dispatched by Chief append privacy-minimized events to `process/workflow-journal.jsonl`. The journal records stage/script, timestamps, exit code, duration, artifact hashes, and counts only; it must not contain raw invoice text, applicant answers, client details, full command arguments, or source paths. It is observational rather than an integrity authority, never enters the final package, and a journal-write failure must not replace the underlying script's exit code.
 
 Missing OCR system tools such as Tesseract or Poppler do not block text-layer PDFs or Excel/package stages. If OCR is unavailable, stage 1 must mark scan-only inputs as `manual_review` instead of inventing fields.
@@ -100,7 +102,7 @@ python scripts/chief_orchestrator.py run compose \
     --decisions process/batch-decisions.json
 ```
 
-Create `process/batch-decisions.json` from `assets/allocation-decisions-template.json`. Keep `schema_version: allocation_decisions.v1` and only these root actions: `decisions`, `question_updates`, `project_contexts`, `confirm_units`, `drop_units`, and `exclude_units`. Composer compiles all of them; there is no helper-script exception.
+Create `process/batch-decisions.json` from `assets/allocation-decisions-template.json`. Keep `schema_version: allocation_decisions.v1` and only these root actions: `decisions`, `expense_hint_resolutions`, `question_updates`, `project_contexts`, `confirm_units`, `drop_units`, and `exclude_units`. Composer compiles all of them; there is no helper-script exception. Use the field quick reference in `references/stage-2-allocation.md` instead of guessing names.
 
 If Composer exits nonzero, read its updater error, correct the same UTF-8 decisions file, and rerun Composer. Never switch to `build_allocation_answers_template.py`, generate `fill_answers.py`, create `patch_allocation.py`/`fix_*.py`, edit `expense-allocation.json`, or modify a bundled script. The template builder is developer-only diagnostic output and is structurally rejected by the updater.
 

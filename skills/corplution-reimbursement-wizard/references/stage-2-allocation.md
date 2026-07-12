@@ -15,6 +15,7 @@ Do not fill the Excel reimbursement template in this stage. Produce allocation p
 - [Final Note Format](#final-note-format)
 - [Interaction Loop](#interaction-loop)
 - [Applying User Answers](#applying-user-answers)
+- [Composer Field Quick Reference](#composer-field-quick-reference)
 - [JSON Output](#json-output)
 - [Completion Criteria](#completion-criteria)
 
@@ -587,6 +588,31 @@ Canonical decisions shape:
 ```
 
 `decisions[].units` accepts one displayed item number, comma-separated numbers, or ranges. `decisions[].set` accepts canonical updater fields plus Composer aliases such as `client`, `code`, `note`, `date`, `nights`, `checkin`, `checkout`, `attendee`, `origin_type`, and `destination_type`.
+
+### Composer Field Quick Reference
+
+Use these aliases inside `decisions[].set`. Canonical field names remain valid too.
+
+| Short field | Canonical field | Use |
+| --- | --- | --- |
+| `client` | `client_name` | Client shown in the workbook project block |
+| `code` / `charge_code` | `client_charge_code` | Client Charge Code |
+| `date` | `expense_date` | Actual reimbursement date in `YYYY-MM-DD` |
+| `note` | `final_note` | Final Chinese reimbursement Note |
+| `category` | `source_category` | Substantive category such as `meal`, `hotel`, or `taxi` |
+| `context` | `meal_context` | Meal policy context, such as `business_trip` or `overtime` |
+| `project_context` | `project_context_id` | Existing Stage 2 project-context ID |
+| `nights` | `hotel_nights` | Number of hotel nights |
+| `checkin` / `check_in` | `check_in_date` | Hotel check-in date |
+| `checkout` / `check_out` | `check_out_date` | Hotel check-out date |
+| `attendee` | `attendees` | Meal attendee/counterparty text |
+| `origin_type` | `origin_place_type` | Taxi origin type, such as `家`, `公司`, or `火车站` |
+| `destination_type` | `destination_place_type` | Taxi destination type |
+| `reimbursable` | `reimbursable_amount` | Amount actually claimed when lower than invoice amount |
+
+For a hotel, setting either canonical `city` or `hotel_city` is sufficient; the updater mirrors it to the other field and rejects conflicting values. Never set `final_template_column`: it is computed from `source_category` and formal city. Fix `city` or `source_category` when the visible amount column is wrong.
+
+Use `question_updates` for ordinary question status/answer updates. Use `expense_hint_resolutions` for every `R1/R2/...` applicant-record completeness decision; free-text `question_updates` cannot close those records.
 
 The root action arrays are also supported:
 
