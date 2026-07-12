@@ -610,18 +610,18 @@ def guard_meal_reclass_signal(unit: dict[str, Any], update: dict[str, Any], was_
     row cannot be placed in the right column."""
     if was_meal or clean(update.get("source_category")) != "meal":
         return None
+    meal_context = clean(unit.get("meal_context"))
     has_signal = (
-        clean(unit.get("city"))
-        or clean(unit.get("meal_context"))
+        meal_context in {"travel", "business_trip", "station_airport", "overtime"}
         or clean(unit.get("final_note")).startswith(("出差餐费", "加班餐费"))
     )
     if has_signal:
         return None
     return (
         f"{unit.get('unit_id')}: reclassified to meal, but there is no way to decide which "
-        "meal policy applies. Add ONE of: city (哪个城市吃的 — 决定 meal/travel 列和是否按 "
-        "150/天出差餐费检查), meal_context: \"overtime\" (加班餐, 60/天), or a final_note "
-        "starting with 出差餐费/加班餐费."
+        "meal policy applies. Add meal_context: business_trip/station_airport/overtime or a final_note "
+        "starting with 出差餐费/加班餐费. City is not a policy signal: it only determines the "
+        "meal/travel workbook column and Expense Nature."
     )
 
 
@@ -665,11 +665,12 @@ COMPUTED_FIELDS_TEACHING = {
     "final_template_column": (
         "final_template_column is COMPUTED, not settable: the writer derives the visible "
         "amount column from source_category + city (Shanghai restaurant -> meal column, "
-        "out-of-town trip meal -> travel column with the RMB150/day trip-meal cap; "
+        "non-Shanghai restaurant -> travel column; "
         "Shanghai ride -> taxi, out-of-town ride -> travel). Any value you set here is "
         "re-normalized away on apply. If the column looks wrong, fix the INPUT instead: "
         "set city (e.g. \u57ce\u5e02\u5199\u9519) or source_category (extraction error, "
-        "needs manual_correction + correction_note)."
+        "needs manual_correction + correction_note). For meals, this computed column never "
+        "selects the RMB150/60 policy; final_note/meal_context does."
     ),
 }
 

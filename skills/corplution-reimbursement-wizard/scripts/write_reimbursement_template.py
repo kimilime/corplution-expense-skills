@@ -62,6 +62,10 @@ ADMIN_FALLBACK_CLIENT = _POLICY.admin_fallback_client
 MOBILE_CLIENT = _POLICY.mobile_client
 FIRST_TIER_CITIES = _POLICY.first_tier_cities
 
+TRIP_MEAL_CONTEXTS = {"travel", "business_trip", "station_airport"}
+OVERTIME_MEAL_CONTEXTS = {"overtime"}
+MEAL_POLICY_NON_TRIGGERS = ["city", "amount_column", "final_template_column", "expenses_nature"]
+
 
 AMOUNT_COLUMNS = {
     "hotel": "G",
@@ -443,6 +447,50 @@ def meal_template_note(unit: dict[str, Any]) -> str:
     return C["trip_meal"]
 
 
+def classify_meal_policy(value: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Classify meal policy by substantive purpose, never by workbook form fields."""
+    if clean(value.get("source_category")) != "meal":
+        return None, None
+
+    note = clean(value.get("note") or value.get("final_note"))
+    context = clean(value.get("meal_context"))
+    trip_signals: list[str] = []
+    overtime_signals: list[str] = []
+    if note.startswith(C["trip_meal"]):
+        trip_signals.append("final_note starts with 出差餐费")
+    if note.startswith(C["overtime_meal"]):
+        overtime_signals.append("final_note starts with 加班餐费")
+    if context in TRIP_MEAL_CONTEXTS:
+        trip_signals.append(f"meal_context={context}")
+    if context in OVERTIME_MEAL_CONTEXTS:
+        overtime_signals.append(f"meal_context={context}")
+
+    if trip_signals and overtime_signals:
+        return None, (
+            "meal policy signals conflict: " + ", ".join(trip_signals + overtime_signals)
+            + "; city/amount column cannot resolve this conflict"
+        )
+    if trip_signals:
+        return {
+            "policy": "business_trip_meal",
+            "policy_name": C["business_trip_meal_policy"],
+            "cap": BUSINESS_TRIP_MEAL_DAILY_CAP,
+            "basis": trip_signals,
+        }, None
+    if overtime_signals:
+        return {
+            "policy": "local_overtime_meal",
+            "policy_name": C["local_overtime_meal_policy"],
+            "cap": LOCAL_OVERTIME_MEAL_DAILY_CAP,
+            "basis": overtime_signals,
+        }, None
+    return None, (
+        "meal policy is missing: explicitly set final_note to 出差餐费/出差餐费（高铁站/机场）/加班餐费 "
+        "or set meal_context to business_trip/station_airport/overtime; do not infer it from Shanghai, "
+        "amount_column, or Expense Nature"
+    )
+
+
 def hotel_template_note(unit: dict[str, Any]) -> str:
     if clean(unit.get("source_category")) != "hotel":
         return ""
@@ -535,6 +583,10 @@ def stage3_rule_errors(unit: dict[str, Any]) -> list[str]:
             errors.append("hotel final note must use actual nights/check-in/check-out, not X晚/入住日/离店日 placeholders")
     if category == "mobile" and visible_column != "mobile":
         errors.append("mobile expenses must use the mobile amount column")
+    if category == "meal":
+        _policy, policy_error = classify_meal_policy(unit)
+        if policy_error:
+            errors.append(policy_error)
 
     if not normalized_note_base(unit) and category != "other":
         errors.append("final note cannot be derived from the confirmed allocation")
@@ -871,29 +923,25 @@ def make_rows(units: list[dict[str, Any]], requester: str) -> list[dict[str, Any
 
 
 def meal_cap_policy(row: dict[str, Any]) -> dict[str, Any] | None:
-    if row.get("source_category") != "meal":
-        return None
-    note = clean(row.get("note"))
-    meal_context = clean(row.get("meal_context"))
-    is_trip_meal = (
-        row.get("amount_column") == "travel"
-        or note.startswith(C["trip_meal"])
-        or meal_context in {"travel", "business_trip", "station_airport"}
-    )
-    if is_trip_meal:
-        return {
-            "policy": "business_trip_meal",
-            "policy_name": C["business_trip_meal_policy"],
-            "cap": BUSINESS_TRIP_MEAL_DAILY_CAP,
-        }
-    is_local_overtime_meal = meal_context == "overtime" or note.startswith(C["overtime_meal"])
-    if is_local_overtime_meal:
-        return {
-            "policy": "local_overtime_meal",
-            "policy_name": C["local_overtime_meal_policy"],
-            "cap": LOCAL_OVERTIME_MEAL_DAILY_CAP,
-        }
-    return None
+    policy, _error = classify_meal_policy(row)
+    return policy
+
+
+def annotate_meal_policies(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        if clean(row.get("source_category")) != "meal":
+            continue
+        policy, error = classify_meal_policy(row)
+        if error or not policy:
+            row["meal_cap_policy"] = "unclassified"
+            row["meal_daily_cap"] = ""
+            row["meal_policy_basis"] = []
+            row["meal_policy_error"] = error or "meal policy could not be classified"
+            continue
+        row["meal_cap_policy"] = policy["policy"]
+        row["meal_daily_cap"] = money(policy["cap"])
+        row["meal_policy_basis"] = policy["basis"]
+        row["meal_policy_error"] = ""
 
 
 def meal_item(row: dict[str, Any]) -> dict[str, Any]:
@@ -907,6 +955,11 @@ def meal_item(row: dict[str, Any]) -> dict[str, Any]:
         "reimbursable_amount": row.get("reimbursable_amount", row.get("amount", "0.00")),
         "attendees": row.get("attendees", ""),
         "note": row.get("note", ""),
+        "amount_column": row.get("amount_column", ""),
+        "expenses_nature": row.get("expenses_nature", ""),
+        "meal_cap_policy": row.get("meal_cap_policy", ""),
+        "meal_daily_cap": row.get("meal_daily_cap", ""),
+        "meal_policy_basis": row.get("meal_policy_basis", []),
     }
 
 
@@ -977,6 +1030,14 @@ def meal_daily_cap_checks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
             "policy_name": policy["policy_name"],
             "date": date_value,
             "cap": money(cap),
+            "aggregation_key": "meal_cap_policy + expense_date",
+            "cross_column_aggregation": True,
+            "policy_basis": sorted({
+                basis
+                for row in day_rows
+                for basis in row.get("meal_policy_basis", [])
+            }),
+            "policy_non_triggers": list(MEAL_POLICY_NON_TRIGGERS),
             "total": money(total),
             "over_by": money(over_by) if over_by > 0 else "0.00",
             "status": status,
@@ -992,15 +1053,56 @@ def meal_daily_cap_checks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _meal_population_line(meal_checks: list) -> str:
     total = sum(len(day.get("items", [])) for day in meal_checks)
-    return f"(covering {total} meal item(s) across {len(meal_checks)} day(s) — items are selected by source_category=meal)"
+    return (
+        f"(covering {total} meal item(s) across {len(meal_checks)} policy/day pool(s); "
+        "source_category=meal selects the population only)"
+    )
+
+
+def meal_policy_rule() -> dict[str, Any]:
+    return {
+        "population_selector": "source_category=meal",
+        "cap_selector": "final_note/meal_context substantive purpose",
+        "business_trip_meal": {
+            "cap": money(BUSINESS_TRIP_MEAL_DAILY_CAP),
+            "signals": ["final_note starts with 出差餐费", "meal_context=business_trip/station_airport/travel"],
+        },
+        "local_overtime_meal": {
+            "cap": money(LOCAL_OVERTIME_MEAL_DAILY_CAP),
+            "signals": ["final_note starts with 加班餐费", "meal_context=overtime"],
+        },
+        "not_cap_selectors": list(MEAL_POLICY_NON_TRIGGERS),
+        "cross_column_aggregation": (
+            "Same-date rows with the same meal_cap_policy are summed together even when one is in meal "
+            "and another is in travel."
+        ),
+        "critical_invariant": (
+            "A Shanghai row may use amount_column=meal and expenses_nature=本地 while remaining "
+            "business_trip_meal with a 150/day cap. There is no generic Shanghai/local meal 60/day rule; "
+            "60/day applies only to explicit local overtime meals."
+        ),
+    }
 
 
 def print_meal_cap_check(checks: list[dict[str, Any]]) -> None:
-    print("\nMEAL DAILY CAP CHECK TO SHOW IN CHAT")
+    print("\n=== MEAL DAILY CAP CHECK TO RELAY VERBATIM ===")
+    print(
+        "POLICY INVARIANT: source_category=meal only selects meal rows. The 150/60 cap is selected only "
+        "by final_note/meal_context: 出差餐费=150/day; explicit 加班餐费=60/day."
+    )
+    print(
+        "NEVER select a cap from city, amount_column, or Expense Nature. A Shanghai row in the meal column "
+        "with Note=出差餐费 is still in the 150/day business-trip pool. There is no generic 本地餐=60 rule."
+    )
+    print(
+        "AGGREGATION: sum all rows sharing meal_cap_policy + date, including rows split across the meal and "
+        "travel columns. Do not recalculate separate pools by workbook column."
+    )
     print(_meal_population_line(checks))
-    print("Copy or summarize this check in the conversation before final submission.")
+    print("Relay this block as generated; do not independently reclassify or recompute it from workbook columns.")
     if not checks:
         print("No meal rows requiring daily cap checks found.")
+        print("=== END MEAL DAILY CAP CHECK ===")
         return
     for check in checks:
         print(
@@ -1011,7 +1113,10 @@ def print_meal_cap_check(checks: list[dict[str, Any]]) -> None:
             print(
                 f"  item {item.get('user_no') or '-'} | proof {item.get('proof_no') or '-'} | "
                 f"{item.get('source_filename') or '-'} | invoice {item['invoice_amount']} | "
-                f"reimburse {item['reimbursable_amount']} | attendees {item.get('attendees') or '-'}"
+                f"reimburse {item['reimbursable_amount']} | policy {item.get('meal_cap_policy') or '-'} "
+                f"cap {item.get('meal_daily_cap') or '-'} | column {item.get('amount_column') or '-'} | "
+                f"nature {item.get('expenses_nature') or '-'} | note {item.get('note') or '-'} | "
+                f"attendees {item.get('attendees') or '-'}"
             )
         if check["suggested_adjustments"]:
             print("  suggested adjustment to fit cap:")
@@ -1022,6 +1127,7 @@ def print_meal_cap_check(checks: list[dict[str, Any]]) -> None:
                     f"{adjustment['suggested_reimbursable_amount']} "
                     f"(reduce {adjustment['reduce_by']})"
                 )
+    print("=== END MEAL DAILY CAP CHECK ===")
 
 
 def boolish(value: Any) -> bool:
@@ -1577,6 +1683,17 @@ def build_markdown(payload: dict[str, Any], workbook: Path) -> str:
             f"| {block['project_key']} | {block['first_detail_row']}:{block['last_detail_row']} | "
             f"{block['subtotal_row']} | {block['subtotal_formula']} |"
         )
+    meal_rule = payload.get("meal_policy_rule", {})
+    lines += [
+        "",
+        "## Meal Policy Rule",
+        "",
+        f"- Population selector: {meal_rule.get('population_selector', '')}",
+        f"- Cap selector: {meal_rule.get('cap_selector', '')}",
+        f"- Not cap selectors: {', '.join(meal_rule.get('not_cap_selectors', []))}",
+        f"- Invariant: {meal_rule.get('critical_invariant', '')}",
+        f"- Aggregation: {meal_rule.get('cross_column_aggregation', '')}",
+    ]
     lines += [
         "",
         "## Meal Daily Cap Checks",
@@ -1639,6 +1756,10 @@ def print_stage3_review_summary(payload: dict[str, Any]) -> None:
     advisory = advisory_checks(payload)
     print("\nSTAGE 3 REVIEW SUMMARY TO SHOW IN CHAT")
     print(
+        "AUTHORITATIVE MEAL RESULT: use the generated MEAL DAILY CAP CHECK block and per-row "
+        "meal_cap_policy/meal_daily_cap fields; never reclassify from city, amount column, or Expense Nature."
+    )
+    print(
         "meal_daily_caps="
         f"{payload['checks'][0]['status']} "
         f"({payload['checks'][0]['days_requiring_confirmation']} requiring confirmation, "
@@ -1672,7 +1793,10 @@ def print_stage3_review_summary(payload: dict[str, Any]) -> None:
                 f"over {check.get('over_by')} / {check.get('status')}"
             )
         return
-    print("OK: No meal or hotel cap issue requiring applicant attention.")
+    print(
+        "OK: No meal or hotel cap issue requiring applicant attention. This means zero blocking/advisory "
+        "issues, not zero checked meal rows; retain the generated policy classification and totals."
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1791,6 +1915,7 @@ def main(argv: list[str] | None = None) -> int:
     proof_groups = assign_proof_numbers(units)
     rows = make_rows(units, args.requester)
     rows.sort(key=lambda r: (r["client"], r["client_charge_code"], ROW_ORDER.get(r["row_order_type"], 99), r["expense_date"], r["proof_no"]))
+    annotate_meal_policies(rows)
     row_text_issues = text_safety.find_suspect_text(
         text_safety.pick_fields(rows, WORKBOOK_ROW_TEXT_FIELDS),
         path="final_rows.rows",
@@ -1823,6 +1948,7 @@ def main(argv: list[str] | None = None) -> int:
         "rows": rows,
         "project_blocks": project_blocks,
         "summary_rows": summary_rows,
+        "meal_policy_rule": meal_policy_rule(),
         "meal_daily_cap_checks": meal_checks,
         "hotel_cap_checks": hotel_checks,
         "checks": [
@@ -1832,6 +1958,7 @@ def main(argv: list[str] | None = None) -> int:
                     "business_trip_meal": money(BUSINESS_TRIP_MEAL_DAILY_CAP),
                     "local_overtime_meal": money(LOCAL_OVERTIME_MEAL_DAILY_CAP),
                 },
+                "classification_rule": meal_policy_rule(),
                 "status": meal_check_status,
                 "days_checked": len(meal_checks),
                 "days_with_advisory": sum(1 for check in meal_checks if check.get("severity") == "advisory"),

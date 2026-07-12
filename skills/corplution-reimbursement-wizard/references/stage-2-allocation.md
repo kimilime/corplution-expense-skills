@@ -49,7 +49,8 @@ Ask the user to provide, in natural language:
   - actual meal date
   - client/project
   - attendees or dining counterparties
-  - whether it was local Shanghai meal or out-of-town trip meal
+  - substantive purpose: business-trip meal (including a Shanghai meal before/during travel) or explicit local overtime meal
+  - formal restaurant/invoice city, which separately determines the workbook column and `Expense Nature`
   - any "with X", "和X一起", "同事X", or similar companion/counterparty note, even if the meal is under the daily cap
 - Substitute invoice notes:
   - which invoice/item is a substitute invoice
@@ -130,7 +131,7 @@ The allocation script scores these hints against extracted units using amount, d
 
 Use hints to preserve attendee details even when a meal does not exceed the cap.
 
-Do not let a meal hint override the formal amount column or `Expense Nature`. For meal invoices, `final_template_column` and nature follow the invoice/restaurant city: Shanghai formal city -> `meal`/local; non-Shanghai formal city -> `travel`/business trip. A Shanghai invoice can still belong to an out-of-town project and use note `出差餐费`, but its amount column remains `meal` and its nature remains local. `final_template_column` is computed and re-normalized on every apply — it cannot be set through the answers file; to change a column, correct `city` or `source_category` instead.
+Do not let a meal hint override the formal amount column or `Expense Nature`. For meal invoices, `final_template_column` and nature follow the invoice/restaurant city: Shanghai formal city -> `meal`/local; non-Shanghai formal city -> `travel`/business trip. These are workbook-form fields only and never select the meal cap. A Shanghai invoice can belong to an out-of-town project, use note `出差餐费`, remain in the `meal` column with local nature, and still use the RMB 150/day business-trip policy. `final_template_column` is computed and re-normalized on every apply — it cannot be set through the answers file; to change a column, correct `city` or `source_category` instead.
 
 ## Allocation Units
 
@@ -309,7 +310,7 @@ Create a meal review list unless the user already provided clear meal details. A
 - actual meal date
 - project/client
 - attendees or dining counterparties
-- whether it is local Shanghai meal or out-of-town trip meal
+- whether its substantive purpose is business-trip meal (including a Shanghai pre-departure/station/airport meal) or explicit local overtime meal; never infer this from invoice city
 - whether it is a substitute invoice
 - whether actual reimbursable amount differs from invoice amount, when the user says a meal should be partially reimbursed to meet the daily standard
 
@@ -322,9 +323,11 @@ This is form-over-substance. A Shanghai meal invoice allocated to a non-Shanghai
 
 Final note:
 
-- Out-of-town business-trip meal: `出差餐费`
-- Shanghai meal that belongs in `meal` but is tied to station/airport travel context: `出差餐费（高铁站/机场）`
-- Overtime meal: `加班餐费`
+- Business-trip meal, regardless of whether formal city puts it in `meal` or `travel`: `出差餐费`
+- Shanghai meal specifically tied to station/airport travel context: `出差餐费（高铁站/机场）`
+- Explicit local overtime meal: `加班餐费`
+
+These notes also select the downstream cap policy: either `出差餐费` form -> `business_trip_meal` at RMB 150/day, or explicit `加班餐费` -> `local_overtime_meal` at RMB 60/day. There is no generic local/Shanghai meal RMB 60 policy. Same-date business-trip meal rows are one 150 pool even when Shanghai rows appear in `meal` and non-Shanghai rows appear in `travel`.
 
 Carry attendee details in a separate `attendees` field for downstream use. Include attendees in the final note only if the user explicitly wants that style.
 

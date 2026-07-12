@@ -60,14 +60,14 @@ Amounts must be numeric values. Each row must have exactly one populated amount 
 
 Use `reimbursable_amount` for the visible Excel amount when it is present; otherwise use `amount`. Preserve `invoice_amount` in `final-expense-rows.json`. If the reimbursable amount differs from the invoice amount, append `（发票金额XX/实际报销XX）` to the final note.
 
-Treat project allocation and visible amount-column classification as two separate layers. `client_name`, `client_charge_code`, and the project block come from the confirmed project allocation. `meal`/`taxi` versus `travel`, and the matching `Expenses Nature`, come from formal evidence only. Do not move a Shanghai meal or Shanghai ride into `travel` merely because it belongs to an out-of-town project; do not move a non-Shanghai meal or non-Shanghai ride into `meal`/`taxi` merely because it belongs to a Shanghai/admin context.
+Treat project allocation, visible form classification, and meal policy as separate axes. `client_name`, `client_charge_code`, and the project block come from confirmed project allocation. `meal`/`taxi` versus `travel`, and matching `Expenses Nature`, come from formal city evidence. Meal cap policy comes only from substantive purpose in `final_note`/`meal_context`. Never derive one axis from another.
 
 For meal rows, choose the visible amount column by formal invoice/restaurant city, not by project substance:
 
 - Shanghai formal city -> `meal`.
 - Non-Shanghai formal city -> `travel`.
 
-A Shanghai meal invoice assigned to an out-of-town project can still use note `出差餐费`, but its amount must stay in the `meal` column and `Expense Nature` must stay local.
+A Shanghai meal invoice assigned to an out-of-town project can still use note `出差餐费`, but its amount must stay in the `meal` column and `Expense Nature` must stay local. Despite those local form fields, it remains `business_trip_meal` under the RMB 150/day policy.
 
 For taxi/Didi/Gaode ride rows, choose the visible amount column by ride city, not by assigned project:
 
@@ -94,28 +94,41 @@ Corplution has two meal daily standards:
 
 Authoritative cap values live in `assets/policy.toml`; the numbers above are the current values for readability.
 
+There is no generic "Shanghai meal", "local meal", or `amount_column=meal` RMB 60 policy. RMB 60 applies only when the item is explicitly an overtime meal. `Expense Nature: 本地` is a workbook presentation value and is not a cap-policy signal.
+
+Keep these three axes distinct:
+
+| Axis | Meaning | Selector | Example for a Shanghai pre-departure trip meal |
+| --- | --- | --- | --- |
+| `source_category` | substantive expense type / inclusion in meal checks | recognized expense type | `meal` |
+| `amount_column` + `Expense Nature` | workbook form | formal invoice/restaurant city | `meal` + `本地` |
+| `meal_cap_policy` | daily cap and aggregation pool | explicit `final_note` / `meal_context` | `business_trip_meal` + `150.00` |
+
 After final rows are built and before final submission, calculate daily totals separately by meal policy.
 
 Treat a row as a business-trip meal when:
 
 - `source_category` is `meal`; and
-- final amount column is `travel`, or final note starts with `出差餐费`, or `meal_context` is `travel`, `business_trip`, or `station_airport`.
+- final note starts with `出差餐费`, or `meal_context` is `travel`, `business_trip`, or `station_airport`.
 
 Treat a row as a local overtime meal when:
 
 - `source_category` is `meal`; and
 - final note starts with `加班餐费`, or `meal_context` is `overtime`.
 
+If neither policy has an explicit signal, Stage 3 must block and ask for the meal purpose. If trip and overtime signals conflict, Stage 3 must also block. City, project, `amount_column`, `final_template_column`, and `Expense Nature` must never resolve a missing or conflicting policy.
+
 For each date and meal policy:
 
 - Sum the visible Excel amounts, meaning `reimbursable_amount` when present, otherwise `amount`.
+- Aggregate across workbook columns. For example, a Shanghai `meal`-column trip meal and a Zhengzhou `travel`-column trip meal on the same date share one RMB 150 business-trip pool.
 - If total is within the relevant cap, mark the date as OK.
 - If total exceeds the relevant cap and at least one item has `attendees`, set `severity: advisory` and show a warning only: the day exceeds the standard but may be valid because multiple people are involved.
 - If total exceeds the relevant cap and no item has `attendees`, ask the user directly whether the actual meal date is wrong, attendee details are missing, or one item should be partially reimbursed.
 - When partial reimbursement is needed, suggest a `reimbursable_amount` adjustment that makes the day total exactly equal to the relevant cap. For example, if a local overtime meal is 70, suggest changing `reimbursable_amount` to 60; if two same-day trip meals are 90 + 90, suggest changing one item's `reimbursable_amount` to 60.
 - Apply user-confirmed partial reimbursement with `scripts/apply_allocation_answers.py`, then regenerate the workbook. The final note should show the invoice/reimbursable difference automatically.
 
-Always copy or summarize the script's `MEAL DAILY CAP CHECK TO SHOW IN CHAT` output in the conversation. Do not leave this only in `final-expense-rows.json/md`.
+Relay the script's complete `MEAL DAILY CAP CHECK TO RELAY VERBATIM` block without independently reclassifying or recomputing it. The script writes `meal_cap_policy`, `meal_daily_cap`, and `meal_policy_basis` onto every meal row and includes the authoritative policy/day pools in `meal_daily_cap_checks`. Do not replace those fields with an inference from city or workbook column.
 
 ## Hotel Caps
 
@@ -420,8 +433,8 @@ Create or update:
       "client": "",
       "client_charge_code": "",
       "expenses_nature": "本地",
-      "note": "",
-      "amount_column": "travel",
+      "note": "出差餐费（上海出发前）",
+      "amount_column": "meal",
       "amount": "0.00",
       "invoice_amount": "0.00",
       "reimbursable_amount": "0.00",
@@ -439,7 +452,14 @@ Create or update:
       "date_required": false,
       "seller_name": "",
       "attendees": "",
-      "meal_context": "",
+      "meal_context": "business_trip",
+      "meal_cap_policy": "business_trip_meal",
+      "meal_daily_cap": "150.00",
+      "meal_policy_basis": [
+        "final_note starts with 出差餐费",
+        "meal_context=business_trip"
+      ],
+      "meal_policy_error": "",
       "hotel_city": "",
       "hotel_city_tier": "",
       "hotel_nights": "",
@@ -475,12 +495,36 @@ Create or update:
     "grand_total_row": 22,
     "status_row": 23
   },
+  "meal_policy_rule": {
+    "population_selector": "source_category=meal",
+    "cap_selector": "final_note/meal_context substantive purpose",
+    "not_cap_selectors": [
+      "city",
+      "amount_column",
+      "final_template_column",
+      "expenses_nature"
+    ],
+    "cross_column_aggregation": "Same-date rows with the same meal_cap_policy are summed together even when one is in meal and another is in travel.",
+    "critical_invariant": "A Shanghai meal-column/local-nature row with Note=出差餐费 remains business_trip_meal at RMB 150/day; only explicit 加班餐费 uses RMB 60/day."
+  },
   "meal_daily_cap_checks": [
     {
       "policy": "business_trip_meal",
       "policy_name": "出差餐费",
       "date": "YYYYMMDD",
       "cap": "150.00",
+      "aggregation_key": "meal_cap_policy + expense_date",
+      "cross_column_aggregation": true,
+      "policy_basis": [
+        "final_note starts with 出差餐费",
+        "meal_context=business_trip"
+      ],
+      "policy_non_triggers": [
+        "city",
+        "amount_column",
+        "final_template_column",
+        "expenses_nature"
+      ],
       "total": "0.00",
       "over_by": "0.00",
       "status": "未超标",

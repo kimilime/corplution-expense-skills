@@ -171,10 +171,11 @@ def build_unit_update(unit: dict[str, Any], question_ids: list[str]) -> dict[str
 
     # final_template_column is intentionally NOT offered: the visible amount
     # column is computed from source_category + city (Shanghai meal -> meal
-    # column, out-of-town trip meal -> travel column, etc.) and re-normalized
+    # column, non-Shanghai meal -> travel column, etc.) and re-normalized
     # on every apply. Offering it here invited models to set it and then
     # watch normalize silently override their value. To change a column, fix
-    # source_category or city instead.
+    # source_category or city instead. Meal cap policy is a separate axis and
+    # comes only from final_note/meal_context, never from this column.
     if category == "hotel":
         update["hotel_nights"] = value_or_placeholder(unit.get("hotel_nights"), "<nights>")
         update["check_in_date"] = value_or_placeholder(unit.get("check_in_date"), "<YYYY-MM-DD>")
