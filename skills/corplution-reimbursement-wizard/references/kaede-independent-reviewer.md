@@ -28,6 +28,32 @@ Complete every coverage check in the packet, even when the result is `not_applic
 - Do not trust internal consistency alone. Compare allocation results with chronology, routes, cities, source categories, notes, hints, and supporting evidence.
 - Do not invent a pass. State `unavailable` with a concise reason when the packet is materially incomplete.
 
+## Return Contract
+
+The task packet's `response_json_schema` is authoritative whenever the host supports structured output. Otherwise fill the supplied result template exactly.
+
+- Every `coverage[]` entry contains only `check_id`, `status`, and `notes`. `status` may only be `completed` or `not_applicable`. Never use `pending`, `pass`, `block`, or `advisory` in coverage.
+- Write the overall conclusion only in `outcome`: `pass`, `advisory`, `block`, or `unavailable`.
+- Each `findings[]` item must contain exactly `finding_id`, `severity`, `code`, `message`, `unit_refs`, `evidence_refs`, and `recommended_action`. Do not use aliases such as `check_id`, `references`, or `summary`.
+- The example below illustrates shape only. Replace every reference with an exact current token from the packet; do not copy example references.
+
+```json
+{
+  "outcome": "block",
+  "findings": [
+    {
+      "finding_id": "F-001",
+      "severity": "blocking",
+      "code": "missing_approval_link",
+      "message": "The approval screenshot is not linked to the flight evidence.",
+      "unit_refs": ["27@f752f9da"],
+      "evidence_refs": ["DOC-046"],
+      "recommended_action": "Link the approval screenshot, then run a fresh review."
+    }
+  ]
+}
+```
+
 ## Independence
 
 Review the canonical snapshot from scratch. Do not assume that a confirmed status, generated note, or prior model decision is correct merely because it is present. Existing deterministic script checks remain authoritative and run after this review.

@@ -36,3 +36,33 @@ Complete every coverage check in the packet, even when the result is `not_applic
 - Explain every proposal with evidence references and a confidence level.
 - Keep low-confidence proposals as questions rather than presenting them as facts.
 - A proposal is advisory. The coordinator must review it and use Composer/Updater for any accepted change.
+
+## Return Contract
+
+The task packet's `response_json_schema` is authoritative whenever the host supports structured output. Otherwise fill the supplied result template exactly.
+
+- Every `coverage[]` entry contains only `check_id`, `status`, and `notes`. `status` may only be `completed` or `not_applicable`. Never use `pending`, `pass`, `block`, or `advisory` in coverage.
+- Each proposal must contain exactly `proposal_id`, `unit_refs`, `set`, `confidence`, `reason`, and `evidence_refs`.
+- Each user question must contain exactly `question_id`, `unit_refs`, `question`, `reason`, and `blocking`.
+- The examples below illustrate shape only. Replace every reference with an exact current token from the packet; do not copy example references.
+
+```json
+{
+  "proposal_id": "P-001",
+  "unit_refs": ["27@f752f9da"],
+  "set": {"project_context_id": "CTX-001"},
+  "confidence": "high",
+  "reason": "The route, date, and destination project agree.",
+  "evidence_refs": ["DOC-046"]
+}
+```
+
+```json
+{
+  "question_id": "Q-001",
+  "unit_refs": ["27@f752f9da"],
+  "question": "Which project did this ride support?",
+  "reason": "The available itinerary supports more than one project.",
+  "blocking": true
+}
+```

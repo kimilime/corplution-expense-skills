@@ -548,7 +548,11 @@ def normal_note(unit: dict[str, Any]) -> str:
     category = unit.get("source_category", "")
     subtype = unit.get("document_subtype", "")
     source = clean(unit.get("source_note"))
-    if subtype == "railway_e_ticket" or "G" in source[:12]:
+    rail_ticket_evidence = subtype == "railway_e_ticket" or (
+        category in {"travel", "rail"}
+        and bool(re.match(r"^[GCDKZT]\d{1,5}\b", source, flags=re.IGNORECASE))
+    )
+    if rail_ticket_evidence:
         route = route_from_note(source) or clean(unit.get("route"))
         note_type = C["rail_refund"] if is_refund_fee(unit) else C["rail"]
         return f"{note_type}\uff08{route}\uff09" if route else note_type
@@ -1681,6 +1685,56 @@ def cross_field_hint_merchants_compatible(first: dict[str, Any], second: dict[st
     )
 
 
+RAIL_MEAL_TRANSPORT_TERMS = ("高铁", "动车", "火车", "列车")
+RAIL_MEAL_CONSUMPTION_TERMS = (
+    "餐车",
+    "列车餐",
+    "高铁餐",
+    "动车餐",
+    "火车餐",
+    "点餐",
+    "用餐",
+    "吃饭",
+    "就餐",
+    "餐饮",
+    "餐费",
+)
+
+
+def is_rail_meal_hint(hint: dict[str, Any]) -> bool:
+    """Recognize a meal consumed during rail travel, not a rail ticket."""
+    text = clean(" ".join(
+        clean(hint.get(field))
+        for field in ("description", "note", "purpose", "business_reason", "merchant", "seller_name")
+    ))
+    return (
+        any(term in text for term in RAIL_MEAL_TRANSPORT_TERMS)
+        and any(term in text for term in RAIL_MEAL_CONSUMPTION_TERMS)
+    )
+
+
+def normalize_hint_source_category(hint: dict[str, Any], source_field: str) -> dict[str, Any]:
+    """Keep meal-array semantics and rail-meal wording from becoming travel tickets."""
+    declared = clean(hint.get("source_category") or hint.get("category"))
+    normalized = ""
+    reason = ""
+    if source_field == "meal_hints":
+        normalized = "meal"
+        reason = "meal_hints entry"
+    elif is_rail_meal_hint(hint):
+        normalized = "meal"
+        reason = "rail-travel meal wording"
+    if not normalized:
+        return hint
+    if declared and declared != normalized:
+        hint["_source_category_normalized_from"] = declared
+        hint["_source_category_normalization_reason"] = reason
+    hint["source_category"] = normalized
+    if "category" in hint:
+        hint["category"] = normalized
+    return hint
+
+
 def expense_hints_from_contexts(contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     hints: list[dict[str, Any]] = []
     for ctx in contexts:
@@ -1689,7 +1743,7 @@ def expense_hints_from_contexts(contexts: list[dict[str, Any]]) -> list[dict[str
             for index, raw_hint in enumerate(list_value(ctx.get(field)), start=1):
                 if not isinstance(raw_hint, dict):
                     continue
-                hint = dict(raw_hint)
+                hint = normalize_hint_source_category(dict(raw_hint), field)
                 hint.setdefault("hint_id", f"{clean(ctx.get('context_id')) or 'CTX'}:{field}:{index}")
                 if default_category and not hint.get("source_category") and not hint.get("category"):
                     hint["source_category"] = default_category

@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import copy
 import hashlib
 import json
 import subprocess
@@ -188,6 +189,144 @@ class SubagentProtocolTests(unittest.TestCase):
         self.assertNotIn("/home/", encoded)
         self.assertIn("[local-path]", encoded)
 
+    def test_task_packet_is_role_scoped_and_bounded_when_source_records_are_bloated(self) -> None:
+        fixture = PilotFixture(self.root)
+        extraction = json.loads(fixture.extraction_path.read_text(encoding="utf-8"))
+        extraction["documents"][0]["debug_blob"] = "E" * 300_000
+        extraction["documents"][0]["classification"] = {
+            "expense_category": "meal",
+            "unused_blob": "C" * 300_000,
+        }
+        integrity.stamp(extraction, "test")
+        write_json(fixture.extraction_path, extraction)
+
+        allocation = fixture.allocation()
+        allocation["source_extraction_fingerprint"] = extraction["integrity"]["fingerprint"]
+        allocation["allocation_units"][0]["raw_remarks"] = "R" * 300_000
+        allocation["allocation_units"][0]["unused_blob"] = "U" * 300_000
+        integrity.stamp(allocation, "test")
+        write_json(fixture.allocation_path, allocation)
+
+        task, _paths = fixture.task("allocation_analyst")
+        encoded = json.dumps(task, ensure_ascii=False)
+        self.assertEqual("role_scoped_compact.v1", task["snapshot_mode"])
+        self.assertLessEqual(
+            subagent_protocol.task_packet_size_bytes(task),
+            subagent_protocol.MAX_HANDOFF_PACKET_BYTES,
+        )
+        self.assertNotIn("raw_remarks", task["allocation_units"][0])
+        self.assertNotIn("unused_blob", encoded)
+        self.assertNotIn("R" * 1000, encoded)
+        self.assertNotIn("E" * 1000, encoded)
+        self.assertNotIn("C" * 1000, encoded)
+
+    def test_task_packet_over_cap_has_a_resource_or_split_recovery_message(self) -> None:
+        fixture = PilotFixture(self.root)
+        with mock.patch.object(subagent_protocol, "MAX_HANDOFF_PACKET_BYTES", 1):
+            with self.assertRaisesRegex(subagent_protocol.ProtocolError, "resource attachment or split"):
+                fixture.task("allocation_analyst")
+
+    def test_65_unit_49_document_handoffs_stay_within_the_80_kib_budget(self) -> None:
+        fixture = PilotFixture(self.root, unit_status="confirmed", open_question=False)
+        extraction = json.loads(fixture.extraction_path.read_text(encoding="utf-8"))
+        base_document = extraction["documents"][0]
+        extraction["documents"] = []
+        for number in range(1, 50):
+            document = copy.deepcopy(base_document)
+            document["document_id"] = f"DOC-{number:03d}"
+            document["source_file"] = f"invoice-{number:03d}.pdf"
+            document["source_sha256"] = f"{number:064x}"
+            document["invoice"]["invoice_number"] = f"INV-{number:04d}"
+            document["invoice"]["seller_name"] = f"Seller {number:03d}"
+            extraction["documents"].append(document)
+        integrity.stamp(extraction, "test")
+        write_json(fixture.extraction_path, extraction)
+
+        allocation = fixture.allocation()
+        base_unit = allocation["allocation_units"][0]
+        allocation["source_extraction_fingerprint"] = extraction["integrity"]["fingerprint"]
+        allocation["allocation_units"] = []
+        for number in range(1, 66):
+            unit = copy.deepcopy(base_unit)
+            document_number = ((number - 1) % 49) + 1
+            unit.update({
+                "unit_id": f"UNIT-{number:03d}",
+                "user_no": number,
+                "unit_ref": f"{number:08x}",
+                "source_document_id": f"DOC-{document_number:03d}",
+                "source_file": f"invoice-{document_number:03d}.pdf",
+                "source_sha256": f"{document_number:064x}",
+                "invoice_number": f"INV-{document_number:04d}",
+                "seller_name": f"Seller {document_number:03d}",
+                "final_note": f"出差餐费 {number}",
+                "raw_remarks": "Evidence summary " + ("x" * 350),
+            })
+            allocation["allocation_units"].append(unit)
+        integrity.stamp(allocation, "test")
+        write_json(fixture.allocation_path, allocation)
+
+        for role in ("allocation_analyst", "independent_reviewer"):
+            task, _paths = fixture.task(role)
+            self.assertEqual(65, task["snapshot_summary"]["allocation_unit_count"])
+            self.assertEqual(49, task["snapshot_summary"]["evidence_document_count"])
+            self.assertLessEqual(
+                subagent_protocol.task_packet_size_bytes(task),
+                subagent_protocol.MAX_HANDOFF_PACKET_BYTES,
+            )
+
+    def test_template_and_schema_make_coverage_and_kaede_finding_contract_explicit(self) -> None:
+        fixture = PilotFixture(self.root, unit_status="confirmed", open_question=False)
+        task, _paths = fixture.task("independent_reviewer")
+        template = subagent_protocol.result_template(task)
+        self.assertTrue(all(item["status"] == "completed" for item in template["coverage"]))
+        self.assertEqual(
+            ["completed", "not_applicable"],
+            task["result_contract"]["coverage_entry"]["allowed_statuses"],
+        )
+        self.assertEqual(
+            list(subagent_protocol.FINDING_FIELDS),
+            task["result_contract"]["finding"]["required_and_only_fields"],
+        )
+        finding_schema = task["response_json_schema"]["properties"]["findings"]["items"]
+        self.assertFalse(finding_schema["additionalProperties"])
+        self.assertEqual(list(subagent_protocol.FINDING_FIELDS), finding_schema["required"])
+
+    def test_coverage_and_finding_validation_explain_the_correct_return_shape(self) -> None:
+        fixture = PilotFixture(self.root, unit_status="confirmed", open_question=False)
+        task, _paths = fixture.task("independent_reviewer")
+        candidate = fixture.completed_template(task)
+        candidate["coverage"][0]["status"] = "block"
+        result_path = self.root / "kaede-invalid-coverage.json"
+        write_json(result_path, candidate)
+        with self.assertRaisesRegex(
+            subagent_protocol.ProtocolError,
+            r"coverage\[material_completeness\]\.status='block'.*only completed or not_applicable.*outcome",
+        ):
+            subagent_protocol.accept_result(
+                "independent_reviewer",
+                fixture.allocation_path,
+                fixture.extraction_path,
+                fixture.process,
+                result_path,
+            )
+
+        candidate = fixture.completed_template(task)
+        candidate["outcome"] = "block"
+        candidate["findings"] = [{
+            "check_id": "F-001",
+            "references": ["1@deadbeef"],
+            "summary": "Wrong legacy aliases.",
+        }]
+        write_json(result_path, candidate)
+        with self.assertRaisesRegex(subagent_protocol.ProtocolError, r"finding is missing required fields.*exactly"):
+            subagent_protocol.accept_result(
+                "independent_reviewer",
+                fixture.allocation_path,
+                fixture.extraction_path,
+                fixture.process,
+                result_path,
+            )
+
     def test_otako_result_requires_current_refs_and_generates_noncanonical_proposal_only(self) -> None:
         fixture = PilotFixture(self.root)
         task, _paths = fixture.task("allocation_analyst")
@@ -223,7 +362,7 @@ class SubagentProtocolTests(unittest.TestCase):
             result_path,
         )
         unreviewed = json.loads(paths["proposal"].read_text(encoding="utf-8"))
-        self.assertEqual("allocation_analysis.v1", accepted["schema_version"])
+        self.assertEqual("allocation_analysis.v2", accepted["schema_version"])
         self.assertEqual("allocation_proposals.v1", unreviewed["schema_version"])
         self.assertEqual("unreviewed", unreviewed["review_status"])
         promoted, promoted_path = subagent_protocol.promote_proposals(

@@ -313,11 +313,19 @@ def is_refund_fee(unit: dict[str, Any]) -> bool:
 
 def is_rail_ticket(unit: dict[str, Any]) -> bool:
     subtype = clean(unit.get("document_subtype"))
+    if subtype == "railway_e_ticket":
+        return True
+    source_category = clean(unit.get("source_category"))
+    if source_category and source_category not in {"travel", "rail"}:
+        return False
     text = clean(" ".join([unit.get("source_note", ""), unit.get("expense_note", ""), unit.get("final_note", "")]))
-    return subtype == "railway_e_ticket" or bool(re.match(r"^[GCDKZT]\d{1,5}\b", text, flags=re.IGNORECASE))
+    return bool(re.match(r"^[GCDKZT]\d{1,5}\b", text, flags=re.IGNORECASE))
 
 
 def is_flight_ticket(unit: dict[str, Any]) -> bool:
+    source_category = clean(unit.get("source_category"))
+    if source_category and source_category not in {"travel", "flight"}:
+        return False
     text = clean(" ".join([
         unit.get("document_subtype", ""),
         unit.get("source_note", ""),

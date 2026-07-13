@@ -33,12 +33,24 @@ SCRIPT_DIR = Path(__file__).resolve().parent
 SKILL_DIR = SCRIPT_DIR.parent
 POLICY_PATH = SKILL_DIR / "assets" / "policy.toml"
 
-TASK_SCHEMA = "subagent_task.v1"
-ANALYSIS_SCHEMA = "allocation_analysis.v1"
-REVIEW_SCHEMA = "stage3_independent_review.v1"
+TASK_SCHEMA = "subagent_task.v2"
+ANALYSIS_SCHEMA = "allocation_analysis.v2"
+REVIEW_SCHEMA = "stage3_independent_review.v2"
 PROPOSAL_SCHEMA = "allocation_proposals.v1"
-ANALYSIS_CONTRACT = "allocation-analysis.v1"
-REVIEW_CONTRACT = "stage3-preflight-review.v1"
+ANALYSIS_CONTRACT = "allocation-analysis.v2"
+REVIEW_CONTRACT = "stage3-preflight-review.v2"
+
+MAX_HANDOFF_PACKET_BYTES = 80 * 1024
+PACKET_TEXT_LIMIT = 480
+PACKET_NESTED_LIST_LIMIT = 24
+COVERAGE_STATUSES = ("completed", "not_applicable")
+COVERAGE_FIELDS = ("check_id", "status", "notes")
+PROPOSAL_FIELDS = ("proposal_id", "unit_refs", "set", "confidence", "reason", "evidence_refs")
+QUESTION_FIELDS = ("question_id", "unit_refs", "question", "reason", "blocking")
+FINDING_FIELDS = (
+    "finding_id", "severity", "code", "message", "unit_refs",
+    "evidence_refs", "recommended_action",
+)
 
 ROLE_SPECS: dict[str, dict[str, Any]] = {
     "allocation_analyst": {
@@ -105,6 +117,66 @@ EMBEDDED_ABSOLUTE_PATHS = (
     re.compile(r"(?i)(?<![A-Za-z0-9_])(?:[A-Z]:[\\/](?:[^\\/\r\n\"'<>|]+[\\/])*[^\r\n\"'<>|,;]*)"),
     re.compile(r"(?<![\\/])(?:\\\\[^\\/\s\r\n\"'<>|]+[\\/][^\\/\s\r\n\"'<>|]+(?:[\\/][^\r\n\"'<>|,;]*)?)"),
     re.compile(r"(?<![A-Za-z0-9_.])(?:/(?:[^/\s\r\n\"'<>|]+/)+[^\r\n\"'<>|,;]*)"),
+)
+
+COMMON_UNIT_PACKET_FIELDS = (
+    "unit_id", "user_no", "unit_no", "unit_ref", "source_document_id", "source_doc_id",
+    "source_item_id", "source_file", "source_filename", "document_subtype", "source_category",
+    "status", "confidence", "needs_user_confirmation", "amount", "invoice_amount",
+    "reimbursable_amount", "expense_date",
+    "date_source", "date_required", "date_is_provisional", "city", "formal_city", "hotel_city",
+    "origin", "destination", "route", "train_no", "travel_date", "departure_time",
+    "client_name", "client_charge_code", "project_context_id", "final_template_column",
+    "supporting_invoice_document_id", "supporting_invoice_filename",
+    "supporting_schedule_document_id", "supporting_schedule_filename",
+)
+OTAKO_UNIT_PACKET_FIELDS = COMMON_UNIT_PACKET_FIELDS + (
+    "expense_note", "match_reason", "auto_project_match", "hint_match_score",
+    "hint_match_summary", "hint_match_reasons", "matched_expense_hint_ids", "hint_candidates",
+    "journey_chain_id", "journey_chain_position", "journey_chain_route",
+    "journey_chain_assignment_rule", "journey_chain_confidence", "journey_chain_status",
+    "meal_context", "attendees", "business_reason", "check_in_date", "check_out_date",
+    "hotel_nights", "is_refund_fee", "refund_fee_amount", "issues",
+)
+KAEDE_UNIT_PACKET_FIELDS = COMMON_UNIT_PACKET_FIELDS + (
+    "final_note", "expense_note", "meal_context", "attendees", "business_reason",
+    "check_in_date", "check_out_date", "hotel_nights", "hotel_shared_with", "shared_room_with",
+    "is_refund_fee", "refund_fee_amount", "is_substitute_invoice", "substitute_for",
+    "partner_approval_document_id", "approval_screenshot_document_id", "journey_chain_id",
+    "journey_chain_route", "journey_chain_assignment_rule", "issues",
+)
+PROJECT_CONTEXT_PACKET_FIELDS = (
+    "context_id", "date_start", "date_end", "city", "cities", "client_name",
+    "client_charge_code", "project_description", "user_notes", "travel_buffer_days", "status",
+    "local_match_keywords", "meal_hints", "expense_hints",
+)
+QUESTION_PACKET_FIELDS = (
+    "question_id", "question_type", "status", "blocking", "unit_ids", "user_nos", "hint_ids",
+    "required_answer_tokens", "question", "why_it_matters", "reason",
+)
+HINT_PACKET_FIELDS = (
+    "hint_id", "hint_ref", "display_ref", "display_token", "source_field", "source_fields",
+    "source_index", "project_context_id", "client_name", "client_charge_code", "source_category",
+    "summary", "match_status", "resolution_status", "matched_unit_ids", "matched_user_nos",
+    "candidate_units", "question_id", "resolution_answer", "resolution_action",
+)
+DOCUMENT_PACKET_FIELDS = (
+    "document_id", "source_file", "source_sha256", "sha256", "document_role", "document_subtype",
+    "needs_review", "review_status", "excluded_by_user", "excluded_reason",
+    "linked_invoice_document_id", "linked_trip_report_document_id", "linked_document_ids",
+    "supporting_document_ids", "source_category", "classification_summary",
+)
+INVOICE_PACKET_FIELDS = (
+    "invoice_number", "seller_name", "issue_date", "total_amount", "amount", "currency",
+    "invoice_type", "invoice_kind", "line_item_name",
+)
+CLASSIFICATION_PACKET_FIELDS = (
+    "expense_category", "source_category", "document_role", "document_subtype", "city", "route",
+    "origin", "destination", "travel_date", "departure_time", "railway_leg", "refund_fee_amount",
+    "hotel_city", "check_in_date", "check_out_date", "hotel_nights",
+)
+UNRESOLVED_INPUT_PACKET_FIELDS = (
+    "source_file", "filename", "source_sha256", "sha256", "reason", "status", "resolution_status",
 )
 
 
@@ -215,6 +287,244 @@ def sanitize_snapshot(value: Any, key: str = "") -> Any:
         scrubbed = _scrub_embedded_paths(value)
         return scrubbed if len(scrubbed) <= 4000 else scrubbed[:4000] + " [truncated]"
     return value
+
+
+def _compact_packet_value(value: Any) -> Any:
+    """Bound selected snapshot values without dropping top-level evidence records."""
+    if isinstance(value, str):
+        return value if len(value) <= PACKET_TEXT_LIMIT else value[:PACKET_TEXT_LIMIT] + " [truncated]"
+    if isinstance(value, list):
+        items = [_compact_packet_value(item) for item in value[:PACKET_NESTED_LIST_LIMIT]]
+        if len(value) > PACKET_NESTED_LIST_LIMIT:
+            items.append(f"[{len(value) - PACKET_NESTED_LIST_LIMIT} additional item(s) omitted]")
+        return items
+    if isinstance(value, dict):
+        return {str(key): _compact_packet_value(item) for key, item in value.items()}
+    return value
+
+
+def _compact_record(record: Any, fields: tuple[str, ...]) -> dict[str, Any]:
+    if not isinstance(record, dict):
+        return {"invalid_record": _compact_packet_value(sanitize_snapshot(record))}
+    output: dict[str, Any] = {}
+    for field in fields:
+        if field not in record:
+            continue
+        value = record.get(field)
+        if value in (None, "", [], {}):
+            continue
+        output[field] = _compact_packet_value(sanitize_snapshot(value, field))
+    return output
+
+
+def _compact_document(document: Any) -> dict[str, Any]:
+    output = _compact_record(document, DOCUMENT_PACKET_FIELDS)
+    if not isinstance(document, dict):
+        return output
+    invoice = document.get("invoice")
+    if isinstance(invoice, dict):
+        output["invoice"] = _compact_record(invoice, INVOICE_PACKET_FIELDS)
+    classification = document.get("classification")
+    if isinstance(classification, dict):
+        output["classification"] = _compact_record(classification, CLASSIFICATION_PACKET_FIELDS)
+    return output
+
+
+def _compact_task_snapshot(
+    role: str,
+    allocation: dict[str, Any],
+    extraction: dict[str, Any],
+) -> dict[str, Any]:
+    unit_fields = OTAKO_UNIT_PACKET_FIELDS if role == "allocation_analyst" else KAEDE_UNIT_PACKET_FIELDS
+    units = [
+        _compact_record(unit, unit_fields)
+        for unit in allocation.get("allocation_units", [])
+    ]
+    documents = [
+        _compact_document(document)
+        for document in extraction.get("documents", [])
+    ]
+    questions = [
+        _compact_record(question, QUESTION_PACKET_FIELDS)
+        for question in allocation.get("questions", [])
+    ]
+    hints = [
+        _compact_record(hint, HINT_PACKET_FIELDS)
+        for hint in allocation.get("expense_hint_reconciliation", [])
+    ]
+    unresolved_inputs = [
+        _compact_record(item, UNRESOLVED_INPUT_PACKET_FIELDS)
+        for item in extraction.get("unresolved_input_files", [])
+    ]
+    contexts = [
+        _compact_record(context, PROJECT_CONTEXT_PACKET_FIELDS)
+        for context in allocation.get("project_contexts", [])
+    ]
+    return {
+        "snapshot_mode": "role_scoped_compact.v1",
+        "snapshot_limits": {
+            "text_field_char_limit": PACKET_TEXT_LIMIT,
+            "nested_list_item_limit": PACKET_NESTED_LIST_LIMIT,
+            "max_packet_bytes": MAX_HANDOFF_PACKET_BYTES,
+        },
+        "snapshot_summary": {
+            "allocation_unit_count": len(units),
+            "evidence_document_count": len(documents),
+            "allocation_question_count": len(questions),
+            "expense_hint_record_count": len(hints),
+            "unresolved_input_file_count": len(unresolved_inputs),
+        },
+        "project_contexts": contexts,
+        "allocation_units": units,
+        "allocation_questions": questions,
+        "expense_hint_reconciliation": hints,
+        "evidence_index": documents,
+        "unresolved_input_files": unresolved_inputs,
+    }
+
+
+def task_packet_size_bytes(task: dict[str, Any]) -> int:
+    return len(_json_bytes(task))
+
+
+def response_contract(role: str, coverage: list[str]) -> dict[str, Any]:
+    contract: dict[str, Any] = {
+        "return_format": "Return exactly one UTF-8 JSON object with no Markdown.",
+        "coverage_entry": {
+            "required_and_only_fields": list(COVERAGE_FIELDS),
+            "allowed_statuses": list(COVERAGE_STATUSES),
+            "rule": (
+                "Every required check must appear once. Do not use pass, advisory, block, "
+                "unavailable, or pending as a coverage status."
+            ),
+        },
+        "required_coverage_check_ids": coverage,
+        "structured_output_hint": (
+            "When the host supports JSON Schema response mode, use response_json_schema. "
+            "Otherwise start from the supplied result template exactly."
+        ),
+    }
+    if role == "allocation_analyst":
+        contract.update({
+            "proposal": {
+                "required_and_only_fields": list(PROPOSAL_FIELDS),
+                "confidence_values": ["high", "medium", "low"],
+                "unit_refs_rule": "Use one or more exact current N@ref values.",
+            },
+            "user_question": {
+                "required_and_only_fields": list(QUESTION_FIELDS),
+                "blocking_type": "boolean",
+            },
+        })
+    else:
+        contract.update({
+            "outcome": {
+                "allowed_values": ["pass", "advisory", "block", "unavailable"],
+                "rule": "Put the overall conclusion only here, never in coverage[].status.",
+            },
+            "finding": {
+                "required_and_only_fields": list(FINDING_FIELDS),
+                "severity_values": ["blocking", "advisory"],
+                "blocking_reference_rule": "A blocking finding needs a current unit_refs or evidence_refs entry.",
+            },
+        })
+    return contract
+
+
+def response_json_schema(role: str, coverage: list[str]) -> dict[str, Any]:
+    coverage_item = {
+        "type": "object",
+        "additionalProperties": False,
+        "required": list(COVERAGE_FIELDS),
+        "properties": {
+            "check_id": {"type": "string", "enum": coverage},
+            "status": {"type": "string", "enum": list(COVERAGE_STATUSES)},
+            "notes": {"type": "string"},
+        },
+    }
+    properties: dict[str, Any] = {
+        "schema_version": {"type": "string", "const": ANALYSIS_SCHEMA if role == "allocation_analyst" else REVIEW_SCHEMA},
+        "task_id": {"type": "string"},
+        "source_task_fingerprint": {"type": "string"},
+        "source_allocation_fingerprint": {"type": "string"},
+        "source_extraction_fingerprint": {"type": "string"},
+        "agent_id": {"type": "string"},
+        "agent_display_name": {"type": "string"},
+        "coverage": {
+            "type": "array",
+            "minItems": len(coverage),
+            "maxItems": len(coverage),
+            "items": coverage_item,
+        },
+        "summary": {"type": "string", "minLength": 1},
+    }
+    required = list(properties)
+    if role == "allocation_analyst":
+        properties.update({
+            "proposals": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": list(PROPOSAL_FIELDS),
+                    "properties": {
+                        "proposal_id": {"type": "string", "minLength": 1},
+                        "unit_refs": {"type": "array", "items": {"type": "string"}, "minItems": 1},
+                        "set": {"type": "object", "minProperties": 1},
+                        "confidence": {"type": "string", "enum": ["high", "medium", "low"]},
+                        "reason": {"type": "string", "minLength": 1},
+                        "evidence_refs": {"type": "array", "items": {"type": "string"}},
+                    },
+                },
+            },
+            "user_questions": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": list(QUESTION_FIELDS),
+                    "properties": {
+                        "question_id": {"type": "string", "minLength": 1},
+                        "unit_refs": {"type": "array", "items": {"type": "string"}},
+                        "question": {"type": "string", "minLength": 1},
+                        "reason": {"type": "string", "minLength": 1},
+                        "blocking": {"type": "boolean"},
+                    },
+                },
+            },
+            "warnings": {"type": "array", "items": {"type": "string", "minLength": 1}},
+        })
+        required.extend(["proposals", "user_questions", "warnings"])
+    else:
+        properties.update({
+            "review_contract_version": {"type": "string", "const": REVIEW_CONTRACT},
+            "outcome": {"type": "string", "enum": ["pass", "advisory", "block", "unavailable"]},
+            "findings": {
+                "type": "array",
+                "items": {
+                    "type": "object",
+                    "additionalProperties": False,
+                    "required": list(FINDING_FIELDS),
+                    "properties": {
+                        "finding_id": {"type": "string", "minLength": 1},
+                        "severity": {"type": "string", "enum": ["blocking", "advisory"]},
+                        "code": {"type": "string", "minLength": 1},
+                        "message": {"type": "string", "minLength": 1},
+                        "unit_refs": {"type": "array", "items": {"type": "string"}},
+                        "evidence_refs": {"type": "array", "items": {"type": "string"}},
+                        "recommended_action": {"type": "string", "minLength": 1},
+                    },
+                },
+            },
+        })
+        required.extend(["review_contract_version", "outcome", "findings"])
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": False,
+        "required": required,
+        "properties": properties,
+    }
 
 
 def _full_fingerprint(payload: dict[str, Any], label: str) -> str:
@@ -409,6 +719,7 @@ def _build_task(
         "role_instructions_sha256": role_sha,
     }
     task_id = canonical_sha(basis)
+    snapshot = _compact_task_snapshot(role, allocation, extraction)
     task = {
         "schema_version": TASK_SCHEMA,
         "task_id": task_id,
@@ -422,22 +733,30 @@ def _build_task(
         "required_coverage": list(spec["coverage"]),
         "allowed_unit_update_fields": sorted(ALLOWED_UNIT_FIELDS),
         "policy": policy,
-        "project_contexts": sanitize_snapshot(allocation.get("project_contexts", [])),
-        "allocation_units": sanitize_snapshot(allocation.get("allocation_units", [])),
-        "allocation_questions": sanitize_snapshot(allocation.get("questions", [])),
-        "expense_hint_reconciliation": sanitize_snapshot(
-            allocation.get("expense_hint_reconciliation", [])
-        ),
-        "evidence_index": sanitize_snapshot(extraction.get("documents", [])),
-        "unresolved_input_files": sanitize_snapshot(extraction.get("unresolved_input_files", [])),
+        "result_contract": response_contract(role, list(spec["coverage"])),
+        "response_json_schema": response_json_schema(role, list(spec["coverage"])),
+        **snapshot,
         "handoff_rules": [
             "Use only this packet; do not access files, tools, scripts, or prior-agent reasoning.",
+            (
+                "The coordinator must pass this packet and the result template directly through a read-only "
+                "attachment/resource handoff when the host supports it. Never ask the subagent to locate or read "
+                "workspace files."
+            ),
+            "When the host supports structured JSON output, use response_json_schema; otherwise fill the result template exactly.",
             "Return exactly one JSON object and no Markdown.",
             "Do not mutate reimbursement artifacts or claim that a proposal was applied.",
             "Bind the result to the exact task and allocation fingerprints in the result template.",
         ],
     }
     integrity.stamp(task, "subagent_protocol.py")
+    packet_bytes = task_packet_size_bytes(task)
+    if packet_bytes > MAX_HANDOFF_PACKET_BYTES:
+        raise ProtocolError(
+            f"compact {spec['display_name']} handoff is {packet_bytes:,} bytes, exceeding the "
+            f"{MAX_HANDOFF_PACKET_BYTES:,}-byte cap. Use a host read-only resource attachment or split the "
+            "review into explicitly scoped packets; never make the subagent browse workspace files."
+        )
     return task, allocation
 
 
@@ -446,7 +765,7 @@ def result_template(task: dict[str, Any]) -> dict[str, Any]:
     allocation_fp = clean((task.get("source_generation") or {}).get("source_allocation_fingerprint"))
     extraction_fp = clean((task.get("source_generation") or {}).get("source_extraction_fingerprint"))
     coverage = [
-        {"check_id": check_id, "status": "pending", "notes": ""}
+        {"check_id": check_id, "status": "completed", "notes": ""}
         for check_id in task.get("required_coverage", [])
     ]
     common = {
@@ -537,16 +856,27 @@ def _validate_coverage(candidate: dict[str, Any], task: dict[str, Any]) -> None:
     expected = list(task.get("required_coverage", []))
     seen: dict[str, str] = {}
     for item in coverage:
-        if not isinstance(item, dict) or set(item) - {"check_id", "status", "notes"}:
-            raise ProtocolError("each coverage entry may contain only check_id, status, and notes")
+        if not isinstance(item, dict) or set(item) - set(COVERAGE_FIELDS):
+            raise ProtocolError(
+                "each coverage entry may contain only check_id, status, and notes; "
+                "status must be completed or not_applicable"
+            )
         if any(not isinstance(item.get(field, ""), str) for field in ("check_id", "status", "notes")):
             raise ProtocolError("coverage check_id, status, and notes must be strings")
         check_id = clean(item.get("check_id"))
         status = clean(item.get("status"))
         if check_id in seen:
             raise ProtocolError(f"coverage repeats check {check_id}")
-        if status not in {"completed", "not_applicable"}:
-            raise ProtocolError(f"coverage check {check_id or '?'} is still pending or invalid")
+        if status not in COVERAGE_STATUSES:
+            role_hint = (
+                "Put pass/advisory/block/unavailable only in outcome and concrete defects in findings."
+                if task.get("role_id") == "independent_reviewer"
+                else "Put allocation advice in proposals or user_questions, not in coverage status."
+            )
+            raise ProtocolError(
+                f"coverage[{check_id or '?'}].status={status!r} is invalid; only completed or "
+                f"not_applicable are allowed. {role_hint}"
+            )
         seen[check_id] = status
     if set(seen) != set(expected):
         missing = sorted(set(expected) - set(seen))
@@ -631,11 +961,18 @@ def _validate_analysis(
     for item in proposals:
         if not isinstance(item, dict):
             raise ProtocolError("each proposal must be an object")
-        unknown = set(item) - {
-            "proposal_id", "unit_refs", "set", "confidence", "reason", "evidence_refs"
-        }
+        missing = set(PROPOSAL_FIELDS) - set(item)
+        unknown = set(item) - set(PROPOSAL_FIELDS)
+        if missing:
+            raise ProtocolError(
+                "proposal is missing required fields: " + ", ".join(sorted(missing))
+                + ". A proposal must contain exactly: " + ", ".join(PROPOSAL_FIELDS)
+            )
         if unknown:
-            raise ProtocolError(f"proposal contains unknown fields: {', '.join(sorted(unknown))}")
+            raise ProtocolError(
+                f"proposal contains unknown fields: {', '.join(sorted(unknown))}. "
+                "A proposal may contain only: " + ", ".join(PROPOSAL_FIELDS)
+            )
         proposal_id = clean(item.get("proposal_id"))
         if not isinstance(item.get("proposal_id"), str) or not proposal_id or proposal_id in proposal_ids:
             raise ProtocolError("proposal_id must be present and unique")
@@ -669,9 +1006,18 @@ def _validate_analysis(
     for item in questions:
         if not isinstance(item, dict):
             raise ProtocolError("each user question must be an object")
-        unknown = set(item) - {"question_id", "unit_refs", "question", "reason", "blocking"}
+        missing = set(QUESTION_FIELDS) - set(item)
+        unknown = set(item) - set(QUESTION_FIELDS)
+        if missing:
+            raise ProtocolError(
+                "user question is missing required fields: " + ", ".join(sorted(missing))
+                + ". A user question must contain exactly: " + ", ".join(QUESTION_FIELDS)
+            )
         if unknown:
-            raise ProtocolError(f"user question contains unknown fields: {', '.join(sorted(unknown))}")
+            raise ProtocolError(
+                f"user question contains unknown fields: {', '.join(sorted(unknown))}. "
+                "A user question may contain only: " + ", ".join(QUESTION_FIELDS)
+            )
         question_id = clean(item.get("question_id"))
         if not isinstance(item.get("question_id"), str) or not question_id or question_id in question_ids:
             raise ProtocolError("question_id must be present and unique")
@@ -720,12 +1066,18 @@ def _validate_review(
     for item in findings:
         if not isinstance(item, dict):
             raise ProtocolError("each review finding must be an object")
-        unknown = set(item) - {
-            "finding_id", "severity", "code", "message", "unit_refs",
-            "evidence_refs", "recommended_action",
-        }
+        missing = set(FINDING_FIELDS) - set(item)
+        unknown = set(item) - set(FINDING_FIELDS)
+        if missing:
+            raise ProtocolError(
+                "review finding is missing required fields: " + ", ".join(sorted(missing))
+                + ". A finding must contain exactly: " + ", ".join(FINDING_FIELDS)
+            )
         if unknown:
-            raise ProtocolError(f"review finding contains unknown fields: {', '.join(sorted(unknown))}")
+            raise ProtocolError(
+                f"review finding contains unknown fields: {', '.join(sorted(unknown))}. "
+                "A finding may contain only: " + ", ".join(FINDING_FIELDS)
+            )
         finding_id = clean(item.get("finding_id"))
         if not isinstance(item.get("finding_id"), str) or not finding_id or finding_id in finding_ids:
             raise ProtocolError("finding_id must be present and unique")
@@ -1228,11 +1580,18 @@ def main(argv: list[str] | None = None) -> int:
                 Path(args.process_dir),
             )
             print(f"Prepared {task.get('display_name')} task {task.get('task_id')}")
-            print(f"Task packet: {paths['task']}")
+            print(
+                f"Task packet: {paths['task']} "
+                f"({task_packet_size_bytes(task):,} bytes; cap {MAX_HANDOFF_PACKET_BYTES:,})"
+            )
             print(f"Result template: {paths['template']}")
-            print("SUBAGENT HANDOFF: start a fresh read-only subagent with the COMPLETE JSON contents "
-                  "of both files. Do not give it filesystem paths or mutation tools. Save its exact JSON "
-                  "response outside process/, then run Chief accept-agent.")
+            print(
+                "SUBAGENT HANDOFF: start a fresh read-only subagent. Attach the compact task packet and "
+                "result template as host resources when available; otherwise include their complete JSON contents "
+                "in its initial message. Do not give filesystem paths or mutation tools, and never ask it to locate "
+                "workspace files. Use response_json_schema when the host supports structured output. Save its exact "
+                "JSON response outside process/, then run Chief accept-agent."
+            )
             return 0
         if args.command == "accept":
             accepted, paths = accept_result(

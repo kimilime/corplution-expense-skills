@@ -12,6 +12,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import write_reimbursement_template as writer  # noqa: E402
 import apply_allocation_answers as updater  # noqa: E402
+import allocate_expenses as allocator  # noqa: E402
 
 
 def meal_row(
@@ -44,6 +45,73 @@ def meal_row(
 
 
 class MealPolicyTests(unittest.TestCase):
+    def test_rail_meal_hints_override_an_incorrect_travel_label(self) -> None:
+        hints = allocator.expense_hints_from_contexts([
+            {
+                "context_id": "CTX-001",
+                "meal_hints": [],
+                "expense_hints": [{
+                    "source_category": "travel",
+                    "date": "2026-05-18",
+                    "amount": "38.00",
+                    "description": "高铁上点餐",
+                }],
+            },
+        ])
+        self.assertEqual("meal", hints[0]["source_category"])
+        self.assertEqual("travel", hints[0]["_source_category_normalized_from"])
+
+    def test_meal_hints_are_meals_even_when_a_weak_model_labels_them_travel(self) -> None:
+        hints = allocator.expense_hints_from_contexts([
+            {
+                "context_id": "CTX-001",
+                "meal_hints": [{
+                    "source_category": "travel",
+                    "date": "2026-05-18",
+                    "amount": "38.00",
+                    "description": "高铁餐车用餐",
+                }],
+                "expense_hints": [],
+            },
+        ])
+        self.assertEqual("meal", hints[0]["source_category"])
+
+    def test_real_rail_ticket_hint_remains_travel(self) -> None:
+        hints = allocator.expense_hints_from_contexts([
+            {
+                "context_id": "CTX-001",
+                "meal_hints": [],
+                "expense_hints": [{
+                    "source_category": "travel",
+                    "date": "2026-05-18",
+                    "amount": "218.00",
+                    "description": "G1234 高铁票 上海虹桥-郑州东",
+                }],
+            },
+        ])
+        self.assertEqual("travel", hints[0]["source_category"])
+
+    def test_rail_meal_note_never_becomes_a_ticket_proof(self) -> None:
+        rail_meal = {
+            "source_category": "meal",
+            "source_note": "G1234 高铁上点餐 上海-郑州",
+            "meal_context": "business_trip",
+        }
+        self.assertFalse(writer.is_rail_ticket(rail_meal))
+        self.assertFalse(updater.is_rail_ticket(rail_meal))
+        self.assertEqual("出差餐费", allocator.normal_note(rail_meal))
+        self.assertEqual("meal", writer.proof_type(rail_meal))
+        self.assertEqual("出差餐费", writer.normalized_note_base(rail_meal))
+
+    def test_real_rail_ticket_still_receives_a_rail_proof_type(self) -> None:
+        rail_ticket = {
+            "source_category": "travel",
+            "document_subtype": "railway_e_ticket",
+            "source_note": "G1234 上海虹桥 -> 郑州东",
+        }
+        self.assertTrue(writer.is_rail_ticket(rail_ticket))
+        self.assertEqual("rail", writer.proof_type(rail_ticket))
+
     def test_shanghai_meal_column_trip_meal_uses_150_policy(self) -> None:
         row = meal_row(
             13,
