@@ -19,6 +19,7 @@ from typing import Any
 
 import integrity
 import allocate_expenses
+import allocation_generations
 
 
 def configure_stdio() -> None:
@@ -315,6 +316,11 @@ def inspect_workflow(
     alloc_fp = ""
     answers_current = False
     current_answer_count = 0
+    rebase_current = False
+    rebase_action_count = 0
+    rebase_available = False
+    rebase_source_path = ""
+    rebase_lineage_error = ""
     if not allocation:
         if allocation_path.exists():
             lines.append("Stage 2 归集: BLOCKED expense-allocation.json 无法解析")
@@ -388,6 +394,9 @@ def inspect_workflow(
                 if isinstance(answers.get(field, []), list) else 0
                 for field in ANSWER_ACTION_FIELDS
             }
+            answer_action_counts["lineage_rebase"] = (
+                1 if isinstance(answers.get("lineage_rebase"), dict) and answers.get("lineage_rebase") else 0
+            )
             current_answer_count = sum(answer_action_counts.values())
             answers_current = bool(
                 alloc_fp
@@ -403,6 +412,51 @@ def inspect_workflow(
                 "schema_valid": answers_schema_valid,
                 "current": answers_current,
             }
+        rebase_path = pdir / "rebase-decisions.json"
+        rebase_decisions = load(rebase_path)
+        if rebase_decisions:
+            rebase_metadata = rebase_decisions.get("rebase_metadata", {})
+            rebase_integrity_ok, _rebase_integrity_reason = integrity.check(rebase_decisions)
+            rebase_action_count = sum(
+                len(rebase_decisions.get(field, []))
+                if isinstance(rebase_decisions.get(field, []), list) else 0
+                for field in ("decisions", "expense_hint_resolutions")
+            )
+            declared_generation = str(
+                rebase_decisions.get("for_allocation_fingerprint", "")
+            ).strip().lower()
+            target_fingerprint = str(
+                (rebase_metadata if isinstance(rebase_metadata, dict) else {}).get(
+                    "target_allocation_fingerprint", ""
+                )
+            ).strip().lower()
+            rebase_current = bool(
+                alloc_fp
+                and rebase_integrity_ok
+                and str(rebase_decisions.get("integrity", {}).get("stamped_by", "")) == "rebase_allocation_decisions.py"
+                and len(declared_generation) >= 8
+                and str(alloc_fp).lower().startswith(declared_generation)
+                and target_fingerprint == str(alloc_fp).lower()
+            )
+            if rebase_current:
+                # Even a zero-carry rebase must pass through Composer/updater
+                # once to record that lineage review has been completed.
+                rebase_action_count += 1
+            artifacts["rebase_decisions"] = {
+                "path": str(rebase_path),
+                "target_allocation_fingerprint": target_fingerprint,
+                "action_count": rebase_action_count,
+                "current": rebase_current,
+            }
+        if ok and not allocation.get("change_log"):
+            source_path, _source_alloc, rebase_reason = allocation_generations.discover_rebase_source(
+                allocation_path, allocation
+            )
+            if source_path is not None:
+                rebase_available = True
+                rebase_source_path = str(source_path)
+            elif allocation_generations.is_lineage_integrity_error(rebase_reason):
+                rebase_lineage_error = rebase_reason
         generation_mismatch = bool(extraction_fp) and (
             str(allocation.get("source_extraction_fingerprint", "")) != extraction_fp
         )
@@ -420,8 +474,9 @@ def inspect_workflow(
             not context_ok or actual_context_sha != expected_context_sha
         )
         upstream_unavailable = not stage1_ready
-        stage2_state = "BLOCKED" if not ok or generation_mismatch or context_mismatch or upstream_unavailable or hint_ledger_missing else (
-            "✓" if not open_qs and not unconfirmed and not answers_current and not unresolved_hints else "…"
+        stage2_state = "BLOCKED" if not ok or generation_mismatch or context_mismatch or upstream_unavailable or hint_ledger_missing or rebase_lineage_error else (
+            "✓" if not open_qs and not unconfirmed and not answers_current and not unresolved_hints
+            and not rebase_available and not (rebase_current and rebase_action_count) else "…"
         )
         stamp_note = "" if ok else f" [INTEGRITY FAILED: {reason}]"
         if generation_mismatch:
@@ -432,21 +487,30 @@ def inspect_workflow(
             stamp_note += " [BLOCKED: extraction is not ready]"
         if hint_ledger_missing:
             stamp_note += " [STALE: user expense-record reconciliation ledger missing]"
+        if rebase_lineage_error:
+            stamp_note += f" [BLOCKED: {rebase_lineage_error}]"
         answer_note = f"，待应用答案 {current_answer_count} 项" if answers_current else ""
+        rebase_note = (
+            f"，待迁移决定 {rebase_action_count} 项" if rebase_current and rebase_action_count
+            else ("，检测到可迁移的上一代决定" if rebase_available and not rebase_current else "")
+        )
         hint_count_text = "未知（台账缺失）" if hint_ledger_missing else f"{len(unresolved_hints)} 条"
         lines.append(f"Stage 2 归集: {stage2_state} 单元 {len(confirmed)}/{len(units)} 已确认"
                      f"（另排除 {len(closed)}），阻断问题 {len(open_qs)} 个，未对应用户记录 {hint_count_text}"
-                     f"{answer_note}{stamp_note}")
+                     f"{answer_note}{rebase_note}{stamp_note}")
         stage2_ready = (
-            ok and not generation_mismatch and not context_mismatch and not upstream_unavailable
+            ok and not generation_mismatch and not context_mismatch and not upstream_unavailable and not rebase_lineage_error
             and not hint_ledger_missing and not unresolved_hints
             and not open_qs and not unconfirmed and not answers_current
+            and not rebase_available and not (rebase_current and rebase_action_count)
         )
         stages["allocation"] = {
             "number": 2,
             "status": "ready" if stage2_ready else (
-                "blocked" if not ok or generation_mismatch or context_mismatch or upstream_unavailable else (
-                    "command_ready" if answers_current else "needs_user"
+                "blocked" if not ok or generation_mismatch or context_mismatch or upstream_unavailable or rebase_lineage_error else (
+                    "command_ready" if answers_current or rebase_available or (
+                        rebase_current and rebase_action_count
+                    ) else "needs_user"
                 )
             ),
             "unit_count": len(units),
@@ -457,6 +521,11 @@ def inspect_workflow(
             "unresolved_expense_hint_count": len(unresolved_hints),
             "expense_hint_ledger_missing": hint_ledger_missing,
             "unapplied_answer_count": current_answer_count if answers_current else 0,
+            "rebase_available": rebase_available,
+            "rebase_source_path": rebase_source_path,
+            "rebase_decisions_current": rebase_current,
+            "rebase_action_count": rebase_action_count if rebase_current else 0,
+            "rebase_lineage_error": rebase_lineage_error,
             "integrity_valid": ok,
             "generation_mismatch": generation_mismatch,
             "context_mismatch": context_mismatch,
@@ -469,8 +538,12 @@ def inspect_workflow(
             "source_project_context_file": str(context_path),
             "source_project_context_sha256": expected_context_sha,
             "actual_project_context_sha256": actual_context_sha,
+            "allocation_engine_revision": str(allocation.get("allocation_engine_revision", "")),
+            "previous_allocation_file": str(allocation.get("previous_allocation_file", "")),
         }
         if not ok:
+            integrity_blocked = True
+        if rebase_lineage_error:
             integrity_blocked = True
         if not ok:
             set_next(next_step(
@@ -478,6 +551,15 @@ def inspect_workflow(
                 "allocation",
                 "Allocation integrity failed; regenerate Stage 2 and use only composer/updater for later changes.",
                 missing=["current project context file"],
+            ), priority=100)
+        elif rebase_lineage_error:
+            set_next(next_step(
+                "blocked",
+                "allocation",
+                "The immutable allocation generation chain is missing, cyclic, or failed integrity. "
+                "Recover the referenced stamped archive or use the documented clean sibling-batch rebuild; "
+                "do not continue with ordinary answers.",
+                missing=[rebase_lineage_error],
             ), priority=100)
         elif generation_mismatch:
             if context_ok:
@@ -537,6 +619,22 @@ def inspect_workflow(
                 "through the official updater.",
                 operation="apply",
                 parameters={"answers": str(answers_path)},
+            ))
+        elif rebase_current and rebase_action_count:
+            set_next(next_step(
+                "command",
+                "allocation",
+                f"Compile the {rebase_action_count} lineage-rebased decision action(s) through Composer.",
+                operation="compose",
+                parameters={"decisions": str(rebase_path)},
+            ))
+        elif rebase_available and not rebase_current:
+            set_next(next_step(
+                "command",
+                "allocation",
+                "A prior same-basis allocation contains official user decisions. Rebase them by evidence identity before asking repeated questions.",
+                operation="rebase",
+                parameters={"old": rebase_source_path},
             ))
         elif open_qs:
             set_next(next_step(

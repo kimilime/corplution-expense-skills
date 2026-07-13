@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import hashlib
 import subprocess
 import sys
 import tempfile
@@ -105,6 +106,9 @@ class ComposerTests(unittest.TestCase):
             "allocation_units": [{
                 "unit_id": "UNIT-001",
                 "user_no": 1,
+                "unit_ref": "00000001",
+                "unit_identity_sha256": hashlib.sha256(b"unit-1").hexdigest(),
+                "source_sha256": "a" * 64,
                 "status": "draft",
                 "source_category": "other",
                 "final_template_column": "other",
@@ -114,6 +118,8 @@ class ComposerTests(unittest.TestCase):
                 "final_note": "Test expense",
             }],
             "project_contexts": [],
+            "allocation_engine_revision": "expense-allocation-engine.v2",
+            "source_policy_sha256": "p" * 64,
             "questions": [{
                 "question_id": "Q-001",
                 "unit_ids": ["UNIT-001"],
@@ -128,6 +134,12 @@ class ComposerTests(unittest.TestCase):
         self.temp.cleanup()
 
     def compose(self, decisions: dict) -> tuple[subprocess.CompletedProcess[str], Path]:
+        if decisions.get("schema_version") == "allocation_decisions.v1" and not decisions.get(
+            "for_allocation_fingerprint"
+        ):
+            allocation = json.loads(self.allocation_path.read_text(encoding="utf-8"))
+            decisions = dict(decisions)
+            decisions["for_allocation_fingerprint"] = allocation["integrity"]["fingerprint"][:8]
         decisions_path = self.root / "batch-decisions.json"
         output_path = self.root / "process" / "allocation-answers.json"
         write_json(decisions_path, decisions)
@@ -142,7 +154,7 @@ class ComposerTests(unittest.TestCase):
     def test_composer_resolves_real_user_no_field(self) -> None:
         result, output = self.compose({
             "schema_version": "allocation_decisions.v1",
-            "decisions": [{"units": "1", "set": {"status": "confirmed"}}],
+            "decisions": [{"units": "1@00000001", "set": {"status": "confirmed"}}],
             "question_updates": [],
             "project_contexts": [],
             "confirm_units": [],
@@ -163,6 +175,8 @@ class ComposerTests(unittest.TestCase):
                 **prototype,
                 "unit_id": f"UNIT-{number:03d}",
                 "user_no": number,
+                "unit_ref": f"{number:08x}",
+                "unit_identity_sha256": hashlib.sha256(f"unit-{number}".encode()).hexdigest(),
             }
             for number in range(1, 72)
         ]
@@ -171,7 +185,10 @@ class ComposerTests(unittest.TestCase):
         write_json(self.allocation_path, allocation)
         result, output = self.compose({
             "schema_version": "allocation_decisions.v1",
-            "decisions": [{"units": "1-71", "set": {"status": "dropped"}}],
+            "decisions": [{
+                "units": ",".join(f"{number}@{number:08x}" for number in range(1, 72)),
+                "set": {"status": "dropped"},
+            }],
             "question_updates": [],
             "project_contexts": [],
             "confirm_units": [],
@@ -198,7 +215,7 @@ class ComposerTests(unittest.TestCase):
                 "project_description": "Updated",
             }],
             "confirm_units": [],
-            "drop_units": ["1"],
+            "drop_units": ["1@00000001"],
             "exclude_units": [],
         })
         self.assertEqual(0, result.returncode, result.stderr)
@@ -211,8 +228,11 @@ class ComposerTests(unittest.TestCase):
         allocation = json.loads(self.allocation_path.read_text(encoding="utf-8"))
         allocation["expense_hint_reconciliation"] = [{
             "hint_id": "CTX-001:expense_hints:1",
+            "hint_ref": "1234abcd",
+            "hint_identity_sha256": hashlib.sha256(b"hint-1").hexdigest(),
             "question_id": "Q-HINT-001",
             "display_ref": "R1",
+            "display_token": "R1@1234abcd",
             "summary": "2026-06-01 未开票费用 RMB 88.00",
             "match_status": "unmatched",
             "resolution_status": "open",
@@ -224,7 +244,7 @@ class ComposerTests(unittest.TestCase):
             "question_type": "expense_hint_reconciliation",
             "status": "open",
             "requires_explicit_answer": True,
-            "required_answer_tokens": ["R1"],
+            "required_answer_tokens": ["R1@1234abcd"],
         }]
         integrity.stamp(allocation, "test")
         write_json(self.allocation_path, allocation)
@@ -234,7 +254,7 @@ class ComposerTests(unittest.TestCase):
             "decisions": [],
             "expense_hint_resolutions": [{
                 "question_id": "Q-HINT-001",
-                "record_ref": "R1",
+                "record_ref": "R1@1234abcd",
                 "action": "pending_invoice",
                 "note": "商户承诺稍后补开",
             }],

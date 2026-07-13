@@ -16,8 +16,11 @@ from typing import Any
 
 # Policy numbers and year-coded charge codes come from assets/policy.toml;
 # edit that file (not this one) when company policy changes.
-from policy_config import load_policy
+from policy_config import load_policy, policy_path
+import allocation_generations
+import hint_refs
 import integrity
+import unit_refs
 
 _POLICY = load_policy()
 
@@ -1976,6 +1979,8 @@ def hint_candidate_record(
 def hint_reconciliation_record(hint: dict[str, Any]) -> dict[str, Any]:
     return {
         "hint_id": clean(hint.get("hint_id")),
+        "hint_ref": clean(hint.get("_hint_ref")),
+        "hint_identity_sha256": clean(hint.get("_hint_identity_sha256")),
         "source_field": clean(hint.get("_source_field")),
         "source_fields": list_value(hint.get("_source_fields")),
         "source_index": hint.get("_source_index", ""),
@@ -2002,6 +2007,7 @@ def apply_expense_hints(
     hints = expense_hints_from_contexts(contexts)
     if not hints:
         return []
+    hint_refs.assign_hint_refs(hints)
     reconciliation = [hint_reconciliation_record(hint) for hint in hints]
     records = {id(hint): record for hint, record in zip(hints, reconciliation)}
     for unit in units:
@@ -2596,9 +2602,11 @@ def add_expense_hint_reconciliation_questions(
         required_tokens: list[str] = []
         for record_index, record in enumerate(records, start=1):
             display_ref = f"R{record_index}"
-            required_tokens.append(display_ref)
+            display_token = f"{display_ref}@{clean(record.get('hint_ref'))}"
+            required_tokens.append(display_token)
             record["question_id"] = question_id
             record["display_ref"] = display_ref
+            record["display_token"] = display_token
             candidates = record.get("candidate_units") or []
             for candidate in candidates:
                 unit_id = clean(candidate.get("unit_id"))
@@ -2618,7 +2626,7 @@ def add_expense_hint_reconciliation_questions(
             else:
                 match_text = "无可信候选"
             record_lines.append(
-                f"- {display_ref} | {record.get('summary') or record.get('hint_id')} | "
+                f"- {display_token} | {record.get('summary') or record.get('hint_id')} | "
                 f"项目 {record.get('client_name') or '?'} / {record.get('client_charge_code') or '?'} | {match_text}"
             )
         questions.append({
@@ -2631,7 +2639,7 @@ def add_expense_hint_reconciliation_questions(
             "question": (
                 f"你提供的以下 {category} 费用记录没有找到唯一对应发票，不能静默忽略。\n"
                 + "\n".join(record_lines)
-                + "\n请逐条保留 R 编号回复：它对应第几项/哪张发票，是否被某张汇总发票合并覆盖，"
+                + "\n请逐条保留完整 R@ref 令牌回复：它对应第几项/哪张发票，是否被某张汇总发票合并覆盖，"
                 "是否稍后补票，还是这条记录不报销、可以排除。稍后补票会保留为待补凭证并继续阻断写表；"
                 "确认不报销则关闭这条记录，不会强制要求补票。"
             ),
@@ -2812,6 +2820,11 @@ def build_questions(
     return questions
 
 
+def unit_ref_token(unit: dict[str, Any]) -> str:
+    no = unit.get("user_no") or unit.get("unit_no") or "?"
+    return f"{no}@{unit.get('unit_ref', '????????')}"
+
+
 def unit_review_line(unit: dict[str, Any]) -> str:
     source = clean(unit.get("source_filename")) or clean(unit.get("supporting_schedule_filename")) or "-"
     invoice = clean(unit.get("supporting_invoice_filename"))
@@ -2855,7 +2868,7 @@ def print_applicant_review_list(payload: dict[str, Any]) -> None:
     print("APPLICANT REVIEW LIST TO SHOW IN CHAT:")
     print("Copy or summarize this list before asking questions, so the user can correct items by number and source filename.")
     for unit in units:
-        print(unit_review_line(unit))
+        print(f"[{unit_ref_token(unit)}] " + unit_review_line(unit))
 
 
 def add_trip_window_advisories(payload: dict[str, Any]) -> None:
@@ -2924,6 +2937,7 @@ def build_markdown(payload: dict[str, Any]) -> str:
         "",
         f"Generated at: {payload['generated_at']}",
         f"Source extraction file: {payload['source_extraction_file']}",
+        f"Allocation generation: {payload.get('integrity', {}).get('fingerprint', '')[:8]}",
         f"Allocation units: {len(payload['allocation_units'])}",
         f"Questions remaining: {sum(1 for q in payload['questions'] if q.get('status') == 'open')}",
         "",
@@ -2960,7 +2974,7 @@ def build_markdown(payload: dict[str, Any]) -> str:
             "",
             "## User Expense Record Reconciliation",
             "",
-            "| Hint | Record | Project | Match | Resolution | Matched/Candidate Items |",
+            "| Record Token | Record | Project | Match | Resolution | Matched/Candidate Items |",
             "| --- | --- | --- | --- | --- | --- |",
         ]
         for record in hint_records:
@@ -2968,7 +2982,7 @@ def build_markdown(payload: dict[str, Any]) -> str:
             candidates = [item.get("user_no", "") for item in record.get("candidate_units", [])]
             numbers = matched or candidates
             lines.append(
-                f"| {record.get('hint_id', '')} | {record.get('summary', '')} | "
+                f"| {record.get('display_token') or (str(record.get('hint_id', '')) + '@' + str(record.get('hint_ref', '')))} | {record.get('summary', '')} | "
                 f"{record.get('client_name', '')}/{record.get('client_charge_code', '')} | "
                 f"{record.get('match_status', '')} | {record.get('resolution_status', '')} | "
                 f"{', '.join(str(value) for value in numbers)} |"
@@ -2994,9 +3008,11 @@ def build_markdown(payload: dict[str, Any]) -> str:
         "",
         "## Applicant Review List",
         "",
+        f"Allocation generation: {payload.get('integrity', {}).get('fingerprint', '')[:8]}",
+        "",
     ]
     for unit in payload["allocation_units"]:
-        lines.append(f"- {unit_review_line(unit)}")
+        lines.append(f"- [{unit_ref_token(unit)}] {unit_review_line(unit)}")
     lines += [
         "",
         "## Questions For User",
@@ -3082,11 +3098,16 @@ def main(argv: list[str] | None = None) -> int:
     units, link_questions = create_units(extraction, contexts)
     print_document_reconciliation(extraction, units)
     hint_reconciliation: list[dict[str, Any]] = []
-    apply_matches(units, contexts, hint_reconciliation=hint_reconciliation)
+    try:
+        apply_matches(units, contexts, hint_reconciliation=hint_reconciliation)
+    except ValueError as exc:
+        print(f"ERROR: allocation matching/identity generation failed: {exc}", file=sys.stderr)
+        return 2
     questions = build_questions(units, context_questions + link_questions, hint_reconciliation)
 
     payload = {
         "schema_version": "expense_allocation.v1",
+        "allocation_engine_revision": allocation_generations.ALLOCATION_ENGINE_REVISION,
         "generated_at": datetime.now().replace(microsecond=0).isoformat(),
         "source_extraction_file": str(extraction_path),
         "source_extraction_fingerprint": extraction["integrity"]["fingerprint"],
@@ -3094,6 +3115,8 @@ def main(argv: list[str] | None = None) -> int:
         "source_project_context_sha256": (
             hashlib.sha256(context_path.read_bytes()).hexdigest() if context_path else ""
         ),
+        "source_policy_file": str(policy_path().resolve()),
+        "source_policy_sha256": hashlib.sha256(policy_path().read_bytes()).hexdigest(),
         "raw_project_context": raw_context,
         "project_contexts": contexts,
         "allocation_units": units,
@@ -3102,8 +3125,27 @@ def main(argv: list[str] | None = None) -> int:
         "change_log": [],
     }
     output = Path(args.output)
+    try:
+        unit_refs.assign_unit_refs(extraction, payload.get("allocation_units", []))
+    except ValueError as exc:
+        print(f"ERROR: allocation evidence identity generation failed: {exc}", file=sys.stderr)
+        return 2
+    allocation_out = output / "expense-allocation.json"
+    try:
+        archived = allocation_generations.archive_current_generation(allocation_out)
+    except ValueError as exc:
+        # Allocation is a derived artifact, so a broken current copy must not
+        # prevent trusted regeneration from extraction + project context.
+        print(f"WARNING: {exc} The invalid current allocation was not archived.", file=sys.stderr)
+        archived = None
+    allocation_generations.record_previous_generation(payload, archived)
+    if archived:
+        print(f"Previous allocation archived as immutable generation {archived[1]} at {archived[0]}.")
     integrity.stamp(payload, "allocate_expenses.py")
     write_json(output / "expense-allocation.json", payload)
+    generation = payload["integrity"]["fingerprint"][:8]
+    print(f"Allocation generation: {generation} — decisions files must set "
+          f"for_allocation_fingerprint to this generation and reference items as N@ref.")
     (output / "expense-allocation.md").write_text(build_markdown(payload), encoding="utf-8")
     print(f"Wrote {output / 'expense-allocation.json'}")
     print(f"Wrote {output / 'expense-allocation.md'}")

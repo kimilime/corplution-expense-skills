@@ -6,7 +6,6 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import shutil
 import sys
 from datetime import datetime
 from pathlib import Path
@@ -19,6 +18,7 @@ CLOSED_UNIT_STATUSES = {"confirmed", "fixed", "dropped", "excluded", "non_reimbu
 ALLOWED_UNIT_STATUSES = OPEN_STATUSES | CLOSED_UNIT_STATUSES
 # Policy values come from assets/policy.toml; edit that file when policy changes.
 from policy_config import load_policy
+import allocation_generations
 import integrity
 import text_safety
 
@@ -39,6 +39,7 @@ ALLOWED_ROOT_FIELDS = {
     "confirm_units",
     "drop_units",
     "exclude_units",
+    "lineage_rebase",
 }
 
 HINT_RESOLUTION_ACTIONS = {
@@ -604,7 +605,7 @@ def normalize_answers(
         dict(item)
         for item in answers.get("expense_hint_resolutions", [])
     ]
-    if not unit_updates and not question_updates and not context_updates and not hint_resolutions:
+    if not unit_updates and not question_updates and not context_updates and not hint_resolutions and not answers.get("lineage_rebase"):
         raise ValueError(
             "Answers file contains no actionable updates. Correct the allocation_decisions.v1 input and "
             "rerun compose_answers.py."
@@ -1267,6 +1268,38 @@ def apply_answers(
             "would silently write data onto the wrong units. Rerun Composer against the CURRENT "
             "allocation and apply only its newly published answers. Never reuse an old answers file."
         )
+    lineage_rebase = answers.get("lineage_rebase")
+    if lineage_rebase is not None and not isinstance(lineage_rebase, dict):
+        raise ValueError("lineage_rebase must be a Composer-generated object")
+    if not payload.get("change_log"):
+        source_path, source_alloc, lineage_reason = allocation_generations.discover_rebase_source(
+            allocation_path, payload
+        )
+        if allocation_generations.is_lineage_integrity_error(lineage_reason):
+            raise ValueError(
+                f"{lineage_reason}. Recover the stamped generation archive or perform a clean "
+                "sibling-batch rebuild; updater refuses to erase lineage evidence"
+            )
+        if source_path is not None and source_alloc is not None:
+            expected_source = str(source_alloc.get("integrity", {}).get("fingerprint", ""))
+            if not lineage_rebase:
+                raise ValueError(
+                    "this allocation has pending lineage decisions. Run Chief rebase and Composer; "
+                    "ordinary answers cannot consume the fresh generation first"
+                )
+            if (
+                str(lineage_rebase.get("source_allocation_fingerprint", "")) != expected_source
+                or str(lineage_rebase.get("target_allocation_fingerprint", "")) != expected
+                or Path(str(lineage_rebase.get("source_allocation_file", ""))).resolve() != source_path.resolve()
+            ):
+                raise ValueError(
+                    "lineage_rebase does not match the source generation selected by the immutable "
+                    "history chain; rerun Chief rebase and Composer"
+                )
+        elif lineage_rebase:
+            raise ValueError("lineage_rebase was supplied but no eligible prior generation exists")
+    elif lineage_rebase:
+        raise ValueError("lineage_rebase cannot be replayed after this generation already has decisions")
     unit_updates, question_updates, context_updates, hint_resolutions = normalize_answers(answers)
     answer_text_issues = text_safety.find_suspect_text(
         {
@@ -1345,13 +1378,14 @@ def apply_answers(
         "question_update_count": len(question_updates),
         "context_update_count": len(context_updates),
         "expense_hint_resolution_count": len(hint_resolutions),
+        "lineage_rebase": lineage_rebase or {},
         "changes": changes,
     })
 
     if write_output:
         if output_path.resolve() == allocation_path.resolve():
-            backup = allocation_path.with_suffix(allocation_path.suffix + ".bak")
-            shutil.copy2(allocation_path, backup)
+            archived = allocation_generations.archive_current_generation(allocation_path)
+            allocation_generations.record_previous_generation(payload, archived)
         integrity.stamp(payload, "apply_allocation_answers.py")
         write_json(output_path, payload)
         markdown_path.write_text(build_markdown(payload), encoding="utf-8")
@@ -1387,7 +1421,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Apply user answers to process/expense-allocation.json.")
     parser.add_argument("--allocation", required=True, help="Path to process/expense-allocation.json.")
     parser.add_argument("--answers", required=True, help="JSON file with unit_updates/question_updates.")
-    parser.add_argument("--output", help="Output allocation JSON. Defaults to overwriting --allocation with a .bak backup.")
+    parser.add_argument(
+        "--output",
+        help="Output allocation JSON. In-place writes archive the prior stamped generation by fingerprint.",
+    )
     parser.add_argument("--md-output", help="Output allocation Markdown. Defaults to output JSON sibling expense-allocation.md.")
     parser.add_argument("--lenient", action="store_true", help="Ignore unknown update fields instead of failing.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and apply in memory without writing files.")

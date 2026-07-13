@@ -173,7 +173,10 @@ class ExpenseHintCompletenessTests(unittest.TestCase):
             if question.get("question_type") == "expense_hint_reconciliation"
         ]
         self.assertEqual(1, len(hint_questions))
-        self.assertEqual(["R1", "R2"], hint_questions[0]["required_answer_tokens"])
+        self.assertEqual(
+            [records[0]["display_token"], records[1]["display_token"]],
+            hint_questions[0]["required_answer_tokens"],
+        )
         payload = {
             "expense_hint_reconciliation": records,
             "questions": hint_questions,

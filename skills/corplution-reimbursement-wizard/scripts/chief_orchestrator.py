@@ -33,6 +33,7 @@ RUN_METADATA = {
     "compose": ("stage2-control", "compose_answers.py"),
     "apply": ("stage2-update", "apply_allocation_answers.py"),
     "trace": ("stage2-query", "trace_expense_item.py"),
+    "rebase": ("stage2-rebase", "rebase_allocation_decisions.py"),
     "write": ("stage3", "write_reimbursement_template.py"),
     "package": ("stage4", "package_reimbursement_files.py"),
 }
@@ -75,6 +76,9 @@ def add_run_parsers(run_parser: argparse.ArgumentParser) -> None:
     apply_answers = stages.add_parser("apply", help="Apply current allocation answers through the updater.")
     apply_answers.add_argument("--answers", help="Defaults to process/allocation-answers.json.")
     apply_answers.add_argument("--dry-run", action="store_true")
+
+    rebase = stages.add_parser("rebase", help="Carry decisions across an allocation regeneration by evidence ref.")
+    rebase.add_argument("--old", help="Optional explicit source; otherwise discover the latest decided lineage generation.")
 
     trace = stages.add_parser("trace", help="Trace a user-facing expense item to source evidence.")
     trace.add_argument("--item", required=True)
@@ -194,6 +198,13 @@ def build_child_command(args: argparse.Namespace) -> tuple[str, str, list[str]]:
         ])
         if args.dry_run:
             child.append("--dry-run")
+    elif stage == "rebase":
+        if args.old:
+            child.extend(["--old", args.old])
+        child.extend([
+            "--new", str(paths["allocation"]),
+            "--output", str(paths["process"] / "rebase-decisions.json"),
+        ])
     elif stage == "trace":
         child.extend([
             "--allocation", str(paths["allocation"]),
@@ -345,6 +356,12 @@ def chief_argv(
     if operation == "apply":
         answers = str(parameters.get("answers", ""))
         return [*base, "--answers", answers] if answers else base
+    if operation == "compose":
+        decisions = str(parameters.get("decisions", ""))
+        return [*base, "--decisions", decisions] if decisions else None
+    if operation == "rebase":
+        old = str(parameters.get("old", ""))
+        return [*base, "--old", old] if old else base
     if operation == "package":
         return base
     return None

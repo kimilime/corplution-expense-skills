@@ -15,6 +15,7 @@ sys.path.insert(0, str(SCRIPTS))
 
 import check_workflow_status  # noqa: E402
 import chief_orchestrator  # noqa: E402
+import allocation_generations  # noqa: E402
 import integrity  # noqa: E402
 import workflow_journal  # noqa: E402
 
@@ -62,8 +63,20 @@ class WorkflowFixture:
             "expense-allocation.json",
             {
                 "schema_version": "expense_allocation.v1",
+                "allocation_engine_revision": allocation_generations.ALLOCATION_ENGINE_REVISION,
+                "source_policy_sha256": "p" * 64,
                 "source_extraction_fingerprint": extraction["integrity"]["fingerprint"],
-                "allocation_units": [{"unit_id": "UNIT-001", "unit_no": 1, "status": status}],
+                "allocation_units": [{
+                    "unit_id": "UNIT-001",
+                    "unit_no": 1,
+                    "unit_ref": "deadbeef",
+                    "unit_identity_sha256": hashlib.sha256(b"unit-1").hexdigest(),
+                    "source_sha256": "a" * 64,
+                    "status": status,
+                }],
+                "project_contexts": [],
+                "expense_hint_reconciliation": [],
+                "change_log": [],
                 "questions": questions,
             },
             "test",
@@ -169,6 +182,60 @@ class WorkflowStateTests(unittest.TestCase):
         state = self.inspect()
         self.assertEqual("needs_user", state["next"]["kind"])
         self.assertEqual("compose", state["next"]["operation"])
+
+    def test_chief_routes_fresh_generation_through_rebase_then_composer(self) -> None:
+        extraction = self.fixture.extraction()
+        old = self.fixture.allocation(extraction, status="confirmed")
+        old["change_log"] = [{"script": "apply_allocation_answers.py", "changes": []}]
+        integrity.stamp(old, "test")
+        allocation_path = self.fixture.process / "expense-allocation.json"
+        allocation_path.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+        archived = allocation_generations.archive_current_generation(allocation_path)
+
+        current = self.fixture.allocation(extraction, status="draft", open_question=True)
+        allocation_generations.record_previous_generation(current, archived)
+        integrity.stamp(current, "test")
+        allocation_path.write_text(json.dumps(current, ensure_ascii=False), encoding="utf-8")
+
+        state = self.inspect()
+        self.assertEqual("command", state["next"]["kind"])
+        self.assertEqual("rebase", state["next"]["operation"])
+        enriched = chief_orchestrator.enrich_next(state)
+        self.assertIn("rebase", enriched["argv"])
+        self.assertIn(str(archived[0]), enriched["argv"])
+
+        rebase_path = self.fixture.process / "rebase-decisions.json"
+        rebase_payload = {
+            "schema_version": "allocation_decisions.v1",
+            "for_allocation_fingerprint": current["integrity"]["fingerprint"][:8],
+            "decisions": [{"units": "1@deadbeef", "set": {"status": "confirmed"}}],
+            "expense_hint_resolutions": [],
+            "rebase_metadata": {
+                "target_allocation_fingerprint": current["integrity"]["fingerprint"],
+            },
+        }
+        integrity.stamp(rebase_payload, "rebase_allocation_decisions.py")
+        rebase_path.write_text(json.dumps(rebase_payload), encoding="utf-8")
+        state = self.inspect()
+        self.assertEqual("command", state["next"]["kind"])
+        self.assertEqual("compose", state["next"]["operation"])
+        enriched = chief_orchestrator.enrich_next(state)
+        self.assertIn("compose", enriched["argv"])
+        self.assertIn(str(rebase_path), enriched["argv"])
+
+    def test_broken_generation_lineage_is_blocked(self) -> None:
+        extraction = self.fixture.extraction()
+        current = self.fixture.allocation(extraction, status="draft", open_question=True)
+        current["previous_allocation_file"] = str(self.fixture.process / "allocation-generations" / "missing.json")
+        current["previous_allocation_fingerprint"] = "f" * 64
+        integrity.stamp(current, "test")
+        (self.fixture.process / "expense-allocation.json").write_text(
+            json.dumps(current, ensure_ascii=False), encoding="utf-8"
+        )
+        state = self.inspect()
+        self.assertEqual("blocked", state["next"]["kind"])
+        self.assertTrue(state["integrity_blocked"])
+        self.assertIn("lineage", state["next"]["missing"][0])
 
     def test_non_unit_answer_actions_are_not_skipped(self) -> None:
         extraction = self.fixture.extraction()

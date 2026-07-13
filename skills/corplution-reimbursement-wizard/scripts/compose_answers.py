@@ -7,7 +7,8 @@ the live allocation fingerprint, validates the decision schema, invokes the
 official updater in dry-run mode, and publishes the answers file atomically.
 
 It never generates a helper script and never mutates expense-allocation.json.
-If composition fails, correct the same decisions input and rerun this tool.
+For same-generation schema/value errors, correct the decisions input and rerun.
+For generation/ref mismatches, re-read the current review and rebuild the stale entry.
 """
 
 from __future__ import annotations
@@ -24,6 +25,7 @@ from uuid import uuid4
 
 import integrity
 import text_safety
+import allocation_generations
 from apply_allocation_answers import (
     ALLOWED_UNIT_FIELDS,
     COMPUTED_FIELDS_TEACHING,
@@ -34,6 +36,7 @@ from apply_allocation_answers import (
 DECISIONS_SCHEMA_VERSION = "allocation_decisions.v1"
 DECISIONS_ROOT_FIELDS = {
     "schema_version",
+    "for_allocation_fingerprint",
     "decisions",
     "expense_hint_resolutions",
     "question_updates",
@@ -41,6 +44,8 @@ DECISIONS_ROOT_FIELDS = {
     "confirm_units",
     "drop_units",
     "exclude_units",
+    "rebase_metadata",
+    "integrity",
 }
 DECISION_FIELDS = {"units", "set"}
 QUESTION_UPDATE_FIELDS = {"question_id", "status", "answer"}
@@ -113,20 +118,65 @@ def decisions_template_path() -> Path:
     return Path(__file__).resolve().parents[1] / "assets" / "allocation-decisions-template.json"
 
 
+# Generation-safe references: every user-facing unit selector, including
+# --set, must be N@ref copied from the current review list. Display numbers
+# and internal UNIT ids are generation-local; there is no same-session bypass.
+# REF_CONTEXT carries current refs so every selector path verifies identity.
+REF_CONTEXT: dict[str, Any] = {"refs_by_number": {}, "require_refs": False}
+
+
+def split_ref_token(text: str) -> tuple[str, str | None]:
+    if "@" in text:
+        base, _, ref = text.partition("@")
+        return base.strip(), ref.strip().lower()
+    return text, None
+
+
+def verify_ref(number: int, ref: str | None, field: str) -> None:
+    refs = REF_CONTEXT["refs_by_number"]
+    if ref is None:
+        if REF_CONTEXT["require_refs"]:
+            raise ValueError(
+                f"{field}: unit selectors must use N@ref (e.g. 3@a1b2c3d4). "
+                "Copy the [token] shown at the start of each line of the CURRENT Applicant "
+                "Review List. Bare numbers and ranges are not accepted."
+            )
+        return
+    if ref != refs.get(number, ""):
+        raise ValueError(
+            f"{field}: evidence ref for item {number} does not match the current allocation. "
+            "Either this decisions file was written against another generation, or the "
+            "evidence for this item changed (extraction corrections, re-parse). Do NOT edit "
+            "the ref to make it pass - re-read the CURRENT Applicant Review List, verify "
+            "which concrete expense this item now is, and rebuild the entry from what you "
+            "see there."
+        )
+
+
 def parse_unit_selector(selector: str) -> list[int]:
     units: list[int] = []
     for part in str(selector).split(","):
         part = part.strip()
         if not part:
             continue
+        part, ref = split_ref_token(part)
         if "-" in part:
+            if ref is not None:
+                raise ValueError(f"range {part!r} cannot carry an @ref; qualify each number individually")
+            if REF_CONTEXT["require_refs"]:
+                raise ValueError(
+                    f"range {part!r}: decisions files must qualify each item as N@ref individually "
+                    "(a range cannot prove which concrete expenses it refers to across generations)"
+                )
             lo, hi = part.split("-", 1)
             lo_i, hi_i = int(lo), int(hi)
             if hi_i < lo_i:
                 raise ValueError(f"range {part!r} runs backwards")
             units.extend(range(lo_i, hi_i + 1))
         else:
-            units.append(int(part))
+            number = int(part)
+            verify_ref(number, ref, "unit selector")
+            units.append(number)
     if not units:
         raise ValueError(f"unit selector {selector!r} selects nothing")
     return units
@@ -313,13 +363,36 @@ def validate_supplemental_actions(
                 f"expense_hint_resolutions[{idx - 1}] unsupported field(s): {', '.join(unknown)}"
             )
         question_id = str(item.get("question_id", "")).strip()
-        record_ref = str(item.get("record_ref", "")).strip().upper()
+        raw_record_ref = str(item.get("record_ref", "")).strip()
+        record_base, record_evidence_ref = split_ref_token(raw_record_ref)
+        record_ref = record_base.upper()
         hint_id = str(item.get("hint_id", "")).strip()
-        record = by_hint_id.get(hint_id) if hint_id else by_question_ref.get((question_id, record_ref))
+        if not question_id or not record_ref or not record_evidence_ref:
+            errors.append(
+                f"expense_hint_resolutions[{idx - 1}] must identify the current record with "
+                "question_id plus the full R@ref token copied from the CURRENT question "
+                "(for example R1@a1b2c3d4); bare R numbers and hint_id-only lookups are refused"
+            )
+            continue
+        record = by_question_ref.get((question_id, record_ref))
         if record is None:
             errors.append(
-                f"expense_hint_resolutions[{idx - 1}] must identify a current record by hint_id or "
-                "question_id + record_ref"
+                f"expense_hint_resolutions[{idx - 1}] references unknown current record "
+                f"{question_id}/{record_ref}"
+            )
+            continue
+        current_hint_ref = str(record.get("hint_ref", "")).strip().lower()
+        if record_evidence_ref.lower() != current_hint_ref:
+            errors.append(
+                f"expense_hint_resolutions[{idx - 1}]: record ref for {record_ref} does not "
+                "match the current applicant record. The R number shifted or the record content "
+                "changed. Do not edit the ref to make it pass; re-read the CURRENT R@ref line "
+                "and rebuild this resolution from the applicant's actual answer."
+            )
+            continue
+        if hint_id and hint_id != str(record.get("hint_id", "")).strip():
+            errors.append(
+                f"expense_hint_resolutions[{idx - 1}].hint_id does not match {raw_record_ref!r}"
             )
             continue
         canonical_hint_id = str(record.get("hint_id", "")).strip()
@@ -393,8 +466,11 @@ def action_numbers(value: Any, by_number: dict[int, str], by_id: dict[str, int],
     numbers: list[int] = []
     for selector in selectors:
         text = str(selector).strip()
-        if text in by_id:
-            numbers.append(by_id[text])
+        base, ref = split_ref_token(text)
+        if base in by_id:
+            number = by_id[base]
+            verify_ref(number, ref, field)
+            numbers.append(number)
             continue
         try:
             numbers.extend(parse_unit_selector(text))
@@ -410,7 +486,12 @@ def print_recovery(decisions_path: Path | None) -> None:
     target = str(decisions_path) if decisions_path else "the --set input"
     print("", file=sys.stderr)
     print("RECOVERY (stay on the canonical path):", file=sys.stderr)
-    print(f"1. Correct {target} from the updater errors above.", file=sys.stderr)
+    print(
+        f"1. Follow the specific error above. Correct {target} only for same-generation "
+        "schema/value errors; for stale generation or ref mismatch, rebuild the entry from "
+        "the CURRENT review/question token.",
+        file=sys.stderr,
+    )
     print(f"2. Follow the UTF-8 structure in {decisions_template_path()}.", file=sys.stderr)
     print("3. Rerun Composer, then run the official updater after Composer succeeds.", file=sys.stderr)
     print(
@@ -429,7 +510,7 @@ def main(argv: list[str] | None = None) -> int:
         action="append",
         default=[],
         dest="specs",
-        help="Repeatable compact spec with no whitespace values; use --decisions for complex text.",
+        help="Repeatable compact spec using N@ref selectors; use --decisions for complex text.",
     )
     parser.add_argument("--decisions", help="UTF-8 allocation_decisions.v1 JSON file")
     parser.add_argument(
@@ -447,14 +528,101 @@ def main(argv: list[str] | None = None) -> int:
 
     try:
         known_units, known_ids = current_unit_maps(allocation)
+        refs_by_number: dict[int, str] = {}
+        numbers_by_ref: dict[str, int] = {}
+        for unit in allocation.get("allocation_units", []):
+            raw_number = str(unit.get("user_no") or unit.get("unit_no") or "")
+            ref = str(unit.get("unit_ref", "")).strip().lower()
+            identity = str(unit.get("unit_identity_sha256", "")).strip().lower()
+            if not raw_number.isdigit() or not ref or not identity:
+                raise ValueError(
+                    "current allocation contains an item without a display number, short ref, or "
+                    "full evidence identity; regenerate Stage 2 before composing decisions"
+                )
+            number = int(raw_number)
+            if number in refs_by_number:
+                raise ValueError(f"current allocation repeats display item number {number}")
+            if ref in numbers_by_ref:
+                raise ValueError(
+                    f"current allocation repeats evidence ref {ref} on items "
+                    f"{numbers_by_ref[ref]} and {number}; regenerate Stage 2"
+                )
+            refs_by_number[number] = ref
+            numbers_by_ref[ref] = number
+        REF_CONTEXT["refs_by_number"] = refs_by_number
+        REF_CONTEXT["require_refs"] = True
         batches = [parse_set_spec(spec) for spec in args.specs]
         decision_data: dict[str, Any] = {}
         if decisions_path:
             decision_data = load_decisions_file(decisions_path)
+            declared = str(decision_data.get("for_allocation_fingerprint", "")).strip().lower()
+            current = str(allocation.get("integrity", {}).get("fingerprint", "")).lower()
+            if not declared:
+                raise ValueError(
+                    "decisions file is missing for_allocation_fingerprint. Set it to the "
+                    "'Allocation generation' code printed by the allocate run (also shown in "
+                    "the review list header), so this file is bound to its generation."
+                )
+            if len(declared) < 8 or not current.startswith(declared):
+                raise ValueError(
+                    "this decisions file belongs to an OLD allocation generation; every display "
+                    "number and R-reference in it is now meaningless. Do NOT just swap the "
+                    "fingerprint value - per-item @refs would still refuse. Create a NEW "
+                    "decisions file: re-read the CURRENT Applicant Review List, re-verify every "
+                    "item by source file, amount, date and route, and rebind confirmed facts to "
+                    "the new N@ref tokens. If invoices were added or removed, run "
+                    "rebase_allocation_decisions.py first ONLY when effective project contexts "
+                    "and policy are unchanged; otherwise review the regenerated allocation from scratch."
+                )
             batches.extend(decision_batches(decision_data))
         question_updates, context_updates, hint_resolutions = validate_supplemental_actions(
             decision_data, allocation
         )
+        rebase_metadata = decision_data.get("rebase_metadata")
+        lineage_rebase: dict[str, Any] | None = None
+        if rebase_metadata:
+            rebase_ok, rebase_reason = integrity.check(decision_data)
+            if not rebase_ok or str(decision_data.get("integrity", {}).get("stamped_by", "")) != "rebase_allocation_decisions.py":
+                raise ValueError(
+                    "rebase decisions are missing or fail their official integrity stamp "
+                    f"({rebase_reason}); rerun Chief rebase instead of editing the file"
+                )
+        if not allocation.get("change_log"):
+            source_path, source_alloc, lineage_reason = allocation_generations.discover_rebase_source(
+                allocation_path, allocation
+            )
+            if allocation_generations.is_lineage_integrity_error(lineage_reason):
+                raise ValueError(
+                    f"{lineage_reason}. Do not continue on a broken generation chain; recover the "
+                    "missing stamped archive or perform the documented clean sibling-batch rebuild"
+                )
+            if source_path is not None and source_alloc is not None:
+                if not isinstance(rebase_metadata, dict):
+                    raise ValueError(
+                        "this fresh allocation has a prior same-basis generation containing official "
+                        "user decisions. Ordinary decisions are blocked until Chief runs rebase and "
+                        "Composer compiles process/rebase-decisions.json"
+                    )
+                expected_source = str(source_alloc.get("integrity", {}).get("fingerprint", ""))
+                declared_source = str(rebase_metadata.get("source_allocation_fingerprint", ""))
+                declared_target = str(rebase_metadata.get("target_allocation_fingerprint", ""))
+                if declared_source != expected_source or declared_target != fingerprint:
+                    raise ValueError(
+                        "rebase metadata does not bind the lineage source selected by Chief and the "
+                        "current allocation generation; rerun Chief rebase instead of editing metadata"
+                    )
+                lineage_rebase = {
+                    "source_allocation_file": str(source_path),
+                    "source_allocation_fingerprint": expected_source,
+                    "target_allocation_fingerprint": fingerprint,
+                }
+            elif rebase_metadata:
+                raise ValueError(
+                    "rebase metadata was supplied but the current allocation has no eligible lineage "
+                    "source; review the current generation normally"
+                )
+        elif rebase_metadata:
+            raise ValueError("this allocation generation already has applied decisions; stale rebase metadata is refused")
     except (ValueError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         print_recovery(decisions_path)
@@ -502,8 +670,10 @@ def main(argv: list[str] | None = None) -> int:
         "project_contexts": context_updates,
         "expense_hint_resolutions": hint_resolutions,
     }
+    if lineage_rebase:
+        answers["lineage_rebase"] = lineage_rebase
 
-    if not answers["unit_updates"] and not question_updates and not context_updates and not hint_resolutions:
+    if not answers["unit_updates"] and not question_updates and not context_updates and not hint_resolutions and not lineage_rebase:
         errors.append("decisions input contains no actionable updates")
     for finding in text_safety.find_suspect_text(answers, path="decisions"):
         errors.append(

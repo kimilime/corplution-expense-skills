@@ -502,7 +502,7 @@ When presenting a grouped question, include enough information for batch replies
 - suggested client/code/project
 - short evidence note
 
-Tell the user they can answer by grouped item numbers, such as: "1/3/5/7 属于山西信托，日期分别是...；2/4/6 属于广联达，日期分别是..." The agent should translate that natural-language answer into `unit_updates` with `unit_nos` arrays.
+Tell the user they can answer by grouped item numbers, such as: "1/3/5/7 属于山西信托，日期分别是...；2/4/6 属于广联达，日期分别是..." The agent should translate that natural-language answer into `unit_updates` with `unit_nos` arrays. Item numbers are convenient handles only for the current allocation generation. At the time of the answer, associate each explicit user-confirmed fact with that unit's source filename and corroborating invoice/trip fields so it can be safely understood if a clean rebuild later becomes necessary.
 
 Use `status: advisory` with `blocking: false` for optional refinements that should be shown in chat but must not block Excel output, such as replacing the default admin Client `项目、调研以外的其他费用` with a more specific matter name, or reviewing pure `other` items whose Date temporarily uses the invoice issue date.
 
@@ -612,45 +612,45 @@ Use these aliases inside `decisions[].set`. Canonical field names remain valid t
 
 For a hotel, setting either canonical `city` or `hotel_city` is sufficient; the updater mirrors it to the other field and rejects conflicting values. Never set `final_template_column`: it is computed from `source_category` and formal city. Fix `city` or `source_category` when the visible amount column is wrong.
 
-Use `question_updates` for ordinary question status/answer updates. Use `expense_hint_resolutions` for every `R1/R2/...` applicant-record completeness decision; free-text `question_updates` cannot close those records.
+Use `question_updates` for ordinary question status/answer updates. Use `expense_hint_resolutions` for every generation-safe `R1@ref` applicant-record completeness decision; free-text `question_updates` cannot close those records.
 
 The root action arrays are also supported:
 
-- `confirm_units`: list of user-facing item numbers or internal unit IDs to mark confirmed.
-- `drop_units`: list of user-facing item numbers or internal unit IDs to drop.
-- `exclude_units`: list of user-facing item numbers or internal unit IDs to exclude.
+- `confirm_units`: list of current `N@ref` tokens to mark confirmed.
+- `drop_units`: list of current `N@ref` tokens to drop.
+- `exclude_units`: list of current `N@ref` tokens to exclude.
 - `question_updates`: explicit question status/answer updates.
 - `expense_hint_resolutions`: structured outcomes for each displayed `R` record; evidence actions require current item numbers in `units`.
 - `project_contexts`: controlled context additions/updates.
 
-For a grouped user-record completeness question, write one structured entry per displayed R token. A mixed answer may close some records while leaving a missing invoice pending:
+For a grouped user-record completeness question, write one structured entry per displayed full `R@ref` token. A mixed answer may close some records while leaving a missing invoice pending:
 
 ```json
 {
   "expense_hint_resolutions": [
     {
       "question_id": "Q-HINT-001",
-      "record_ref": "R1",
+      "record_ref": "R1@a1b2c3d4",
       "action": "matched_existing",
-      "units": "16",
+      "units": "16@11223344",
       "note": "对应第16项"
     },
     {
       "question_id": "Q-HINT-001",
-      "record_ref": "R2",
+      "record_ref": "R2@b2c3d4e5",
       "action": "covered_by_invoice",
-      "units": "20",
+      "units": "20@55667788",
       "note": "由第20项汇总发票覆盖"
     },
     {
       "question_id": "Q-HINT-001",
-      "record_ref": "R3",
+      "record_ref": "R3@c3d4e5f6",
       "action": "pending_invoice",
       "note": "商户稍后补开；本条继续阻断"
     },
     {
       "question_id": "Q-HINT-001",
-      "record_ref": "R4",
+      "record_ref": "R4@d4e5f6a7",
       "action": "not_reimbursed",
       "note": "记录有误，本次不报销"
     }
@@ -658,7 +658,7 @@ For a grouped user-record completeness question, write one structured entry per 
 }
 ```
 
-Composer resolves each R token against the current fingerprint-bound ledger. The updater closes only evidence-backed or not-reimbursed records and keeps the grouped question open while any record is `pending_evidence`.
+Composer resolves and verifies each full R@ref token against the current fingerprint-bound ledger; bare R numbers and hint_id-only lookups are rejected. The updater closes only evidence-backed or not-reimbursed records and keeps the grouped question open while any record is `pending_evidence`.
 
 Run Composer, then apply only its published output:
 
@@ -667,13 +667,15 @@ python scripts/chief_orchestrator.py run compose --decisions process/batch-decis
 python scripts/chief_orchestrator.py run apply
 ```
 
-Composer resolves the current displayed `user_no` values, binds the current allocation fingerprint, validates text and fields, and calls the updater in dry-run mode before atomically publishing `process/allocation-answers.json`. The updater remains the sole writer of `expense-allocation.json`; it refreshes derived hotel/taxi/rail/flight Notes, closes questions, retains a backup, and appends change history.
+Composer resolves the current displayed `user_no` values, binds the current allocation fingerprint, validates text and fields, and calls the updater in dry-run mode before atomically publishing `process/allocation-answers.json`. The updater remains the sole writer of `expense-allocation.json`; it refreshes derived hotel/taxi/rail/flight Notes, closes questions, archives the prior stamped generation by fingerprint, records a lineage pointer, and appends change history.
 
 If Composer or its updater dry-run fails, correct the same UTF-8 decisions file and rerun Composer. Never generate `fill_answers.py`, write a batch helper, fill a diagnostic answers template, create a patch/fix script, edit a process JSON, or modify a bundled script. `build_allocation_answers_template.py` is developer-only diagnostic output and its schema is intentionally rejected by the updater.
 
 For grouped questions, translate each natural-language batch into one or more `decisions` entries. If the user provides different dates for each item, create separate decision entries so each `expense_date` is correct.
 
-Prefer displayed numeric item selectors when translating user answers. Internal `unit_id` values remain supported only in control action arrays and process files; do not show them to the user in chat.
+Always use the full displayed `N@ref` token when translating user answers, including `--set` and control arrays. Internal `unit_id` values remain supported only in control action arrays and process files; do not show them to the user in chat. After any extraction/allocation rerun, both old numeric selectors and old internal IDs expire. Re-read the new review list and rebind facts by the clean-rebuild mapping rules in `troubleshooting.md` before composing new decisions.
+
+For ordinary invoice additions/removals, ask Chief for the next action instead of manually choosing a historical file. Official allocation generations form an immutable chain under `process/allocation-generations/`; repeated fresh allocator reruns are skipped until Chief finds the nearest generation with an updater change log. Rebase matches the hidden full unit/hint SHA-256 identities, while `N@ref` and `R@ref` remain compact chat handles. It carries only fields proven to have been set through the official updater plus final status, and lets the current updater regenerate derived columns, confidence, place-type state, approval-file status, and standard Notes. Rebase refuses changed project contexts, policy SHA-256, allocation engine revision, missing identities, or duplicate refs. Composer/updater also refuse ordinary answers while this lineage gate is open; the rebase metadata must bind the Chief-selected source and current target fingerprints. A zero-carry result still passes once through Composer/updater as a lineage clearance before new decisions may be applied. Explicit applicant-record outcomes (`matched_existing`, `covered_by_invoice`, `not_reimbursed`, and `pending_invoice`) are carried only when their record identity and any linked unit identities remain unchanged.
 
 For substitute invoices, keep `approval_file` even though it will not appear in the visible Excel sheet. Stage 3 must carry it into `final-expense-rows.json`, and Stage 4 must use it to copy the approval screenshot into the support-document folder.
 

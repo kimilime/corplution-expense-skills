@@ -49,6 +49,8 @@ When the user reports that an item is wrong:
 
 Do not require the user to mention internal IDs such as `DOC-001` or `UNIT-001`.
 
+`DOC-xxx` is generation-local, not a durable evidence identity. Adding, removing, converting, or reordering an input can change later document numbers. When preserving an explicit user correction for a possible clean rebuild, expand the current item number into the original source filename plus available corroborating fields such as SHA-256, invoice number, seller, amount, date, or route. Never retain only `DOC-xxx` or the displayed item number as the remembered fact.
+
 ## Unsupported Input Files
 
 Folder uploads can contain evidence formats the extractor cannot read, such as OFD, EML, or ZIP. These files are not document records, but they are still evidence and must be persisted in top-level `unresolved_input_files` with:
