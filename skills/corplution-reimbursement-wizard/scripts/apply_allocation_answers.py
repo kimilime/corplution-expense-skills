@@ -57,6 +57,26 @@ HINT_RESOLUTION_FIELDS = {
     "note",
 }
 
+REMOVED_EVIDENCE_FIELDS = {
+    "removal_ref",
+    "unit_identity_sha256",
+    "prior_unit_ref",
+    "source_sha256",
+    "source_filename",
+    "amount",
+    "expense_date",
+    "source_category",
+    "prior_status",
+    "requires_confirmation",
+    "resolution_status",
+    "resolution_action",
+    "replacement_unit_ids",
+    "replacement_unit_identities",
+    "replacement_unit_refs",
+    "resolution_note",
+}
+INACTIVE_REBASE_STATUSES = {"dropped", "excluded", "non_reimbursable"}
+
 META_FIELDS = {
     "answer",
     "comment",
@@ -558,6 +578,123 @@ def unit_no(unit: dict[str, Any]) -> str:
     return unit_id
 
 
+def validate_removed_evidence_reconciliation(
+    lineage_rebase: dict[str, Any],
+    current_allocation: dict[str, Any],
+    source_allocation: dict[str, Any],
+) -> list[dict[str, Any]]:
+    entries = lineage_rebase.get("removed_evidence")
+    if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
+        raise ValueError(
+            "lineage_rebase must contain Composer-validated removed_evidence; rerun Chief rebase and Composer"
+        )
+    current_units = [
+        unit for unit in current_allocation.get("allocation_units", []) if isinstance(unit, dict)
+    ]
+    source_units = [
+        unit for unit in source_allocation.get("allocation_units", []) if isinstance(unit, dict)
+    ]
+    current_by_identity = {
+        clean(unit.get("unit_identity_sha256")).lower(): unit for unit in current_units
+    }
+    current_by_token = {
+        f"{unit_no(unit)}@{clean(unit.get('unit_ref')).lower()}": unit for unit in current_units
+    }
+    source_by_identity = {
+        clean(unit.get("unit_identity_sha256")).lower(): unit for unit in source_units
+    }
+    expected_removed = {
+        identity for identity, unit in source_by_identity.items()
+        if identity
+        and identity not in current_by_identity
+    }
+    provided_identities: set[str] = set()
+    removal_refs: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for index, raw in enumerate(entries, start=1):
+        unknown = sorted(set(raw) - REMOVED_EVIDENCE_FIELDS)
+        if unknown:
+            raise ValueError(
+                f"removed_evidence #{index} contains unsupported field(s): {', '.join(unknown)}"
+            )
+        entry = dict(raw)
+        identity = clean(entry.get("unit_identity_sha256")).lower()
+        removal_ref = clean(entry.get("removal_ref")).lower()
+        if not identity or identity in provided_identities or not removal_ref or removal_ref in removal_refs:
+            raise ValueError("removed_evidence identities and M@ref references must be present and unique")
+        provided_identities.add(identity)
+        removal_refs.add(removal_ref)
+        old_unit = source_by_identity.get(identity)
+        if old_unit is None or identity in current_by_identity:
+            raise ValueError(f"{entry.get('removal_ref')} is not evidence removed between these generations")
+        expected_old_values = {
+            "prior_unit_ref": f"{unit_no(old_unit)}@{clean(old_unit.get('unit_ref')).lower()}",
+            "source_sha256": clean(old_unit.get("source_sha256")).lower(),
+            "amount": clean(old_unit.get("amount")),
+            "expense_date": clean(old_unit.get("expense_date")),
+            "source_category": clean(old_unit.get("source_category")),
+            "prior_status": clean(old_unit.get("status")),
+        }
+        for field, expected_value in expected_old_values.items():
+            actual = clean(entry.get(field)).lower() if field == "source_sha256" else clean(entry.get(field))
+            if actual != expected_value:
+                raise ValueError(
+                    f"{entry.get('removal_ref')} {field} no longer matches the selected source generation"
+                )
+        old_source = clean(old_unit.get("source_filename") or old_unit.get("source_file"))
+        expected_filename = Path(old_source).name if old_source else ""
+        if clean(entry.get("source_filename")) != expected_filename:
+            raise ValueError(f"{entry.get('removal_ref')} source filename does not match the source generation")
+
+        requires_confirmation = clean(old_unit.get("status")) not in INACTIVE_REBASE_STATUSES
+        if entry.get("requires_confirmation") is not requires_confirmation:
+            raise ValueError(f"{entry.get('removal_ref')} has an invalid confirmation requirement")
+        action = clean(entry.get("resolution_action"))
+        if clean(entry.get("resolution_status")) != "resolved":
+            raise ValueError(f"{entry.get('removal_ref')} is unresolved or still pending evidence restoration")
+        if requires_confirmation:
+            if action not in {"intentional_removal", "replacement_provided"}:
+                raise ValueError(f"{entry.get('removal_ref')} lacks an explicit removal confirmation")
+            if not clean(entry.get("resolution_note")):
+                raise ValueError(f"{entry.get('removal_ref')} lacks its applicant/coordinator confirmation note")
+        elif action != "prior_closed_item_removed":
+            raise ValueError(f"{entry.get('removal_ref')} has an invalid auto-resolution action")
+
+        refs = entry.get("replacement_unit_refs")
+        ids = entry.get("replacement_unit_ids")
+        identities = entry.get("replacement_unit_identities")
+        if any(not isinstance(values, list) for values in (refs, ids, identities)):
+            raise ValueError(f"{entry.get('removal_ref')} replacement bindings must be arrays")
+        if action == "replacement_provided":
+            if not refs or not (len(refs) == len(ids) == len(identities)):
+                raise ValueError(f"{entry.get('removal_ref')} has incomplete replacement bindings")
+            seen_replacements: set[str] = set()
+            for position, raw_token in enumerate(refs):
+                token = clean(raw_token).lower()
+                unit = current_by_token.get(token)
+                if token in seen_replacements or unit is None:
+                    raise ValueError(f"{entry.get('removal_ref')} has a repeated or stale replacement token")
+                seen_replacements.add(token)
+                if (
+                    clean(unit.get("unit_id")) != clean(ids[position])
+                    or clean(unit.get("unit_identity_sha256")).lower() != clean(identities[position]).lower()
+                    or clean(unit.get("status")) in INACTIVE_REBASE_STATUSES
+                ):
+                    raise ValueError(f"{entry.get('removal_ref')} replacement binding is stale or inactive")
+        elif refs or ids or identities:
+            raise ValueError(f"{entry.get('removal_ref')} contains replacement bindings without a replacement action")
+        normalized.append(entry)
+
+    if provided_identities != expected_removed:
+        missing = sorted(expected_removed - provided_identities)
+        extra = sorted(provided_identities - expected_removed)
+        raise ValueError(
+            "removed_evidence does not exactly reconcile every source-generation item that disappeared; "
+            f"missing={missing}, extra={extra}. Rerun Chief rebase and Composer."
+        )
+    return normalized
+
+
 def units_by_no(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {unit_no(unit): unit for unit in payload.get("allocation_units", [])}
 
@@ -962,6 +1099,8 @@ def apply_expense_hint_resolutions(
                 raise ValueError(
                     f"expense_hint_resolutions[{idx}] references missing or inactive unit(s): "
                     + ", ".join(inactive)
+                    + ". Remove closed units from a multi-unit match; if no active unit remains, "
+                    "omit this resolution so the applicant record stays open for confirmation."
                 )
             record["match_status"] = "matched" if action == "matched_existing" else "covered"
             record["matched_unit_ids"] = unit_ids
@@ -1020,8 +1159,10 @@ def refresh_expense_hint_reconciliation(payload: dict[str, Any], touched_units: 
     known_question_ids = {clean(question.get("question_id")) for question in questions}
     reopen_index = 1
     for record in payload.get("expense_hint_reconciliation", []):
-        matched_ids = {clean(value) for value in record.get("matched_unit_ids", []) if clean(value)}
-        if not matched_ids.intersection(touched_units):
+        matched_ids = list(dict.fromkeys(
+            clean(value) for value in record.get("matched_unit_ids", []) if clean(value)
+        ))
+        if not set(matched_ids).intersection(touched_units):
             continue
         if (
             record.get("resolution_status") == "resolved"
@@ -1035,6 +1176,8 @@ def refresh_expense_hint_reconciliation(payload: dict[str, Any], touched_units: 
             }
         ]
         if active_ids:
+            record["matched_unit_ids"] = active_ids
+            record["matched_user_nos"] = [unit_no(units[unit_id]) for unit_id in active_ids]
             continue
         while f"Q-HINT-REOPEN-{reopen_index:03d}" in known_question_ids:
             reopen_index += 1
@@ -1292,6 +1435,7 @@ def apply_answers(
     lineage_rebase = answers.get("lineage_rebase")
     if lineage_rebase is not None and not isinstance(lineage_rebase, dict):
         raise ValueError("lineage_rebase must be a Composer-generated object")
+    lineage_source_allocation: dict[str, Any] | None = None
     if not payload.get("change_log"):
         source_path, source_alloc, lineage_reason = allocation_generations.discover_rebase_source(
             allocation_path, payload
@@ -1302,6 +1446,7 @@ def apply_answers(
                 "sibling-batch rebuild; updater refuses to erase lineage evidence"
             )
         if source_path is not None and source_alloc is not None:
+            lineage_source_allocation = source_alloc
             expected_source = str(source_alloc.get("integrity", {}).get("fingerprint", ""))
             if not lineage_rebase:
                 raise ValueError(
@@ -1321,6 +1466,13 @@ def apply_answers(
             raise ValueError("lineage_rebase was supplied but no eligible prior generation exists")
     elif lineage_rebase:
         raise ValueError("lineage_rebase cannot be replayed after this generation already has decisions")
+    removed_evidence_reconciliation: list[dict[str, Any]] = []
+    if lineage_rebase:
+        if lineage_source_allocation is None:
+            raise ValueError("lineage_rebase has no validated source allocation")
+        removed_evidence_reconciliation = validate_removed_evidence_reconciliation(
+            lineage_rebase, payload, lineage_source_allocation
+        )
     unit_updates, question_updates, context_updates, hint_resolutions = normalize_answers(answers)
     answer_text_issues = text_safety.find_suspect_text(
         {
@@ -1328,6 +1480,7 @@ def apply_answers(
             "question_updates": question_updates,
             "project_contexts": context_updates,
             "expense_hint_resolutions": hint_resolutions,
+            "lineage_rebase": lineage_rebase or {},
         },
         path="answers",
     )
@@ -1390,6 +1543,8 @@ def apply_answers(
             "the applied allocation would contain encoding-damaged user-visible text. Nothing was written. "
             "Fix the UTF-8 decisions input and rerun Composer. Findings: " + "; ".join(allocation_text_issues)
         )
+    if lineage_rebase:
+        payload["removed_evidence_reconciliation"] = removed_evidence_reconciliation
     payload["generated_at"] = datetime.now().replace(microsecond=0).isoformat()
     payload.setdefault("change_log", []).append({
         "timestamp": payload["generated_at"],

@@ -2203,7 +2203,7 @@ def main(argv: list[str] | None = None) -> int:
     else:
         print(
             "INDEPENDENT REVIEW: "
-            f"{independent_review.get('status', 'missing')} - optional pilot unavailable or stale; "
+            f"{independent_review.get('status', 'missing')} - preferred checkpoint unavailable, opted out, or stale; "
             "continuing with deterministic Stage 3 preflight only."
         )
     print_stage3_preflight_summary(allocation, errors)

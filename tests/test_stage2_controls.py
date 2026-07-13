@@ -167,6 +167,20 @@ class ComposerTests(unittest.TestCase):
         self.assertEqual("confirmed", answers["unit_updates"][0]["status"])
         self.assertFalse((self.root / "fill_answers.py").exists())
 
+    def test_compact_set_accepts_utf8_chinese_and_unquoted_value_spaces(self) -> None:
+        output_path = self.root / "process" / "allocation-answers.json"
+        result = run_script(
+            "compose_answers.py",
+            "--allocation", str(self.allocation_path),
+            "--set", "1@00000001: note=客户会议交通 补充说明 status=confirmed",
+            "--output", str(output_path),
+        )
+
+        self.assertEqual(0, result.returncode, result.stderr)
+        answers = json.loads(output_path.read_text(encoding="utf-8"))
+        self.assertEqual("客户会议交通 补充说明", answers["unit_updates"][0]["final_note"])
+        self.assertEqual("confirmed", answers["unit_updates"][0]["status"])
+
     def test_composer_handles_large_allocator_user_no_batch(self) -> None:
         allocation = json.loads(self.allocation_path.read_text(encoding="utf-8"))
         prototype = allocation["allocation_units"][0]

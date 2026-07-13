@@ -235,19 +235,44 @@ def inspect_workflow(
         extraction_fp = str((extraction.get("integrity") or {}).get("fingerprint", "")) if ok else ""
         docs = extraction.get("documents", [])
         excluded = [d for d in docs if d.get("excluded_by_user")]
+        docs_by_sha: dict[str, list[dict[str, Any]]] = {}
+        for doc in docs:
+            source_sha = str(doc.get("sha256", "")).strip().lower()
+            if source_sha:
+                docs_by_sha.setdefault(source_sha, []).append(doc)
+        duplicate_group_errors = []
+        for source_sha, group in docs_by_sha.items():
+            if len(group) < 2:
+                continue
+            active = [doc for doc in group if not doc.get("excluded_by_user")]
+            if len(active) == 1:
+                continue
+            duplicate_group_errors.append({
+                "sha256": source_sha,
+                "active_count": len(active),
+                "filenames": [Path(str(doc.get("source_file", "?"))).name for doc in group],
+            })
         pending = [d for d in docs if not d.get("excluded_by_user")
                    and (d.get("needs_review") or d.get("document_role") == "unknown")]
         unresolved_inputs = [
             item for item in extraction.get("unresolved_input_files", [])
             if item.get("status", "open") == "open"
         ]
-        state = "BLOCKED" if not ok else ("…" if unresolved_inputs or pending else "✓")
+        state = "BLOCKED" if not ok else (
+            "…" if unresolved_inputs or pending or duplicate_group_errors else "✓"
+        )
         stamp_note = "" if ok else f" [INTEGRITY FAILED: {reason}]"
         lines.append(f"Stage 1 提取: {state} {len(docs)} 份文档，排除 {len(excluded)}，待识别/复核 {len(pending)}{stamp_note}")
         if unresolved_inputs:
             lines.append(f"  - BLOCKED: {len(unresolved_inputs)} 个不支持的输入文件尚未记录用户处理决定")
             for item in unresolved_inputs[:10]:
                 lines.append(f"    * {item.get('filename', '?')}")
+        for group in duplicate_group_errors[:10]:
+            lines.append(
+                "  - 重复凭证组未恰好保留一份: "
+                f"{group['sha256'][:8]} ({group['active_count']} active) - "
+                + ", ".join(group["filenames"])
+            )
         for d in pending[:10]:
             duplicate = any(
                 "duplicate" in str(issue.get("problem", "")).lower()
@@ -255,7 +280,7 @@ def inspect_workflow(
             )
             label = "重复凭证待 Stage 1 排除确认" if duplicate else "待识别"
             lines.append(f"  - {label}: {Path(str(d.get('source_file', '?'))).name}")
-        stage1_status = "ready" if ok and not unresolved_inputs and not pending else (
+        stage1_status = "ready" if ok and not unresolved_inputs and not pending and not duplicate_group_errors else (
             "blocked" if not ok else "needs_user"
         )
         stages["extraction"] = {
@@ -264,6 +289,7 @@ def inspect_workflow(
             "document_count": len(docs),
             "excluded_count": len(excluded),
             "review_count": len(pending),
+            "duplicate_group_error_count": len(duplicate_group_errors),
             "unresolved_input_count": len(unresolved_inputs),
             "integrity_valid": ok,
         }
@@ -286,6 +312,20 @@ def inspect_workflow(
                 "Ask the applicant to exclude or replace every unsupported input, then apply the recorded resolutions.",
                 operation="correct-extraction",
                 missing=[f"resolution for {item.get('filename', '?')}" for item in unresolved_inputs],
+            ))
+        elif duplicate_group_errors:
+            set_next(next_step(
+                "needs_user",
+                "extraction",
+                "Every exact-SHA duplicate group must retain exactly one canonical active copy. "
+                "If an older SHA-only correction excluded every copy, re-run extraction with the "
+                "current scripts; then exclude only the named duplicate using sha256 plus its exact source_file.",
+                operation="correct-extraction",
+                missing=[
+                    f"{group['sha256'][:8]}: {group['active_count']} active among "
+                    + ", ".join(group["filenames"])
+                    for group in duplicate_group_errors
+                ],
             ))
         elif pending:
             duplicate_names = [
@@ -322,7 +362,18 @@ def inspect_workflow(
     rebase_action_count = 0
     rebase_available = False
     rebase_source_path = ""
+    rebase_source_fingerprint = ""
+    rebase_selection_reason = "not evaluated"
+    rebase_decisions_status = "missing"
+    rebase_decisions_reason = "no rebase-decisions.json is present"
+    rebase_declared_source = ""
+    rebase_target_fingerprint = ""
+    rebase_target_matches = False
     rebase_lineage_error = ""
+    rebase_removed_evidence: list[dict[str, Any]] = []
+    rebase_removed_open: list[dict[str, Any]] = []
+    rebase_removed_pending_restore: list[dict[str, Any]] = []
+    rebase_removal_template = str(pdir / "rebase-removal-resolutions.json")
     if not allocation:
         if allocation_path.exists():
             lines.append("Stage 2 归集: BLOCKED expense-allocation.json 无法解析")
@@ -418,7 +469,27 @@ def inspect_workflow(
         rebase_decisions = load(rebase_path)
         if rebase_decisions:
             rebase_metadata = rebase_decisions.get("rebase_metadata", {})
-            rebase_integrity_ok, _rebase_integrity_reason = integrity.check(rebase_decisions)
+            rebase_integrity_ok, rebase_integrity_reason = integrity.check(rebase_decisions)
+            raw_removed_evidence = rebase_decisions.get("removed_evidence")
+            removed_evidence_schema_valid = bool(
+                isinstance(raw_removed_evidence, list)
+                and all(isinstance(item, dict) for item in raw_removed_evidence)
+            )
+            if removed_evidence_schema_valid:
+                rebase_removed_evidence = [dict(item) for item in raw_removed_evidence]
+                rebase_removed_open = [
+                    item for item in rebase_removed_evidence
+                    if item.get("resolution_status") == "open"
+                ]
+                rebase_removed_pending_restore = [
+                    item for item in rebase_removed_evidence
+                    if item.get("resolution_status") == "pending_restore"
+                ]
+            if isinstance(rebase_metadata, dict):
+                rebase_removal_template = str(
+                    rebase_metadata.get("removal_resolution_template")
+                    or rebase_removal_template
+                )
             rebase_action_count = sum(
                 len(rebase_decisions.get(field, []))
                 if isinstance(rebase_decisions.get(field, []), list) else 0
@@ -427,38 +498,100 @@ def inspect_workflow(
             declared_generation = str(
                 rebase_decisions.get("for_allocation_fingerprint", "")
             ).strip().lower()
-            target_fingerprint = str(
+            rebase_target_fingerprint = str(
                 (rebase_metadata if isinstance(rebase_metadata, dict) else {}).get(
                     "target_allocation_fingerprint", ""
                 )
             ).strip().lower()
-            rebase_current = bool(
+            rebase_declared_source = str(
+                (rebase_metadata if isinstance(rebase_metadata, dict) else {}).get(
+                    "source_allocation_fingerprint", ""
+                )
+            ).strip().lower()
+            rebase_target_matches = bool(
                 alloc_fp
                 and rebase_integrity_ok
                 and str(rebase_decisions.get("integrity", {}).get("stamped_by", "")) == "rebase_allocation_decisions.py"
                 and len(declared_generation) >= 8
                 and str(alloc_fp).lower().startswith(declared_generation)
-                and target_fingerprint == str(alloc_fp).lower()
+                and rebase_target_fingerprint == str(alloc_fp).lower()
             )
-            if rebase_current:
-                # Even a zero-carry rebase must pass through Composer/updater
-                # once to record that lineage review has been completed.
-                rebase_action_count += 1
-            artifacts["rebase_decisions"] = {
-                "path": str(rebase_path),
-                "target_allocation_fingerprint": target_fingerprint,
-                "action_count": rebase_action_count,
-                "current": rebase_current,
-            }
+            if not rebase_integrity_ok:
+                rebase_decisions_status = "invalid"
+                rebase_decisions_reason = f"integrity failed: {rebase_integrity_reason}"
+            elif str(rebase_decisions.get("integrity", {}).get("stamped_by", "")) != "rebase_allocation_decisions.py":
+                rebase_decisions_status = "invalid"
+                rebase_decisions_reason = "file was not stamped by rebase_allocation_decisions.py"
+            elif not rebase_target_matches:
+                rebase_decisions_status = "stale"
+                rebase_decisions_reason = (
+                    "target allocation fingerprint does not match the current allocation generation"
+                )
+            elif not removed_evidence_schema_valid:
+                rebase_decisions_status = "invalid"
+                rebase_decisions_reason = (
+                    "rebase packet lacks the structured removed_evidence ledger; rerun Chief rebase"
+                )
+            else:
+                rebase_decisions_status = "pending_source_validation"
+                rebase_decisions_reason = "target matches; validating the selected lineage source"
+        elif rebase_path.exists():
+            rebase_decisions_status = "invalid"
+            rebase_decisions_reason = "rebase-decisions.json cannot be parsed"
         if ok and not allocation.get("change_log"):
-            source_path, _source_alloc, rebase_reason = allocation_generations.discover_rebase_source(
+            source_path, source_alloc, rebase_reason = allocation_generations.discover_rebase_source(
                 allocation_path, allocation
             )
+            rebase_selection_reason = rebase_reason
             if source_path is not None:
                 rebase_available = True
                 rebase_source_path = str(source_path)
+                rebase_source_fingerprint = str(
+                    (source_alloc or {}).get("integrity", {}).get("fingerprint", "")
+                ).strip().lower()
             elif allocation_generations.is_lineage_integrity_error(rebase_reason):
                 rebase_lineage_error = rebase_reason
+        elif ok:
+            rebase_selection_reason = "current allocation already contains applied decisions"
+
+        if rebase_target_matches and rebase_decisions_status == "pending_source_validation":
+            if not rebase_available:
+                rebase_decisions_status = "stale"
+                rebase_decisions_reason = (
+                    "current allocation has no eligible lineage source for this rebase file"
+                )
+            elif not rebase_declared_source:
+                rebase_decisions_status = "invalid"
+                rebase_decisions_reason = "rebase metadata is missing source_allocation_fingerprint"
+            elif rebase_declared_source != rebase_source_fingerprint:
+                rebase_decisions_status = "stale"
+                rebase_decisions_reason = (
+                    "declared source fingerprint differs from Chief's nearest eligible lineage source"
+                )
+            else:
+                rebase_current = True
+                rebase_decisions_status = "current"
+                rebase_decisions_reason = "source and target generations match Chief's lineage selection"
+                # Even a zero-carry rebase must pass through Composer/updater
+                # once to record that lineage review has been completed.
+                rebase_action_count += 1
+
+        if rebase_path.exists():
+            artifacts["rebase_decisions"] = {
+                "path": str(rebase_path),
+                "status": rebase_decisions_status,
+                "reason": rebase_decisions_reason,
+                "declared_source_allocation_fingerprint": rebase_declared_source,
+                "selected_source_allocation_fingerprint": rebase_source_fingerprint,
+                "target_allocation_fingerprint": rebase_target_fingerprint,
+                "action_count": rebase_action_count if rebase_current else 0,
+                "current": rebase_current,
+                "removed_evidence_count": len(rebase_removed_evidence),
+                "removed_evidence_open_count": len(rebase_removed_open),
+                "removed_evidence_pending_restore_count": len(rebase_removed_pending_restore),
+                "removed_evidence": rebase_removed_evidence,
+                "removal_resolution_template": rebase_removal_template,
+            }
         generation_mismatch = bool(extraction_fp) and (
             str(allocation.get("source_extraction_fingerprint", "")) != extraction_fp
         )
@@ -493,7 +626,9 @@ def inspect_workflow(
             stamp_note += f" [BLOCKED: {rebase_lineage_error}]"
         answer_note = f"，待应用答案 {current_answer_count} 项" if answers_current else ""
         rebase_note = (
-            f"，待迁移决定 {rebase_action_count} 项" if rebase_current and rebase_action_count
+            f"，待确认移除证据 {len(rebase_removed_open)} 项" if rebase_current and rebase_removed_open
+            else f"，待恢复移除证据 {len(rebase_removed_pending_restore)} 项" if rebase_current and rebase_removed_pending_restore
+            else f"，待迁移决定 {rebase_action_count} 项" if rebase_current and rebase_action_count
             else ("，检测到可迁移的上一代决定" if rebase_available and not rebase_current else "")
         )
         hint_count_text = "未知（台账缺失）" if hint_ledger_missing else f"{len(unresolved_hints)} 条"
@@ -512,6 +647,7 @@ def inspect_workflow(
                 "blocked" if not ok or generation_mismatch or context_mismatch or upstream_unavailable or rebase_lineage_error else (
                     "command_ready" if answers_current or rebase_available or (
                         rebase_current and rebase_action_count
+                        and not rebase_removed_open and not rebase_removed_pending_restore
                     ) else "needs_user"
                 )
             ),
@@ -525,8 +661,18 @@ def inspect_workflow(
             "unapplied_answer_count": current_answer_count if answers_current else 0,
             "rebase_available": rebase_available,
             "rebase_source_path": rebase_source_path,
+            "rebase_source_fingerprint": rebase_source_fingerprint,
+            "rebase_selection_reason": rebase_selection_reason,
             "rebase_decisions_current": rebase_current,
+            "rebase_decisions_status": rebase_decisions_status,
+            "rebase_decisions_reason": rebase_decisions_reason,
             "rebase_action_count": rebase_action_count if rebase_current else 0,
+            "removed_evidence_count": len(rebase_removed_evidence) if rebase_current else 0,
+            "removed_evidence_open_count": len(rebase_removed_open) if rebase_current else 0,
+            "removed_evidence_pending_restore_count": (
+                len(rebase_removed_pending_restore) if rebase_current else 0
+            ),
+            "removal_resolution_template": rebase_removal_template,
             "rebase_lineage_error": rebase_lineage_error,
             "integrity_valid": ok,
             "generation_mismatch": generation_mismatch,
@@ -542,6 +688,11 @@ def inspect_workflow(
             "actual_project_context_sha256": actual_context_sha,
             "allocation_engine_revision": str(allocation.get("allocation_engine_revision", "")),
             "previous_allocation_file": str(allocation.get("previous_allocation_file", "")),
+            "selected_rebase_source_path": rebase_source_path,
+            "selected_rebase_source_fingerprint": rebase_source_fingerprint,
+            "rebase_selection_rule": (
+                "nearest same-basis ancestor containing official user decisions"
+            ),
         }
         if not ok:
             integrity_blocked = True
@@ -622,6 +773,37 @@ def inspect_workflow(
                 operation="apply",
                 parameters={"answers": str(answers_path)},
             ))
+        elif rebase_current and rebase_removed_open:
+            set_next(next_step(
+                "needs_user",
+                "allocation",
+                "A prior confirmed/fixed expense item disappeared after evidence files changed. "
+                "Ask the applicant to confirm each M@ref item as intentional_removal, "
+                "replacement_provided (with exact current N@ref), or restore_required. "
+                "Record the answers in the generated UTF-8 removal-resolution template.",
+                operation="rebase",
+                parameters={
+                    "old": rebase_source_path,
+                    "resolutions": rebase_removal_template,
+                },
+                missing=[
+                    f"{item.get('removal_ref')}: {item.get('source_filename') or '?'} | "
+                    f"{item.get('amount') or '?'} | "
+                    f"{item.get('expense_date') or item.get('source_category') or '?'}"
+                    for item in rebase_removed_open
+                ],
+            ))
+        elif rebase_current and rebase_removed_pending_restore:
+            set_next(next_step(
+                "needs_user",
+                "allocation",
+                "The applicant said removed evidence must be restored. Add/restore those source files, "
+                "then rerun extraction, allocation, and rebase; this generation cannot proceed.",
+                missing=[
+                    f"{item.get('removal_ref')}: restore {item.get('source_filename') or 'the cited evidence'}"
+                    for item in rebase_removed_pending_restore
+                ],
+            ))
         elif rebase_current and rebase_action_count:
             set_next(next_step(
                 "command",
@@ -631,12 +813,24 @@ def inspect_workflow(
                 parameters={"decisions": str(rebase_path)},
             ))
         elif rebase_available and not rebase_current:
+            stale_detail = (
+                f" Existing rebase-decisions.json is {rebase_decisions_status}: "
+                f"{rebase_decisions_reason}."
+                if rebase_path.exists()
+                else ""
+            )
             set_next(next_step(
                 "command",
                 "allocation",
-                "A prior same-basis allocation contains official user decisions. Rebase them by evidence identity before asking repeated questions.",
+                "A prior same-basis allocation contains official user decisions. "
+                f"Chief selected source {rebase_source_fingerprint[:8]} at {rebase_source_path}."
+                f"{stale_detail} Regenerate the rebase packet before asking repeated questions.",
                 operation="rebase",
-                parameters={"old": rebase_source_path},
+                parameters={
+                    "old": rebase_source_path,
+                    "source_fingerprint": rebase_source_fingerprint,
+                    "target_fingerprint": str(alloc_fp),
+                },
             ))
         elif open_qs:
             set_next(next_step(
@@ -672,7 +866,9 @@ def inspect_workflow(
         else:
             lines.append(
                 "  - Otako allocation analysis: "
-                f"{analyst_state.get('status', 'missing')} (optional; does not change Stage 2 state)"
+                f"{analyst_state.get('status', 'missing')} "
+                "(preferred before applicant questioning when a fresh subagent is available; "
+                "deterministic Stage 2 remains the fallback)"
             )
             analyst_can_help = bool(open_qs or unconfirmed) and not any([
                 not ok,
@@ -689,7 +885,7 @@ def inspect_workflow(
                 subagents["recommended"].append({
                     "role": "allocation_analyst",
                     "display_name": "Otako - Allocation Analyst",
-                    "reason": "fresh independent allocation pass before relaying unresolved items",
+                    "reason": "default fresh independent allocation pass before relaying unresolved items",
                 })
 
     stage2_ready = stages.get("allocation", {}).get("status") == "ready"
@@ -738,13 +934,13 @@ def inspect_workflow(
         else:
             lines.append(
                 "Kaede independent review: "
-                f"{independent_review.get('status', 'missing')} - optional fail-open pilot; "
-                "deterministic Stage 3 preflight remains authoritative"
+                f"{independent_review.get('status', 'missing')} - preferred when the host supports "
+                "a fresh subagent; deterministic Stage 3 preflight is the fail-open fallback"
             )
             subagents["recommended"].append({
                 "role": "independent_reviewer",
                 "display_name": "Kaede - Independent Reviewer",
-                "reason": "fresh independent audit before Stage 3",
+                "reason": "default fresh independent audit immediately before Stage 3",
             })
     if review_blocks_stage3:
         set_next(next_step(

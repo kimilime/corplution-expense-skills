@@ -46,6 +46,7 @@ DECISIONS_ROOT_FIELDS = {
     "drop_units",
     "exclude_units",
     "rebase_metadata",
+    "removed_evidence",
     "proposal_review",
     "integrity",
 }
@@ -195,11 +196,18 @@ def parse_set_spec(spec: str) -> tuple[list[int], dict[str, Any]]:
     selector, _, body = spec.partition(":")
     units = parse_unit_selector(selector)
     fields: dict[str, Any] = {}
+    current_field = ""
     for token in shlex.split(body):
-        if "=" not in token:
+        if "=" in token:
+            key, _, value = token.partition("=")
+            current_field = normalize_field(key)
+            if not current_field:
+                raise ValueError(f"empty field name in --set {spec!r}")
+            fields[current_field] = value
+        elif current_field:
+            fields[current_field] = (fields[current_field] + " " + token).strip()
+        else:
             raise ValueError(f"expected field=value, got {token!r} in --set {spec!r}")
-        key, _, value = token.partition("=")
-        fields[normalize_field(key)] = value
     if not fields:
         raise ValueError(f"--set {spec!r} sets no fields")
     return units, fields
@@ -229,6 +237,88 @@ def load_decisions_file(path: Path) -> dict[str, Any]:
     if data.get("schema_version") != DECISIONS_SCHEMA_VERSION:
         raise ValueError(f"schema_version must be {DECISIONS_SCHEMA_VERSION!r}")
     return data
+
+
+def validated_removed_evidence(
+    value: Any,
+    allocation: dict[str, Any],
+    metadata: dict[str, Any],
+) -> list[dict[str, Any]]:
+    if not isinstance(value, list) or any(not isinstance(item, dict) for item in value):
+        raise ValueError(
+            "official rebase decisions must contain a removed_evidence array; rerun Chief rebase"
+        )
+    current_by_identity = {
+        str(unit.get("unit_identity_sha256", "")).strip().lower(): unit
+        for unit in allocation.get("allocation_units", []) if isinstance(unit, dict)
+    }
+    current_by_token = {
+        f"{unit.get('user_no') or unit.get('unit_no')}@{str(unit.get('unit_ref', '')).strip().lower()}": unit
+        for unit in current_by_identity.values()
+    }
+    seen_removals: set[str] = set()
+    seen_identities: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for index, raw in enumerate(value, start=1):
+        entry = dict(raw)
+        removal_ref = str(entry.get("removal_ref", "")).strip().lower()
+        identity = str(entry.get("unit_identity_sha256", "")).strip().lower()
+        status = str(entry.get("resolution_status", "")).strip()
+        action = str(entry.get("resolution_action", "")).strip()
+        requires_confirmation = entry.get("requires_confirmation") is True
+        if not removal_ref or not identity:
+            raise ValueError(f"removed_evidence #{index} lacks its immutable reference or identity")
+        if removal_ref in seen_removals or identity in seen_identities:
+            raise ValueError(f"removed_evidence #{index} repeats an earlier removed item")
+        seen_removals.add(removal_ref)
+        seen_identities.add(identity)
+        if identity in current_by_identity:
+            raise ValueError(
+                f"{entry.get('removal_ref')} is present in the current allocation and cannot be recorded as removed"
+            )
+        if status != "resolved":
+            raise ValueError(
+                f"{entry.get('removal_ref')} is {status or 'unresolved'}; ask the applicant to confirm "
+                "the removal or restore the evidence, then rerun Chief rebase with --resolutions"
+            )
+        if requires_confirmation:
+            if action not in {"intentional_removal", "replacement_provided"}:
+                raise ValueError(f"{entry.get('removal_ref')} lacks an explicit applicant removal decision")
+            if not str(entry.get("resolution_note", "")).strip():
+                raise ValueError(f"{entry.get('removal_ref')} lacks its confirmation note")
+        elif action != "prior_closed_item_removed":
+            raise ValueError(f"{entry.get('removal_ref')} has an invalid automatic removal action")
+        replacement_refs = entry.get("replacement_unit_refs", [])
+        replacement_ids = entry.get("replacement_unit_ids", [])
+        replacement_identities = entry.get("replacement_unit_identities", [])
+        if any(not isinstance(items, list) for items in (replacement_refs, replacement_ids, replacement_identities)):
+            raise ValueError(f"{entry.get('removal_ref')} replacement fields must be arrays")
+        if action == "replacement_provided":
+            if not replacement_refs or not (
+                len(replacement_refs) == len(replacement_ids) == len(replacement_identities)
+            ):
+                raise ValueError(f"{entry.get('removal_ref')} has incomplete replacement bindings")
+            for position, token in enumerate(replacement_refs):
+                unit = current_by_token.get(str(token).strip().lower())
+                if unit is None:
+                    raise ValueError(f"{entry.get('removal_ref')} references stale replacement {token!r}")
+                if (
+                    str(unit.get("unit_id", "")) != str(replacement_ids[position])
+                    or str(unit.get("unit_identity_sha256", "")).strip().lower()
+                    != str(replacement_identities[position]).strip().lower()
+                    or str(unit.get("status", "")).strip() in {"dropped", "excluded", "non_reimbursable"}
+                ):
+                    raise ValueError(f"{entry.get('removal_ref')} replacement binding is stale or inactive")
+        elif replacement_refs or replacement_ids or replacement_identities:
+            raise ValueError(f"{entry.get('removal_ref')} unexpectedly contains replacement bindings")
+        normalized.append(entry)
+
+    declared_count = metadata.get("removed_evidence_count")
+    if not isinstance(declared_count, int) or declared_count != len(normalized):
+        raise ValueError("rebase removed-evidence count does not match its metadata; rerun Chief rebase")
+    if metadata.get("removed_evidence_open_count") != 0 or metadata.get("removed_evidence_pending_restore_count") != 0:
+        raise ValueError("rebase metadata still reports unresolved removed evidence")
+    return normalized
 
 
 def decision_batches(data: dict[str, Any]) -> list[tuple[list[int], dict[str, Any]]]:
@@ -597,7 +687,12 @@ def main(argv: list[str] | None = None) -> int:
             decision_data, allocation
         )
         rebase_metadata = decision_data.get("rebase_metadata")
+        removed_evidence: list[dict[str, Any]] = []
         lineage_rebase: dict[str, Any] | None = None
+        if "removed_evidence" in decision_data and not rebase_metadata:
+            raise ValueError(
+                "removed_evidence is reserved for an officially stamped Chief rebase packet"
+            )
         if rebase_metadata:
             rebase_ok, rebase_reason = integrity.check(decision_data)
             if not rebase_ok or str(decision_data.get("integrity", {}).get("stamped_by", "")) != "rebase_allocation_decisions.py":
@@ -605,6 +700,11 @@ def main(argv: list[str] | None = None) -> int:
                     "rebase decisions are missing or fail their official integrity stamp "
                     f"({rebase_reason}); rerun Chief rebase instead of editing the file"
                 )
+            if not isinstance(rebase_metadata, dict):
+                raise ValueError("rebase_metadata must be an object")
+            removed_evidence = validated_removed_evidence(
+                decision_data.get("removed_evidence"), allocation, rebase_metadata
+            )
         if not allocation.get("change_log"):
             source_path, source_alloc, lineage_reason = allocation_generations.discover_rebase_source(
                 allocation_path, allocation
@@ -633,6 +733,7 @@ def main(argv: list[str] | None = None) -> int:
                     "source_allocation_file": str(source_path),
                     "source_allocation_fingerprint": expected_source,
                     "target_allocation_fingerprint": fingerprint,
+                    "removed_evidence": removed_evidence,
                 }
             elif rebase_metadata:
                 raise ValueError(

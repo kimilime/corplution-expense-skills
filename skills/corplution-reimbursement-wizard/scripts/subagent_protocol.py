@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Version-bound, read-only handoff protocol for the optional subagent pilot.
+"""Version-bound, read-only handoff protocol for preferred subagent checkpoints.
 
 This module never launches an LLM and never mutates extraction/allocation JSON.
 It serializes a path-free snapshot for a fresh subagent, validates the returned

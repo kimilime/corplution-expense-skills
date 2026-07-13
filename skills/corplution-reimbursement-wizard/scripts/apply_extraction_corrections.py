@@ -24,7 +24,7 @@ Corrections file format:
 {
   "corrections": [
     {
-      "match": {"sha256": "..."},            // or document_id / source_file
+      "match": {"sha256": "..."},            // unique content
       "action": "correct",                    // or "exclude"
       "set": {
         "document_role": "invoice",
@@ -46,6 +46,11 @@ Corrections file format:
     }
   ]
 }
+
+For byte-identical copies, sha256 alone is intentionally ambiguous. Select one
+physical copy with both keys:
+  "match": {"sha256": "<shared hash>", "source_file": "<exact source path>"}
+The updater rejects every selector that still matches more than one file.
 """
 
 from __future__ import annotations
@@ -104,8 +109,8 @@ def main(argv: list[str] | None = None) -> int:
         for err in all_errors:
             print(f"ERROR: {err}", file=sys.stderr)
         print("", file=sys.stderr)
-        print("See the format example in this script's docstring. Match by sha256 when possible;", file=sys.stderr)
-        print("get it from the document entry in process/invoice-extraction.md or .json.", file=sys.stderr)
+        print("See the format example in this script's docstring. Use sha256 alone only when unique;", file=sys.stderr)
+        print("for exact copies combine the shared sha256 with the intended exact source_file.", file=sys.stderr)
         return 2
 
     log = xc.apply_overlay(payload, {"corrections": entries})
@@ -116,8 +121,8 @@ def main(argv: list[str] | None = None) -> int:
     if hard_errors:
         print("", file=sys.stderr)
         print(f"ABORTED: {len(hard_errors)} correction(s) could not be applied safely — nothing was "
-              "written (extraction unchanged, overlay unchanged). Fix the match keys (use sha256 "
-              "from process/invoice-extraction.md) and re-run.", file=sys.stderr)
+              "written (extraction unchanged, overlay unchanged). Fix the match keys; for exact "
+              "copies combine sha256 with the intended exact source_file, then re-run.", file=sys.stderr)
         return 2
 
     if args.dry_run:

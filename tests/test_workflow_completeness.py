@@ -17,8 +17,10 @@ sys.path.insert(0, str(SCRIPTS))
 
 import allocate_expenses as allocator  # noqa: E402
 import apply_allocation_answers as updater  # noqa: E402
+import check_workflow_status as workflow_status  # noqa: E402
 import chief_orchestrator as chief  # noqa: E402
 import extract_invoices as extractor  # noqa: E402
+import extraction_corrections as extraction_updates  # noqa: E402
 import integrity  # noqa: E402
 import package_reimbursement_files as packager  # noqa: E402
 import write_reimbursement_template as writer  # noqa: E402
@@ -374,6 +376,137 @@ class CrossStageRegressionTests(unittest.TestCase):
         self.assertTrue(documents[1]["needs_review"])
         self.assertTrue(any(link["relation"] == "duplicate_source_file" for link in links))
         self.assertIn("Stage 1", documents[1]["issues"][0]["suggested_action"])
+
+    def test_sha_only_duplicate_exclusion_is_atomic_and_composite_match_keeps_one(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            process = root / "process"
+            process.mkdir()
+            first = root / "first.pdf"
+            copy = root / "copy.pdf"
+            payload = {
+                "schema_version": "invoice_extraction.v1",
+                "documents": [
+                    {
+                        "document_id": "DOC-001",
+                        "source_file": str(first),
+                        "sha256": "same-hash",
+                        "document_role": "invoice",
+                        "needs_review": False,
+                    },
+                    {
+                        "document_id": "DOC-002",
+                        "source_file": str(copy),
+                        "sha256": "same-hash",
+                        "document_role": "invoice",
+                        "needs_review": True,
+                    },
+                ],
+                "unresolved_input_files": [],
+                "document_links": [],
+            }
+            integrity.stamp(payload, "test")
+            extraction_path = process / "invoice-extraction.json"
+            extraction_path.write_text(json.dumps(payload), encoding="utf-8")
+            original = extraction_path.read_bytes()
+
+            corrections_path = root / "corrections.json"
+            corrections_path.write_text(json.dumps({
+                "corrections": [{
+                    "match": {"sha256": "same-hash"},
+                    "action": "exclude",
+                    "reason": "duplicate copy",
+                    "corrected_by": "user",
+                }],
+            }), encoding="utf-8")
+            command = [
+                sys.executable,
+                "-X",
+                "utf8",
+                str(SCRIPTS / "apply_extraction_corrections.py"),
+                "--extraction",
+                str(extraction_path),
+                "--corrections",
+                str(corrections_path),
+            ]
+            ambiguous = subprocess.run(command, capture_output=True, text=True, encoding="utf-8")
+
+            self.assertEqual(2, ambiguous.returncode)
+            self.assertIn("matched 2 documents", ambiguous.stdout)
+            self.assertEqual(original, extraction_path.read_bytes())
+            self.assertFalse((process / "extraction-corrections.json").exists())
+
+            corrections_path.write_text(json.dumps({
+                "corrections": [{
+                    "match": {"sha256": "same-hash", "source_file": str(copy)},
+                    "action": "exclude",
+                    "reason": "duplicate copy",
+                    "corrected_by": "user",
+                }],
+            }), encoding="utf-8")
+            precise = subprocess.run(command, capture_output=True, text=True, encoding="utf-8")
+
+            self.assertEqual(0, precise.returncode, precise.stdout + precise.stderr)
+            updated = json.loads(extraction_path.read_text(encoding="utf-8"))
+            self.assertFalse(updated["documents"][0].get("excluded_by_user", False))
+            self.assertTrue(updated["documents"][1]["excluded_by_user"])
+
+    def test_sha_only_duplicate_unsupported_resolution_is_rejected(self) -> None:
+        payload = {
+            "unresolved_input_files": [
+                {"source_file": "first.ofd", "sha256": "same-hash", "status": "open"},
+                {"source_file": "copy.ofd", "sha256": "same-hash", "status": "open"},
+            ]
+        }
+        entry = {
+            "match": {"sha256": "same-hash"},
+            "action": "exclude",
+            "reason": "duplicate copy",
+            "corrected_by": "user",
+        }
+
+        log = extraction_updates.apply_input_resolutions(payload, {"input_resolutions": [entry]})
+
+        self.assertTrue(any(line.startswith("ERROR:") for line in log))
+        self.assertEqual(["open", "open"], [item["status"] for item in payload["unresolved_input_files"]])
+
+    def test_status_blocks_legacy_duplicate_group_with_no_active_copy(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            process = root / "process"
+            process.mkdir()
+            extraction = {
+                "schema_version": "invoice_extraction.v1",
+                "documents": [
+                    {
+                        "document_id": "DOC-001",
+                        "source_file": str(root / "first.pdf"),
+                        "sha256": "same-hash",
+                        "document_role": "invoice",
+                        "needs_review": False,
+                        "excluded_by_user": True,
+                    },
+                    {
+                        "document_id": "DOC-002",
+                        "source_file": str(root / "copy.pdf"),
+                        "sha256": "same-hash",
+                        "document_role": "invoice",
+                        "needs_review": False,
+                        "excluded_by_user": True,
+                    },
+                ],
+                "unresolved_input_files": [],
+                "document_links": [],
+            }
+            integrity.stamp(extraction, "test")
+            (process / "invoice-extraction.json").write_text(json.dumps(extraction), encoding="utf-8")
+
+            state = workflow_status.inspect_workflow(process, root / "output")
+
+            self.assertEqual("needs_user", state["stages"]["extraction"]["status"])
+            self.assertEqual(1, state["stages"]["extraction"]["duplicate_group_error_count"])
+            self.assertEqual("extraction", state["next"]["stage"])
+            self.assertIn("exactly one canonical active copy", state["next"]["summary"])
 
     def test_allocation_refuses_pending_duplicate_instead_of_allowing_stage2_drop(self) -> None:
         with tempfile.TemporaryDirectory() as temp:

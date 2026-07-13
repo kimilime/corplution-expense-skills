@@ -19,9 +19,9 @@ Optional:
 - Approval screenshot paths for substitute invoices
 - User confirmation for dropped or excluded items
 
-## Optional Kaede Independent Review
+## Preferred Kaede Independent Review
 
-When the host supports a fresh isolated subagent, run Chief `prepare-agent --role independent_reviewer` after Stage 2 is fully confirmed and immediately before Stage 3. Pass the complete path-free task and result-template JSON contents to the reviewer; do not give it local paths, tools, Otako's reasoning, or permission to modify artifacts. Validate the returned `stage3_independent_review.v1` with Chief `accept-agent`.
+When the host supports a fresh isolated subagent, run Chief `prepare-agent --role independent_reviewer` by default after Stage 2 is fully confirmed and immediately before Stage 3. Skip only when that capability is unavailable or the user opts out. Pass the complete path-free task and result-template JSON contents to the reviewer; do not give it local paths, tools, Otako's reasoning, or permission to modify artifacts. Validate the returned `stage3_independent_review.v1` with Chief `accept-agent`.
 
 A current validated `block` result is a pre-Stage-3 blocker and must cite current unit/evidence references. Every accepted result is retained in an immutable current-task archive under `process/subagent-review-generations/`; deleting or corrupting `stage3-independent-review.json` does not clear it. Resolve the finding through Composer/Updater, then create a new review bound to the new allocation fingerprint. A current `advisory`, `pass`, or explicit `unavailable` result is recorded in `final-expense-rows.json`. When no valid accepted result exists for the current task, the pilot explicitly fails open to the deterministic checks below; absence is never represented as a pass. Reviewer blockers are separate from `blocking_policy_checks`, which remains reserved for deterministic meal/hotel policy confirmations. The writer also rejects a `--process-dir` that is not the allocation's own directory.
 

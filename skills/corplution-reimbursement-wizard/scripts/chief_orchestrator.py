@@ -84,10 +84,14 @@ def add_run_parsers(run_parser: argparse.ArgumentParser) -> None:
 
     rebase = stages.add_parser("rebase", help="Carry decisions across an allocation regeneration by evidence ref.")
     rebase.add_argument("--old", help="Optional explicit source; otherwise discover the latest decided lineage generation.")
+    rebase.add_argument(
+        "--resolutions",
+        help="Filled UTF-8 rebase_removal_resolutions.v1 file for removed-evidence confirmations.",
+    )
 
     prepare_agent = stages.add_parser(
         "prepare-agent",
-        help="Prepare a path-free immutable task packet for an optional read-only subagent.",
+        help="Prepare a path-free immutable task packet for a preferred read-only subagent checkpoint.",
     )
     prepare_agent.add_argument(
         "--role",
@@ -144,6 +148,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     next_parser = commands.add_parser("next", help="Show exactly one next action or required user input.")
     next_parser.add_argument("--json", action="store_true")
+
+    lineage = commands.add_parser(
+        "lineage",
+        help="Show current generation fingerprints and Chief's selected rebase source.",
+    )
+    lineage.add_argument("--json", action="store_true")
 
     run = commands.add_parser("run", help="Dispatch one canonical workflow operation.")
     add_run_parsers(run)
@@ -240,6 +250,8 @@ def build_child_command(args: argparse.Namespace) -> tuple[str, str, list[str]]:
     elif stage == "rebase":
         if args.old:
             child.extend(["--old", args.old])
+        if args.resolutions:
+            child.extend(["--resolutions", args.resolutions])
         child.extend([
             "--new", str(paths["allocation"]),
             "--output", str(paths["process"] / "rebase-decisions.json"),
@@ -454,7 +466,13 @@ def chief_argv(
         return None
     if operation == "rebase":
         old = str(parameters.get("old", ""))
-        return [*base, "--old", old] if old else base
+        resolutions = str(parameters.get("resolutions", ""))
+        command = [*base]
+        if old:
+            command.extend(["--old", old])
+        if resolutions:
+            command.extend(["--resolutions", resolutions])
+        return command
     if operation == "prepare-agent":
         role = str(parameters.get("role", ""))
         return [*base, "--role", role] if role else None
@@ -484,6 +502,26 @@ def enrich_next(state: dict[str, Any], journal: str | None = None) -> dict[str, 
             result["missing"].append("parameters required to construct the next command")
     else:
         result["argv"] = None
+    result["follow_up_argv"] = None
+    if result.get("kind") == "needs_user" and result.get("operation"):
+        result["follow_up_argv"] = chief_argv(
+            str(result["operation"]),
+            result["parameters"],
+            process_dir=str(state.get("process_dir", "process")),
+            output_root=str(state.get("output_root", "output")),
+            journal=journal,
+        )
+    allocation_artifact = (state.get("artifacts") or {}).get("allocation") or {}
+    allocation_stage = (state.get("stages") or {}).get("allocation") or {}
+    allocation_fingerprint = str(allocation_artifact.get("integrity_fingerprint", ""))
+    result["generation"] = {
+        "allocation_fingerprint": allocation_fingerprint,
+        "allocation_code": allocation_fingerprint[:8],
+        "selected_rebase_source_path": str(allocation_stage.get("rebase_source_path", "")),
+        "selected_rebase_source_fingerprint": str(
+            allocation_stage.get("rebase_source_fingerprint", "")
+        ),
+    }
     result["delegations"] = []
     for recommendation in (state.get("subagents") or {}).get("recommended", []):
         role = str(recommendation.get("role", ""))
@@ -498,14 +536,80 @@ def enrich_next(state: dict[str, Any], journal: str | None = None) -> dict[str, 
             result["delegations"].append({
                 "role": role,
                 "display_name": str(recommendation.get("display_name", role)),
-                "reason": str(recommendation.get("reason", "optional independent pass")),
+                "reason": str(recommendation.get("reason", "preferred independent pass")),
+                "priority": "before_next",
+                "required_when_host_supports_fresh_subagents": True,
+                "fallback": "continue only when no fresh isolated subagent capability is available or the user opts out",
                 "argv": command,
             })
+    result["execution_order"] = (
+        ["preferred_subagent_checkpoint", "canonical_next"]
+        if result["delegations"] else ["canonical_next"]
+    )
     return result
 
 
 def format_command(argv: list[str]) -> str:
     return subprocess.list2cmdline(argv) if os.name == "nt" else shlex.join(argv)
+
+
+def lineage_report(state: dict[str, Any]) -> dict[str, Any]:
+    artifacts = state.get("artifacts") or {}
+    stages = state.get("stages") or {}
+    allocation_artifact = artifacts.get("allocation") or {}
+    extraction_artifact = artifacts.get("extraction") or {}
+    allocation_stage = stages.get("allocation") or {}
+    allocation_fingerprint = str(allocation_artifact.get("integrity_fingerprint", ""))
+    extraction_fingerprint = str(extraction_artifact.get("integrity_fingerprint", ""))
+    return {
+        "allocation": {
+            "path": str(allocation_artifact.get("path", "")),
+            "fingerprint": allocation_fingerprint,
+            "generation_code": allocation_fingerprint[:8],
+        },
+        "extraction": {
+            "path": str(extraction_artifact.get("path", "")),
+            "fingerprint": extraction_fingerprint,
+        },
+        "selected_rebase_source": {
+            "available": bool(allocation_stage.get("rebase_available")),
+            "path": str(allocation_stage.get("rebase_source_path", "")),
+            "fingerprint": str(allocation_stage.get("rebase_source_fingerprint", "")),
+            "selection_reason": str(allocation_stage.get("rebase_selection_reason", "")),
+            "selection_rule": (
+                "nearest same-basis ancestor containing official user decisions"
+            ),
+        },
+        "rebase_decisions": dict(artifacts.get("rebase_decisions") or {}),
+    }
+
+
+def render_lineage(report: dict[str, Any]) -> str:
+    allocation = report.get("allocation") or {}
+    extraction = report.get("extraction") or {}
+    source = report.get("selected_rebase_source") or {}
+    packet = report.get("rebase_decisions") or {}
+    lines = [
+        "CHIEF LINEAGE:",
+        f"Allocation generation: {allocation.get('generation_code') or '<none>'}",
+        f"Allocation fingerprint: {allocation.get('fingerprint') or '<none>'}",
+        f"Extraction fingerprint: {extraction.get('fingerprint') or '<none>'}",
+        f"Rebase source: {source.get('path') or '<none>'}",
+        f"Rebase source fingerprint: {source.get('fingerprint') or '<none>'}",
+        f"Selection: {source.get('selection_rule')} ({source.get('selection_reason') or 'not evaluated'})",
+    ]
+    if packet:
+        lines.append(
+            "Rebase packet: "
+            f"{packet.get('status', 'unknown')} - {packet.get('reason', 'no reason recorded')}"
+        )
+        lines.append(
+            "Removed evidence: "
+            f"{packet.get('removed_evidence_count', 0)} total / "
+            f"{packet.get('removed_evidence_open_count', 0)} awaiting confirmation / "
+            f"{packet.get('removed_evidence_pending_restore_count', 0)} awaiting restoration"
+        )
+    return "\n".join(lines)
 
 
 def render_next(step: dict[str, Any]) -> str:
@@ -515,22 +619,32 @@ def render_next(step: dict[str, Any]) -> str:
         f"Stage: {step.get('stage', 'unknown')}",
         f"Action: {step.get('summary', '')}",
     ]
+    generation = step.get("generation") or {}
+    if generation.get("allocation_code"):
+        lines.append(f"Allocation generation: {generation.get('allocation_code')}")
     missing = step.get("missing") or []
     if missing:
         lines.append("Missing:")
         lines.extend(f"- {item}" for item in missing)
-    argv = step.get("argv")
-    if argv:
-        lines.append("Command:")
-        lines.append(format_command(argv))
     delegations = step.get("delegations") or []
     if delegations:
-        lines.append("Optional subagent pilot (does not replace the NEXT action):")
+        lines.append(
+            "PREFERRED SUBAGENT CHECKPOINT (run BEFORE the canonical NEXT action when the host "
+            "offers a genuinely fresh isolated Agent; skip only if unavailable or the user opts out):"
+        )
         for delegation in delegations:
             lines.append(
                 f"- {delegation.get('display_name')}: {delegation.get('reason')}"
             )
             lines.append(f"  Prepare: {format_command(delegation.get('argv') or [])}")
+    argv = step.get("argv")
+    if argv:
+        lines.append("Canonical NEXT command (after the preferred checkpoint):")
+        lines.append(format_command(argv))
+    follow_up = step.get("follow_up_argv")
+    if follow_up:
+        lines.append("After recording the requested user answers:")
+        lines.append(format_command(follow_up))
     return "\n".join(lines)
 
 
@@ -579,6 +693,15 @@ def main(argv: list[str] | None = None) -> int:
         else:
             print(render_next(step))
         return 2 if step.get("kind") == "blocked" else 0
+
+    if args.command == "lineage":
+        state, _step = inspect(args)
+        report = lineage_report(state)
+        if args.json:
+            print(json.dumps(report, ensure_ascii=False, indent=2))
+        else:
+            print(render_lineage(report))
+        return 2 if state.get("integrity_blocked") else 0
 
     try:
         stage, script_name, child = build_child_command(args)

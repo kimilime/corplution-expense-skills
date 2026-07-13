@@ -60,7 +60,7 @@ Folder uploads can contain evidence formats the extractor cannot read, such as O
 - `resolution`, `resolved_by`, and `resolved_at` once the user decides
 - `replacement_file` when status is `converted`
 
-`open` is a hard stop for Stage 2, Stage 3, and Stage 4. Ask the user whether the file should be excluded or converted to a readable PDF/image, then save the decision through `input_resolutions` in `apply_extraction_corrections.py`. Match by SHA-256 whenever possible; a filename-only match that finds multiple files must be rejected.
+`open` is a hard stop for Stage 2, Stage 3, and Stage 4. Ask the user whether the file should be excluded or converted to a readable PDF/image, then save the decision through `input_resolutions` in `apply_extraction_corrections.py`. Use SHA-256 alone only when it identifies one input. For byte-identical copies, combine the shared SHA-256 with the intended copy's exact `source_file`; every selector that still matches multiple files is rejected.
 
 Use the canonical nested `match` object below. Do not flatten `sha256` or `source_file` onto the resolution entry itself.
 
@@ -84,7 +84,7 @@ Use the canonical nested `match` object below. Do not flatten `sha256` or `sourc
 }
 ```
 
-Use `sha256` when it identifies one unsupported-input content record. Use `source_file` only when its basename is unique in the current batch; an ambiguous filename match is rejected. `input_resolutions` is only for `unresolved_input_files`. To correct or exclude an indexed document, use a `corrections` entry instead.
+Use `sha256` when it identifies one unsupported-input content record. Use `source_file` alone only when its basename is unique in the current batch. For identical copies, use both keys and copy the exact source path from the extraction record. `input_resolutions` is only for `unresolved_input_files`. To correct or exclude an indexed document, use a `corrections` entry instead.
 
 ## Canonical Document Fields
 
@@ -268,7 +268,7 @@ Create `document_links` for:
 - `duplicate_source_file`
 - `possible_duplicate_invoice_no`
 
-Both exact SHA-256 duplicates and repeated invoice numbers are Stage 1 review decisions. Byte-identical files have no substantive difference, so propose the first indexed copy as the canonical source instead of asking the applicant to choose between identical contents. Exclude each later copy through a `corrections` entry matched by its unique `source_file` basename, or by its current `document_id` when the basename is ambiguous. Do not use the shared SHA-256 to exclude only one copy: it intentionally matches every byte-identical document. Repeated invoice numbers with different SHA-256 values are not exact copies and still require applicant review. Do not defer either decision to Stage 2 or drop an allocation unit: that would close a reimbursement row without resolving the source-evidence ledger.
+Both exact SHA-256 duplicates and repeated invoice numbers are Stage 1 review decisions. Byte-identical files have no substantive difference, so propose the first indexed copy as the canonical source instead of asking the applicant to choose between identical contents. Exclude each later copy through a `corrections` entry whose `match` combines the shared `sha256` with that copy's exact `source_file`. A SHA-only exclusion cannot identify one physical copy and is rejected atomically; Chief also requires exactly one active document in every exact-duplicate group. Repeated invoice numbers with different SHA-256 values are not exact copies and still require applicant review. Do not defer either decision to Stage 2 or drop an allocation unit: that would close a reimbursement row without resolving the source-evidence ledger.
 
 For Didi/Gaode, link summary invoice and trip report when total amounts match. Generate later reimbursement rows from the trip items, not from the summary invoice, when a matching trip report exists.
 

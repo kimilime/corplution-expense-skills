@@ -574,19 +574,27 @@ class SubagentProtocolTests(unittest.TestCase):
         self.assertEqual("write", state["next"]["operation"])
         self.assertEqual("pass", state["subagents"]["independent_reviewer"]["outcome"])
 
-    def test_optional_delegation_never_replaces_chief_next_action(self) -> None:
+    def test_preferred_delegation_precedes_but_preserves_canonical_next_action(self) -> None:
         fixture = PilotFixture(self.root)
         state = check_workflow_status.inspect_workflow(fixture.process, fixture.output)
         enriched = chief_orchestrator.enrich_next(state)
         self.assertEqual("needs_user", enriched["kind"])
         self.assertEqual("compose", enriched["operation"])
         self.assertEqual("allocation_analyst", enriched["delegations"][0]["role"])
+        self.assertEqual("before_next", enriched["delegations"][0]["priority"])
+        self.assertTrue(enriched["delegations"][0]["required_when_host_supports_fresh_subagents"])
+        self.assertEqual(
+            ["preferred_subagent_checkpoint", "canonical_next"],
+            enriched["execution_order"],
+        )
 
         fixture = PilotFixture(self.root / "ready", unit_status="confirmed", open_question=False)
         state = check_workflow_status.inspect_workflow(fixture.process, fixture.output)
         enriched = chief_orchestrator.enrich_next(state)
         self.assertEqual("write", enriched["operation"])
         self.assertEqual("independent_reviewer", enriched["delegations"][0]["role"])
+        rendered = chief_orchestrator.render_next(enriched)
+        self.assertIn("PREFERRED SUBAGENT CHECKPOINT", rendered)
 
     def test_chief_dispatches_named_roles_through_protocol_only(self) -> None:
         fixture = PilotFixture(self.root)

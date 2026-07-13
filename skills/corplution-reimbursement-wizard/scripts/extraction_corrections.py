@@ -7,9 +7,9 @@ identify — an invoice photo, a partner approval screenshot, an Alipay payment
 receipt — often land as role "unknown". The sanctioned way to fix that is a
 correction entry here, NOT hand-editing invoice-extraction.json: hand edits
 are wiped whenever extract_invoices.py re-runs. Corrections live in their own
-overlay file (process/extraction-corrections.json) keyed by content sha256,
-and the extractor REPLAYS the overlay automatically after every re-run, so a
-correction survives any number of re-extractions.
+overlay file (process/extraction-corrections.json) keyed by durable evidence
+selectors, and the extractor REPLAYS the overlay automatically after every
+re-run, so a correction survives any number of re-extractions.
 
 Every file is evidence until the user explicitly says to drop it. A drop is a
 correction entry too ({"action": "exclude", "reason": ...}) so the exclusion
@@ -117,24 +117,34 @@ def validate_input_resolution(entry: dict[str, Any]) -> list[str]:
     return errors
 
 
+def _source_file_matches(recorded: Any, requested: Any) -> bool:
+    recorded_path = Path(str(recorded or ""))
+    requested_path = Path(str(requested or ""))
+    if requested_path.is_absolute():
+        return recorded_path.resolve(strict=False) == requested_path.resolve(strict=False)
+    return recorded_path.name == requested_path.name
+
+
 def _match_doc(entry: dict[str, Any], doc: dict[str, Any]) -> bool:
     match = entry.get("match") or {}
+    checks: list[bool] = []
     if match.get("sha256"):
-        return doc.get("sha256") == match["sha256"]
-    if match.get("document_id") and doc.get("document_id") == match["document_id"]:
-        return True
+        checks.append(doc.get("sha256") == match["sha256"])
+    if match.get("document_id"):
+        checks.append(doc.get("document_id") == match["document_id"])
     if match.get("source_file"):
-        return Path(str(doc.get("source_file", ""))).name == Path(str(match["source_file"])).name
-    return False
+        checks.append(_source_file_matches(doc.get("source_file"), match["source_file"]))
+    return bool(checks) and all(checks)
 
 
 def _match_input(entry: dict[str, Any], item: dict[str, Any]) -> bool:
     match = entry.get("match") or {}
+    checks: list[bool] = []
     if match.get("sha256"):
-        return item.get("sha256") == match["sha256"]
+        checks.append(item.get("sha256") == match["sha256"])
     if match.get("source_file"):
-        return Path(str(item.get("source_file", ""))).name == Path(str(match["source_file"])).name
-    return False
+        checks.append(_source_file_matches(item.get("source_file"), match["source_file"]))
+    return bool(checks) and all(checks)
 
 
 def apply_overlay(payload: dict[str, Any], overlay: dict[str, Any]) -> list[str]:
@@ -150,11 +160,12 @@ def apply_overlay(payload: dict[str, Any], overlay: dict[str, Any]) -> list[str]
             log.append(f"WARNING: correction {entry.get('match')} matched no document (file removed or renamed?)")
             continue
         match = entry.get("match") or {}
-        if len(matched) > 1 and not (match.get("sha256") or match.get("document_id")):
+        if len(matched) > 1:
             log.append(
-                f"ERROR: correction by source_file {match.get('source_file')!r} matched "
-                f"{len(matched)} documents — refusing to apply to all of them. Re-submit this "
-                "correction with the sha256 (or document_id) of the intended document."
+                f"ERROR: correction selector {match!r} matched {len(matched)} documents; "
+                "nothing was applied. SHA-256 identifies byte content, not one physical copy. "
+                "For exact duplicates, combine the shared sha256 with the intended copy's exact "
+                "source_file (preferred), or use a unique current document_id."
             )
             continue
         for doc in matched:
@@ -191,11 +202,11 @@ def apply_input_resolutions(payload: dict[str, Any], overlay: dict[str, Any]) ->
             log.append(f"WARNING: input resolution {entry.get('match')} matched no unsupported input")
             continue
         match = entry.get("match") or {}
-        if len(matched) > 1 and not match.get("sha256"):
+        if len(matched) > 1:
             log.append(
-                f"ERROR: input resolution by source_file {match.get('source_file')!r} matched "
-                f"{len(matched)} files - refusing to apply to all of them. Re-submit this "
-                "resolution with the sha256 from invoice-extraction.md."
+                f"ERROR: input resolution selector {match!r} matched {len(matched)} files; "
+                "nothing was applied. For byte-identical inputs, combine the shared sha256 "
+                "with the intended copy's exact source_file."
             )
             continue
         for item in matched:

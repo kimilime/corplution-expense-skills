@@ -162,7 +162,11 @@ def discover_rebase_source(
         if basis_error:
             return None, None, basis_error
         if has_explicit_user_decisions(candidate):
-            return path, candidate, "ok"
+            return (
+                path,
+                candidate,
+                f"selected nearest same-basis ancestor with official user decisions at depth {_depth}",
+            )
         current_path, current = path, candidate
     else:
         return None, None, f"{LINEAGE_INTEGRITY_PREFIX} exceeds {MAX_LINEAGE_DEPTH} generations"

@@ -203,6 +203,10 @@ class WorkflowStateTests(unittest.TestCase):
         enriched = chief_orchestrator.enrich_next(state)
         self.assertIn("rebase", enriched["argv"])
         self.assertIn(str(archived[0]), enriched["argv"])
+        self.assertEqual(current["integrity"]["fingerprint"][:8], enriched["generation"]["allocation_code"])
+        lineage = chief_orchestrator.lineage_report(state)
+        self.assertEqual(old["integrity"]["fingerprint"], lineage["selected_rebase_source"]["fingerprint"])
+        self.assertIn("depth 1", lineage["selected_rebase_source"]["selection_reason"])
 
         rebase_path = self.fixture.process / "rebase-decisions.json"
         rebase_payload = {
@@ -210,8 +214,13 @@ class WorkflowStateTests(unittest.TestCase):
             "for_allocation_fingerprint": current["integrity"]["fingerprint"][:8],
             "decisions": [{"units": "1@deadbeef", "set": {"status": "confirmed"}}],
             "expense_hint_resolutions": [],
+            "removed_evidence": [],
             "rebase_metadata": {
+                "source_allocation_fingerprint": old["integrity"]["fingerprint"],
                 "target_allocation_fingerprint": current["integrity"]["fingerprint"],
+                "removed_evidence_count": 0,
+                "removed_evidence_open_count": 0,
+                "removed_evidence_pending_restore_count": 0,
             },
         }
         integrity.stamp(rebase_payload, "rebase_allocation_decisions.py")
@@ -222,6 +231,67 @@ class WorkflowStateTests(unittest.TestCase):
         enriched = chief_orchestrator.enrich_next(state)
         self.assertIn("compose", enriched["argv"])
         self.assertIn(str(rebase_path), enriched["argv"])
+
+        rebase_payload["rebase_metadata"]["source_allocation_fingerprint"] = "0" * 64
+        integrity.stamp(rebase_payload, "rebase_allocation_decisions.py")
+        rebase_path.write_text(json.dumps(rebase_payload), encoding="utf-8")
+        state = self.inspect()
+        self.assertEqual("rebase", state["next"]["operation"])
+        self.assertEqual("stale", state["artifacts"]["rebase_decisions"]["status"])
+        self.assertIn("declared source fingerprint", state["next"]["summary"])
+
+    def test_chief_stops_on_removed_confirmed_evidence_and_prints_follow_up(self) -> None:
+        extraction = self.fixture.extraction()
+        old = self.fixture.allocation(extraction, status="confirmed")
+        old["allocation_units"][0].update({
+            "source_filename": "旧酒店发票.pdf",
+            "amount": "1600.00",
+            "expense_date": "2026-07-02",
+            "source_category": "hotel",
+        })
+        old["change_log"] = [{"script": "apply_allocation_answers.py", "changes": []}]
+        integrity.stamp(old, "test")
+        allocation_path = self.fixture.process / "expense-allocation.json"
+        allocation_path.write_text(json.dumps(old, ensure_ascii=False), encoding="utf-8")
+        archived = allocation_generations.archive_current_generation(allocation_path)
+
+        current = self.fixture.allocation(extraction, status="draft", open_question=True)
+        current["allocation_units"][0].update({
+            "unit_ref": "cafebabe",
+            "unit_identity_sha256": hashlib.sha256(b"new-unit").hexdigest(),
+            "source_sha256": "b" * 64,
+        })
+        allocation_generations.record_previous_generation(current, archived)
+        integrity.stamp(current, "test")
+        allocation_path.write_text(json.dumps(current, ensure_ascii=False), encoding="utf-8")
+
+        rebase_result = subprocess.run(
+            [
+                sys.executable,
+                str(SCRIPTS / "rebase_allocation_decisions.py"),
+                "--old", str(archived[0]),
+                "--new", str(allocation_path),
+                "--output", str(self.fixture.process / "rebase-decisions.json"),
+            ],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+        )
+        self.assertEqual(0, rebase_result.returncode, rebase_result.stderr)
+
+        state = self.inspect()
+        self.assertEqual("needs_user", state["next"]["kind"])
+        self.assertEqual("rebase", state["next"]["operation"])
+        self.assertIn("旧酒店发票.pdf", state["next"]["missing"][0])
+        self.assertEqual(
+            1,
+            state["artifacts"]["rebase_decisions"]["removed_evidence_open_count"],
+        )
+        enriched = chief_orchestrator.enrich_next(state)
+        self.assertIn("--resolutions", enriched["follow_up_argv"])
+        rendered = chief_orchestrator.render_next(enriched)
+        self.assertIn("After recording the requested user answers", rendered)
 
     def test_broken_generation_lineage_is_blocked(self) -> None:
         extraction = self.fixture.extraction()
@@ -459,6 +529,8 @@ class WorkflowStateTests(unittest.TestCase):
         self.assertEqual("package", state["next"]["stage"])
 
     def test_chief_status_and_next_share_identical_next_state(self) -> None:
+        extraction = self.fixture.extraction()
+        allocation = self.fixture.allocation(extraction, status="confirmed")
         chief = SCRIPTS / "chief_orchestrator.py"
         common = [
             sys.executable,
@@ -482,7 +554,20 @@ class WorkflowStateTests(unittest.TestCase):
             errors="replace",
             check=True,
         )
+        lineage_result = subprocess.run(
+            [*common, "lineage", "--json"],
+            capture_output=True,
+            text=True,
+            encoding="utf-8",
+            errors="replace",
+            check=True,
+        )
         self.assertEqual(json.loads(status.stdout)["next"], json.loads(next_result.stdout))
+        lineage = json.loads(lineage_result.stdout)
+        self.assertEqual(
+            allocation["integrity"]["fingerprint"],
+            lineage["allocation"]["fingerprint"],
+        )
 
 
 class JournalTests(unittest.TestCase):

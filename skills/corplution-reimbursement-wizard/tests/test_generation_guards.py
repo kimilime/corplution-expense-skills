@@ -422,11 +422,11 @@ class GenerationGuardTests(unittest.TestCase):
             self.assertIn("blocked until Chief runs rebase", result.stderr)
             self.assertFalse((td / "answers.json").exists())
 
-    def test_zero_carry_rebase_still_records_lineage_clearance(self) -> None:
+    def test_zero_carry_closed_removal_still_records_lineage_clearance(self) -> None:
         with tempfile.TemporaryDirectory() as td:
             td = Path(td)
             contexts = [{"context_id": "CTX-SX", "client_name": "山西信托"}]
-            old = allocation([unit(1, "deadbeef", status="confirmed")], contexts=contexts)
+            old = allocation([unit(1, "deadbeef", status="dropped")], contexts=contexts)
             old["change_log"] = [{"script": "apply_allocation_answers.py", "changes": []}]
             integrity.stamp(old, "generation-guard-test")
             old_path = td / "old.json"
@@ -443,6 +443,10 @@ class GenerationGuardTests(unittest.TestCase):
             self.assertEqual(0, rebased.returncode, rebased.stderr)
             rebase_data = json.loads(rebase_path.read_text(encoding="utf-8"))
             self.assertEqual([], rebase_data["decisions"])
+            self.assertEqual(
+                "prior_closed_item_removed",
+                rebase_data["removed_evidence"][0]["resolution_action"],
+            )
             composed = self.run_script(
                 "compose_answers.py", "--allocation", str(new_path), "--decisions", str(rebase_path),
                 "--output", str(answers_path),
@@ -493,7 +497,7 @@ class GenerationGuardTests(unittest.TestCase):
             source_path, source, reason = allocation_generations.discover_rebase_source(
                 allocation_path, second_rerun
             )
-            self.assertEqual("ok", reason)
+            self.assertIn("depth 2", reason)
             self.assertEqual(archived_decided[0], source_path)
             self.assertEqual(decided["integrity"]["fingerprint"], source["integrity"]["fingerprint"])
 
