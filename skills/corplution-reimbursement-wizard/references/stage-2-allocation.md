@@ -264,6 +264,7 @@ Before applying that rule ticket by ticket, build railway journey chains:
 - Project A -> project B: assign every segment to project B, the project being traveled to.
 - Project -> local/home: assign every segment to the project just completed.
 - Preserve each ticket as a separate allocation unit, proof, amount, and final Note such as `高铁（上海虹桥-周口东）`; share only `journey_chain_id` and project assignment.
+- Apply the same route/date/terminal-project rules to railway refund-fee tickets. Their printed `refund_fee_amount` is their invoice and reimbursable amount. Build connected refund tickets as a separate refund chain; never mix cancelled tickets with actually travelled or replacement tickets in one chain.
 - Show a resolved chain once as an advisory review item. Do not ask about each intermediate destination. Ask one blocking whole-chain question only if station continuity/time order is ambiguous, the whole chain has multiple plausible projects, or the applicant says an intermediate city was an actual stop.
 - When the applicant corrects a chain assignment, include every displayed item number in one Composer decision. The updater clears the whole-chain gate only when all active legs share the same Client, Code, and project context; a partial or split update remains blocking.
 
@@ -279,6 +280,8 @@ Final note:
 - Flight refund or cancellation fee: `飞机退票费（出发地-目的地）`
 
 Use city or station/airport names from the route. Do not include train number, flight number, or seat in the final note unless the user asks; keep those details in evidence fields if needed. If the invoice text, line item, or remarks include `退票`, `退票费`, `退款`, `refund`, or cancellation wording, use the refund-fee note template.
+
+For a railway refund invoice already supplied by the applicant, presume the printed refund fee is claimed in full unless the applicant explicitly drops the evidence or gives a different reimbursable amount. Do not ask whether the original fare or the refund fee should be claimed.
 
 ### Hotel
 

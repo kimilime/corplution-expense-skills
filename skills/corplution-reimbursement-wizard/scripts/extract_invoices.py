@@ -53,6 +53,7 @@ C = {
     "hotel": "\u9152\u5e97",
     "railway_ticket": "\u94c1\u8def\u7535\u5b50\u5ba2\u7968",
     "ticket_price": "\u7968\u4ef7",
+    "refund_fee": "\u9000\u7968\u8d39",
     "shanghai": "\u4e0a\u6d77",
     "invoice": "\u53d1\u7968",
     "total": "\u5408\u8ba1",
@@ -397,7 +398,42 @@ def classify_role_and_subtype(text: str, tables: list[list[list[str]]]) -> tuple
     return "unknown", "unknown"
 
 
+def is_railway_refund_text(text: str) -> bool:
+    normalized = compact(text).lower()
+    return "\u9000\u7968" in normalized or "refund" in normalized or "cancellation" in normalized
+
+
+def parse_railway_refund_fee_amount(text: str) -> str:
+    """Parse the reimbursable amount printed beside the railway refund-fee label.
+
+    China Railway e-ticket PDFs can place the larger amount glyph a few points
+    above the smaller label. pdfplumber can then emit the amount one line
+    before its refund-fee label, so support both semantic orders.
+    """
+    label = r"\u9000\s*\u7968\s*\u8d39"
+    amount = r"[0-9][0-9,]*(?:\.[0-9]{1,2})?"
+    currency = r"(?:[\u00a5\uffe5]|RMB|CNY)"
+    patterns = [
+        label + r"[^\S\r\n]*[:\uff1a]?\s*" + currency + r"\s*(" + amount + r")",
+        label + r"[^\S\r\n]*[:\uff1a][^\S\r\n]*(" + amount + r")",
+        (
+            r"(?m)^[^\S\r\n]*" + currency + r"[^\S\r\n]*(" + amount + r")"
+            r"[^\S\r\n]*(?:\r?\n[^\S\r\n]*)?" + label + r"[^\S\r\n]*[:\uff1a]?"
+        ),
+    ]
+    for pattern in patterns:
+        value = money(regex_first(pattern, text, re.S | re.I))
+        if value:
+            return value
+    return ""
+
+
 def parse_total_amount(text: str, tables: list[list[list[str]]], invoice_type: str) -> str:
+    if invoice_type == "railway_e_ticket" and is_railway_refund_text(text):
+        # A railway refund invoice reimburses the refund fee itself. Do not
+        # fall back to another visible amount or treat a blank label as zero.
+        return parse_railway_refund_fee_amount(text)
+
     patterns = [
         r"\u5c0f\s*\u5199\s*[\)\uff09]?\s*[\u00a5\uffe5]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
         r"[\(\uff08]\s*\u5c0f\s*\u5199\s*[\)\uff09]\s*[\u00a5\uffe5]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
@@ -522,7 +558,8 @@ def parse_railway_leg(text: str) -> dict[str, Any]:
         if route_match:
             origin = clean(route_match.group(1))
             destination = clean(route_match.group(2))
-    refund = "\u9000\u7968" in compact_text or "refund" in compact_text.lower()
+    refund = is_railway_refund_text(text)
+    refund_fee_amount = parse_railway_refund_fee_amount(text) if refund else ""
     return {
         "train_no": train,
         "travel_date": travel_date,
@@ -532,6 +569,7 @@ def parse_railway_leg(text: str) -> dict[str, Any]:
         "destination_station": destination,
         "route": f"{origin}-{destination}" if origin and destination else "",
         "is_refund_fee": refund,
+        "refund_fee_amount": refund_fee_amount,
     }
 
 
@@ -539,6 +577,11 @@ def railway_note(text: str) -> str:
     leg = parse_railway_leg(text)
     seat = regex_first(r"(\u4e00\u7b49\u5ea7|\u4e8c\u7b49\u5ea7|\u5546\u52a1\u5ea7|\u786c\u5ea7|\u786c\u5367|\u8f6f\u5367)", clean(text))
     route = leg["route"].replace("-", " -> ", 1) if leg["route"] else ""
+    refund_note = ""
+    if leg["is_refund_fee"]:
+        refund_note = C["refund_fee"]
+        if leg["refund_fee_amount"]:
+            refund_note += f" \u00a5{leg['refund_fee_amount']}"
     parts = [
         part
         for part in [
@@ -546,7 +589,7 @@ def railway_note(text: str) -> str:
             route,
             leg["departure_datetime"],
             seat,
-            "\u9000\u7968\u8d39" if leg["is_refund_fee"] else "",
+            refund_note,
         ]
         if part
     ]
@@ -792,10 +835,23 @@ def extract_document(document_id: str, path: Path) -> dict[str, Any]:
             required.append("seller_name")
         for field in required:
             if not invoice.get(field):
+                refund_amount_missing = (
+                    field == "total_amount"
+                    and subtype == "railway_e_ticket"
+                    and bool((doc["classification"].get("railway_leg") or {}).get("is_refund_fee"))
+                )
                 doc["issues"].append({
                     "field": field,
-                    "problem": "Required invoice field was not extracted.",
-                    "suggested_action": "Inspect source document or OCR output manually.",
+                    "problem": (
+                        "Railway refund-fee amount was not extracted; a blank label is not zero."
+                        if refund_amount_missing
+                        else "Required invoice field was not extracted."
+                    ),
+                    "suggested_action": (
+                        "Inspect the amount printed beside the refund-fee label and correct it through Stage 1."
+                        if refund_amount_missing
+                        else "Inspect source document or OCR output manually."
+                    ),
                 })
         doc["confidence"] = 0.95 if not doc["issues"] else 0.75
 
@@ -1178,6 +1234,8 @@ def write_markdown(output_dir: Path, payload: dict[str, Any]) -> Path:
                 f"{railway_leg.get('origin_station', '') or '-'} -> {railway_leg.get('destination_station', '') or '-'} | "
                 f"{railway_leg.get('departure_datetime', '') or railway_leg.get('travel_date', '') or '-'}"
             )
+            if railway_leg.get("is_refund_fee"):
+                lines.append(f"- Railway refund fee: {railway_leg.get('refund_fee_amount', '') or 'NEEDS REVIEW'}")
         lines.append(f"- Raw remarks: {invoice.get('raw_remarks', '')}")
         lines.append(f"- Confidence: {doc.get('confidence', '')}")
         lines.append(f"- Issues: {len(doc.get('issues', []))}")

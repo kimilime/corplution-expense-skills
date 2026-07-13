@@ -34,8 +34,11 @@ def rail_unit(
     departure_time: str,
     *,
     travel_date: str = "2026-06-08",
+    refund: bool = False,
 ) -> dict:
     route = f"{origin}-{destination}"
+    note_prefix = "高铁退票费" if refund else "高铁"
+    evidence_suffix = ", 退票费" if refund else ""
     return {
         "unit_id": f"UNIT-{number:03d}",
         "user_no": number,
@@ -55,10 +58,12 @@ def rail_unit(
         "date_source": "railway_travel_date",
         "date_required": False,
         "date_is_provisional": False,
-        "source_note": f"G{100 + number}, {origin} -> {destination}, {travel_date} {departure_time}, 二等座",
-        "expense_note": f"G{100 + number}, {origin} -> {destination}, {travel_date} {departure_time}, 二等座",
-        "final_note": f"高铁（{route}）",
+        "source_note": f"G{100 + number}, {origin} -> {destination}, {travel_date} {departure_time}, 二等座{evidence_suffix}",
+        "expense_note": f"G{100 + number}, {origin} -> {destination}, {travel_date} {departure_time}, 二等座{evidence_suffix}",
+        "final_note": f"{note_prefix}（{route}）",
         "final_template_column": "travel",
+        "is_refund_fee": refund,
+        "refund_fee_amount": "100.00" if refund else "",
         "amount": "100.00",
         "invoice_amount": "100.00",
         "reimbursable_amount": "",
@@ -80,6 +85,75 @@ class RailwayExtractionTests(unittest.TestCase):
         self.assertEqual("周口东", leg["destination_station"])
         self.assertEqual("2026-06-08 08:05", leg["departure_datetime"])
         self.assertEqual("上海虹桥-周口东", leg["route"])
+
+    def test_refund_fee_is_the_invoice_and_reimbursement_amount(self) -> None:
+        examples = [
+            ("￥34.00\n退票费:", "34.00"),
+            ("退票费: ￥63.50", "63.50"),
+        ]
+        for amount_text, expected in examples:
+            with self.subTest(amount=expected):
+                text = (
+                    "铁路电子客票 郑州东 G1950 滁州 "
+                    "2026年07月10日 18:15开 二等座\n"
+                    f"{amount_text}\n电子客票号:123 退票"
+                )
+                self.assertEqual(expected, extractor.parse_railway_refund_fee_amount(text))
+                self.assertEqual(expected, extractor.parse_total_amount(text, [], "railway_e_ticket"))
+                leg = extractor.parse_railway_leg(text)
+                self.assertTrue(leg["is_refund_fee"])
+                self.assertEqual(expected, leg["refund_fee_amount"])
+                self.assertIn(f"退票费 ¥{expected}", extractor.railway_note(text))
+
+    def test_blank_refund_fee_is_unresolved_not_zero_or_ticket_price(self) -> None:
+        text = (
+            "铁路电子客票 郑州东 G1950 滁州 2026年07月10日 18:15开\n"
+            "票价: ￥491.00\n退票费:\n电子客票号:123 退票"
+        )
+        self.assertEqual("", extractor.parse_railway_refund_fee_amount(text))
+        self.assertEqual("", extractor.parse_total_amount(text, [], "railway_e_ticket"))
+
+    def test_allocator_prefers_structured_refund_fee_over_other_ticket_amount(self) -> None:
+        extraction = {
+            "documents": [{
+                "document_id": "DOC-001",
+                "source_file": "refund.pdf",
+                "document_role": "invoice",
+                "document_subtype": "railway_e_ticket",
+                "invoice": {
+                    "invoice_no": "123",
+                    "issue_date": "2026-07-12",
+                    "total_amount": "491.00",
+                    "seller_name": "",
+                    "raw_remarks": "",
+                    "line_item_name": "",
+                },
+                "classification": {
+                    "expense_category": "travel",
+                    "expense_date": "2026-07-10",
+                    "expense_date_source": "railway_travel_date",
+                    "expense_note": "G1950, 郑州东 -> 滁州, 2026-07-10 18:15, 退票费 ¥63.50",
+                    "railway_leg": {
+                        "train_no": "G1950",
+                        "travel_date": "2026-07-10",
+                        "departure_time": "18:15",
+                        "departure_datetime": "2026-07-10 18:15",
+                        "origin_station": "郑州东",
+                        "destination_station": "滁州",
+                        "route": "郑州东-滁州",
+                        "is_refund_fee": True,
+                        "refund_fee_amount": "63.50",
+                    },
+                },
+            }],
+            "links": [],
+        }
+        units, _ = allocator.create_units(extraction, [])
+        self.assertEqual(1, len(units))
+        self.assertEqual("63.50", units[0]["amount"])
+        self.assertEqual("63.50", units[0]["invoice_amount"])
+        self.assertEqual("63.50", units[0]["refund_fee_amount"])
+        self.assertEqual("高铁退票费（郑州东-滁州）", units[0]["final_note"])
 
 
 class RailJourneyChainTests(unittest.TestCase):
@@ -112,6 +186,30 @@ class RailJourneyChainTests(unittest.TestCase):
 
         self.assertEqual({"CTX-ZZ"}, {unit["project_context_id"] for unit in units})
         self.assertEqual({"rail_transfer_chain_return"}, {unit["auto_project_match"] for unit in units})
+
+    def test_refund_transfer_chain_uses_normal_route_assignment(self) -> None:
+        units = [
+            rail_unit(1, "郑州东", "滁州", "18:15", travel_date="2026-07-10", refund=True),
+            rail_unit(2, "滁州", "上海虹桥", "21:04", travel_date="2026-07-10", refund=True),
+        ]
+        context = project("CTX-ZZ", "郑州", "千味央厨", "CORP-QW")
+        context["date_end"] = "2026-07-10"
+        allocator.apply_matches(units, [context])
+
+        self.assertEqual({"RAIL-CHAIN-001"}, {unit["journey_chain_id"] for unit in units})
+        self.assertEqual({"CTX-ZZ"}, {unit["project_context_id"] for unit in units})
+        self.assertEqual({"rail_transfer_chain_return"}, {unit["auto_project_match"] for unit in units})
+        self.assertEqual(
+            ["高铁退票费（郑州东-滁州）", "高铁退票费（滁州-上海虹桥）"],
+            [unit["final_note"] for unit in units],
+        )
+
+    def test_refund_and_travelled_tickets_do_not_form_one_chain(self) -> None:
+        units = [
+            rail_unit(1, "郑州东", "滁州", "18:15", refund=True),
+            rail_unit(2, "滁州", "上海虹桥", "21:04"),
+        ]
+        self.assertEqual([], allocator.build_rail_journey_chains(units))
 
     def test_project_to_project_transfer_uses_project_being_traveled_to(self) -> None:
         units = [

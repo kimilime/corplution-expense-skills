@@ -532,6 +532,8 @@ def route_from_note(note: str) -> str:
 
 
 def is_refund_fee(unit: dict[str, Any]) -> bool:
+    if unit.get("is_refund_fee") is True or clean(unit.get("refund_fee_amount")):
+        return True
     text = clean(" ".join([
         unit.get("source_note", ""),
         unit.get("expense_note", ""),
@@ -716,6 +718,13 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
             railway_leg = classification.get("railway_leg") or {}
             if not isinstance(railway_leg, dict):
                 railway_leg = {}
+            railway_refund_fee_amount = money(railway_leg.get("refund_fee_amount"))
+            railway_is_refund = bool(railway_leg.get("is_refund_fee") or railway_refund_fee_amount)
+            invoice_amount = (
+                railway_refund_fee_amount
+                if railway_is_refund and railway_refund_fee_amount
+                else money(invoice.get("total_amount"))
+            )
             billing_period = ""
             match = re.search(r"(\d{6})", invoice.get("raw_remarks", "") + " " + source_note)
             if source_category == "mobile" and match:
@@ -745,8 +754,8 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
                 "supporting_schedule_file": "",
                 "supporting_schedule_filename": "",
                 "invoice_no": invoice.get("invoice_no", ""),
-                "amount": money(invoice.get("total_amount")),
-                "invoice_amount": money(invoice.get("total_amount")),
+                "amount": invoice_amount,
+                "invoice_amount": invoice_amount,
                 "reimbursable_amount": "",
                 "issue_date": invoice.get("issue_date", ""),
                 "expense_date": expense_date,
@@ -764,6 +773,8 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
                 "destination_station": clean(railway_leg.get("destination_station")),
                 "rail_departure_time": clean(railway_leg.get("departure_time")),
                 "rail_departure_datetime": clean(railway_leg.get("departure_datetime")),
+                "is_refund_fee": railway_is_refund,
+                "refund_fee_amount": railway_refund_fee_amount,
                 "journey_chain_id": "",
                 "journey_chain_route": "",
                 "journey_chain_position": "",
@@ -1198,7 +1209,6 @@ def build_rail_journey_chains(units: list[dict[str, Any]]) -> list[dict[str, Any
     legs = [
         unit for unit in units
         if is_rail_unit(unit)
-        and not is_refund_fee(unit)
         and all(rail_leg_endpoints(unit))
         and parse_date(clean(unit.get("expense_date")))
     ]
@@ -1213,6 +1223,11 @@ def build_rail_journey_chains(units: list[dict[str, Any]]) -> list[dict[str, Any
         for second in legs:
             second_id = clean(second.get("unit_id"))
             if first_id == second_id:
+                continue
+            # A cancelled itinerary may coexist with replacement tickets.
+            # Build refund chains and travelled chains independently so their
+            # identical stations/times cannot create branching ambiguity.
+            if is_refund_fee(first) != is_refund_fee(second):
                 continue
             second_origin, _ = rail_leg_endpoints(second)
             if not rail_stations_connect(first_destination, second_origin):

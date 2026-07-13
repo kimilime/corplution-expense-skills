@@ -224,7 +224,7 @@ Didi/Gaode tax invoices are summary invoices. Link them to trip reports by total
 
 Stage 1 can build provisional `expense_note` from useful operational evidence:
 
-- Railway: extract structured `train_no`, `origin_station`, `destination_station`, `travel_date`, `departure_time`, `departure_datetime`, `route`, and refund status under `classification.railway_leg`; also retain the readable evidence note.
+- Railway: extract structured `train_no`, `origin_station`, `destination_station`, `travel_date`, `departure_time`, `departure_datetime`, `route`, refund status, and `refund_fee_amount` under `classification.railway_leg`; also retain the readable evidence note. On a railway refund invoice, the printed refund fee is the reimbursable `invoice.total_amount`; never reinterpret it as the original fare or turn a blank label into zero.
 - Didi/Gaode: city, origin, destination.
 - Hotel: seller or hotel name, city if inferable, quantity or nights.
 - Meal: seller/restaurant and meal service.
@@ -269,6 +269,7 @@ Read `references/stage-2-allocation.md` before allocating expenses. Keep these c
 - Never create temporary helper or patch scripts for allocation edits. Convert every batch through Composer and the updater even when the decision batch is long or a prior compose attempt failed.
 - Generate final reimbursement notes with the required Chinese templates from the stage-2 reference, including confirmed taxi origin/destination place types. Never write literal placeholders such as `出发地类型` or `目的地类型` into `final_note`; ask the user when either endpoint type is unclear.
 - Mark rail/flight cancellation or refund evidence in the final note as `高铁退票费（出发地-目的地）` or `飞机退票费（出发地-目的地）` instead of the ordinary travel note.
+- Allocate railway refund-fee tickets by the same route/date/destination-project rules as ordinary railway tickets. Connected refund tickets may form their own transfer chain, but must not be mixed into a chain of tickets that were actually travelled.
 
 ## Stage 3 Excel Output Rules
 

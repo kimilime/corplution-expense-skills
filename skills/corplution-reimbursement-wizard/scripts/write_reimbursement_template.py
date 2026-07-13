@@ -367,6 +367,8 @@ def route_from_text(value: Any) -> str:
 
 
 def is_refund_fee(unit: dict[str, Any]) -> bool:
+    if unit.get("is_refund_fee") is True or clean(unit.get("refund_fee_amount")):
+        return True
     text = clean(" ".join([
         unit.get("final_note", ""),
         unit.get("source_note", ""),

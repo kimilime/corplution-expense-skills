@@ -136,8 +136,11 @@ For `railway_e_ticket`, also write `classification.railway_leg`:
 - `destination_station`
 - `route`
 - `is_refund_fee`
+- `refund_fee_amount`
 
 These structured fields support Stage 2 transfer-chain detection. Keep the readable railway `expense_note` as evidence and allow old extractions without `railway_leg` to fall back to parsing that note.
+
+For a railway refund invoice, the amount printed beside `退票费` is the amount being reimbursed. Write it to both `classification.railway_leg.refund_fee_amount` and `invoice.total_amount`. Railway PDF text layers may emit the visually adjacent row as `￥63.50` followed by `退票费:` on the next extracted line; support both label-before-amount and amount-before-label orders. A blank or unresolved label is not `0`: leave the amount blank, keep `needs_review=true`, and ask the applicant to verify it.
 
 Keep `invoice.issue_date` as the formal invoice date. Do not copy it into `classification.expense_date` for ordinary invoices, meal invoices, taxi summary invoices, hotel invoices without stay dates, or `other`/`unknown` invoices. Stage 2 will ask the applicant for the actual date when it is not reliable.
 
