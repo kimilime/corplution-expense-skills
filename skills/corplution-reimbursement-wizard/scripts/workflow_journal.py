@@ -79,11 +79,24 @@ def snapshot_artifacts(process_dir: str | Path, output_root: str | Path) -> dict
             "rows": "row_count",
             "expense_hint_reconciliation": "expense_hint_record_count",
         }),
+        ("independent_review", pdir / "stage3-independent-review.json", {
+            "findings": "finding_count",
+        }),
     ]
     for name, path, count_fields in specs:
         record = process_artifact(path, count_fields)
         if record is not None:
             snapshot[name] = record
+
+    review_archives = sorted(
+        (path for path in (pdir / "subagent-review-generations").glob("*/*.json") if path.is_file()),
+        key=lambda item: item.stat().st_mtime_ns,
+    )
+    if review_archives:
+        snapshot["independent_review_archive"] = {
+            "accepted_result_count": len(review_archives),
+            "latest_file_sha256": sha256_file(review_archives[-1]),
+        }
 
     final_rows = load_json(pdir / "final-expense-rows.json")
     if final_rows:

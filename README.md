@@ -35,6 +35,34 @@ C:\Users\<you>\.codex\skills\corplution-reimbursement-wizard
 
 本实验分支默认通过 `chief_orchestrator.py` 进入流程。Chief 只负责状态导航、规范参数调度和最小化运行日志；提取、归集、受控更新、写表和打包仍由原脚本完成。
 
+## 双子 Agent 试验
+
+该分支增加两个可选的只读角色：`Otako - Allocation Analyst` 在 Stage 2 初步归集后独立检查项目、行程链、接驳和用户费用记录；`Kaede - Independent Reviewer` 在 Stage 3 前从头审查材料完整性、项目归属、形式重于实质、Notes 和政策检查前提。子 Agent 不接收本地路径或写入权限，只接收由 `subagent_protocol.py` 生成的不可变数据快照，并以绑定完整 allocation/extraction 指纹的 JSON 返回。
+
+```bash
+# Otako：先生成任务，将任务和 result-template 的完整 JSON 内容交给新子 Agent。
+python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
+  run prepare-agent --role allocation_analyst
+python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
+  run accept-agent --role allocation_analyst --result <otako-result.json>
+
+# 原始建议是 unreviewed，Composer 会拒绝。先显式选择 proposal ID。
+python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
+  run promote-proposals --select P-001,P-003 --reviewed-by coordinator
+
+# 再把 promote 命令打印的 .reviewed.json 文件交给 Composer。
+python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
+  run compose --proposal <reviewed-otako-proposals.json>
+
+# Kaede：在 Stage 2 完全确认后、Stage 3 前运行。
+python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
+  run prepare-agent --role independent_reviewer
+python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
+  run accept-agent --role independent_reviewer --result <kaede-result.json>
+```
+
+Otako 建议不会自动修改 allocation；未经过 `promote-proposals` 显式选择和盖章的建议也不能进入 Composer。Kaede 只能在 Stage 2 完全就绪后运行；当前且验章通过的 `block` 会阻断写表和打包。每份受理结果先进入 `process/subagent-review-generations/` 的不可变世代归档，因此删除或损坏便捷 sidecar 不能清除已受理阻断；`pass/advisory/unavailable` 会写入 final rows。只有当前任务确实不存在任何有效受理结果时，流程才 fail-open 到现有确定性预检，而不会伪造一个 `pass`。完整性印章只能证明结果验收后未被修改，不能证明模型身份或独立性。
+
 报销工作簿由脚本直接生成，并使用 `skills/corplution-reimbursement-wizard/assets/reimbursement-workbook-layout.toml` 定义静态布局，例如 sheet 名称、字体、行高、列宽、说明文字、表头和示例行样式。旧版模板仍随包保留在 `skills/corplution-reimbursement-wizard/assets/reimbursement-template.xlsx`，并可通过 `--template bundled` 作为备用方案使用。
 
 ## Applicant Experience
@@ -220,6 +248,34 @@ After updating the repo, sync that folder again so Codex does not keep using an 
 4. Package the filled workbook, renamed invoices, and support documents for submission.
 
 This experimental branch uses `chief_orchestrator.py` as the default entry point. Chief handles state navigation, canonical dispatch, and privacy-minimized run logging only; the existing scripts still perform extraction, allocation, controlled updates, workbook generation, and packaging.
+
+## Two-Subagent Pilot
+
+This branch adds two optional read-only roles. `Otako - Allocation Analyst` independently checks Stage 2 project matching, journey chains, transfers, and applicant expense records. `Kaede - Independent Reviewer` audits evidence completeness, project allocation, form-over-substance classification, Notes, and policy prerequisites immediately before Stage 3. Neither receives local paths or write capability; `subagent_protocol.py` supplies an immutable data snapshot and accepts only JSON bound to the full allocation/extraction fingerprints.
+
+```bash
+# Otako: give a fresh subagent the complete task and result-template JSON values.
+python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
+  run prepare-agent --role allocation_analyst
+python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
+  run accept-agent --role allocation_analyst --result <otako-result.json>
+
+# Raw proposals are unreviewed and rejected by Composer. Select proposal IDs explicitly.
+python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
+  run promote-proposals --select P-001,P-003 --reviewed-by coordinator
+
+# Give Composer the stamped .reviewed.json file printed by promotion.
+python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
+  run compose --proposal <reviewed-otako-proposals.json>
+
+# Kaede: run after Stage 2 is fully confirmed and before Stage 3.
+python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
+  run prepare-agent --role independent_reviewer
+python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
+  run accept-agent --role independent_reviewer --result <kaede-result.json>
+```
+
+Otako proposals never mutate allocation automatically, and an unreviewed proposal cannot enter Composer until `promote-proposals` explicitly selects and stamps it. Kaede can run only after Stage 2 is fully ready. A current validated `block` prevents workbook generation and packaging, and every accepted result is first retained under the immutable `process/subagent-review-generations/` archive, so deleting or corrupting the convenience sidecar cannot clear a blocker. `pass/advisory/unavailable` is recorded in final rows. Only when no valid accepted result exists for the current task does the pilot fail open to the deterministic preflight; it never fabricates `pass`. The integrity stamp proves post-acceptance immutability, not reviewer identity or independence.
 
 The reimbursement workbook is generated directly by script using `skills/corplution-reimbursement-wizard/assets/reimbursement-workbook-layout.toml` for static layout such as sheet name, fonts, row heights, column widths, instruction text, headers, and sample-row styles. The legacy template is still bundled at `skills/corplution-reimbursement-wizard/assets/reimbursement-template.xlsx` and can be used as a fallback with `--template bundled`.
 

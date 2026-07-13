@@ -26,6 +26,7 @@ from uuid import uuid4
 import integrity
 import text_safety
 import allocation_generations
+import subagent_protocol
 from apply_allocation_answers import (
     ALLOWED_UNIT_FIELDS,
     COMPUTED_FIELDS_TEACHING,
@@ -45,6 +46,7 @@ DECISIONS_ROOT_FIELDS = {
     "drop_units",
     "exclude_units",
     "rebase_metadata",
+    "proposal_review",
     "integrity",
 }
 DECISION_FIELDS = {"units", "set"}
@@ -512,7 +514,12 @@ def main(argv: list[str] | None = None) -> int:
         dest="specs",
         help="Repeatable compact spec using N@ref selectors; use --decisions for complex text.",
     )
-    parser.add_argument("--decisions", help="UTF-8 allocation_decisions.v1 JSON file")
+    decision_source = parser.add_mutually_exclusive_group()
+    decision_source.add_argument("--decisions", help="UTF-8 allocation_decisions.v1 JSON file")
+    decision_source.add_argument(
+        "--proposal",
+        help="Coordinator-approved Otako proposal file; requires the exact full allocation fingerprint.",
+    )
     parser.add_argument(
         "--output",
         default="process/allocation-answers.json",
@@ -524,7 +531,8 @@ def main(argv: list[str] | None = None) -> int:
     allocation = json.loads(allocation_path.read_text(encoding="utf-8-sig"))
     integrity.require_valid(allocation, allocation_path)
     fingerprint = allocation.get("integrity", {}).get("fingerprint", "")
-    decisions_path = Path(args.decisions) if args.decisions else None
+    decisions_path = Path(args.proposal or args.decisions) if (args.proposal or args.decisions) else None
+    proposal_mode = bool(args.proposal)
 
     try:
         known_units, known_ids = current_unit_maps(allocation)
@@ -555,6 +563,13 @@ def main(argv: list[str] | None = None) -> int:
         decision_data: dict[str, Any] = {}
         if decisions_path:
             decision_data = load_decisions_file(decisions_path)
+            if proposal_mode:
+                subagent_protocol.validate_promoted_proposal(decision_data, allocation_path)
+            elif decision_data.get("proposal_review"):
+                raise ValueError(
+                    "proposal_review metadata is accepted only through --proposal with an officially "
+                    "promoted Otako file; ordinary --decisions input must not invent it"
+                )
             declared = str(decision_data.get("for_allocation_fingerprint", "")).strip().lower()
             current = str(allocation.get("integrity", {}).get("fingerprint", "")).lower()
             if not declared:
@@ -563,7 +578,10 @@ def main(argv: list[str] | None = None) -> int:
                     "'Allocation generation' code printed by the allocate run (also shown in "
                     "the review list header), so this file is bound to its generation."
                 )
-            if len(declared) < 8 or not current.startswith(declared):
+            generation_matches = declared == current if proposal_mode else (
+                len(declared) >= 8 and current.startswith(declared)
+            )
+            if not generation_matches:
                 raise ValueError(
                     "this decisions file belongs to an OLD allocation generation; every display "
                     "number and R-reference in it is now meaningless. Do NOT just swap the "

@@ -182,6 +182,8 @@ Build each package in a fresh sibling staging directory. Only after its workbook
 
 Before copying files, require final rows to carry an `expense_hint_reconciliation` list identical to the current allocation and `unresolved_expense_hint_count: 0`. Missing legacy fields, open records, and `pending_invoice`/`pending_evidence` records require Stage 2/3 regeneration. Packaging must not infer that a note can be ignored merely because no invoice row exists. A record explicitly marked `not_reimbursed` is resolved and does not require an invoice in the package.
 
+For the optional subagent pilot, packaging resolves the current accepted Kaede result from the canonical sidecar plus the immutable `process/subagent-review-generations/` archive. A current `block` prevents packaging even if the convenience sidecar was deleted or damaged. A newer current `pass`, `advisory`, or `unavailable` result whose fingerprint was not consumed by final rows makes the workbook stale and requires Stage 3 to run again. If no valid accepted result exists for the current task, packaging continues under the deterministic checks; absence is not recorded as a pass.
+
 On Windows, renaming an existing package can be temporarily blocked by an open workbook, Explorer preview, antivirus scan, or indexer. Retry transient `PermissionError` locks with bounded exponential backoff while preserving the staging/backup rollback. If retries are exhausted, keep the old package intact, attempt to remove staging, warn if Windows also locks cleanup, and tell the agent to close the workbook and package-folder previews before rerunning Stage 4 through Chief. Status and journal discovery ignore hidden `.staging-*`/`.previous-*` folders so an interrupted package cannot masquerade as the deliverable. Direct script invocation does not bypass the lock and must not be presented as the fix.
 
 If `package_reimbursement_files.py` exits with code `3`, it has written a review package and manifest, but `issues` is non-empty. Treat this as a blocking stop: show the issue list in chat, obtain the missing evidence or an explicit applicant decision, then re-run Stage 4. Do not describe that package as complete or submit it.
@@ -201,5 +203,6 @@ Before final delivery:
 - A rerun has no stale invoice or support file outside the current manifest.
 - The integrity-stamped manifest matches the current final-rows fingerprint, workbook hash, file counts, and every listed package file hash.
 - The packaged final rows carry the same applicant expense-record reconciliation as the current allocation, with zero unresolved records.
+- No current Kaede blocker exists, and any current accepted review fingerprint was consumed by Stage 3.
 - The manifest has no unresolved issues before calling the workflow complete or submitting the package.
 - A concise final package summary has been shown in chat: package folder, workbook filename, and invoice/support-document counts.

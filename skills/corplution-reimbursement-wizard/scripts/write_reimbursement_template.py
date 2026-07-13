@@ -51,6 +51,7 @@ C = {
 from policy_config import load_policy
 import integrity
 import text_safety
+import subagent_protocol
 
 _POLICY = load_policy()
 BUSINESS_TRIP_MEAL_DAILY_CAP = _POLICY.business_trip_meal_daily_cap
@@ -2077,6 +2078,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     allocation_path = Path(args.allocation)
+    process_dir = Path(args.process_dir)
+    if process_dir.resolve() != allocation_path.parent.resolve():
+        print(
+            "ERROR: --process-dir must be the canonical directory containing --allocation. "
+            "A different process folder could hide the current independent-review gate or mix batches. "
+            f"Expected: {allocation_path.parent.resolve()}",
+            file=sys.stderr,
+        )
+        return 2
     template_path = resolve_template_arg(args.template)
     if template_path and not template_path.exists():
         print(
@@ -2164,6 +2174,38 @@ def main(argv: list[str] | None = None) -> int:
                 "Unsupported input files still need a recorded user decision: " + names + ". "
                 "Resolve them through apply_extraction_corrections.py, then re-run Stage 1 and Stage 2."
             )
+    independent_review = subagent_protocol.review_state(
+        process_dir,
+        allocation,
+        allocation_path,
+        extraction_path,
+    )
+    if (
+        independent_review.get("current")
+        and independent_review.get("outcome") == "block"
+        and int(independent_review.get("blocking_count", 0) or 0) > 0
+    ):
+        for finding in independent_review.get("findings", []):
+            if finding.get("severity") == "blocking":
+                errors.append(
+                    "Independent review blocker "
+                    f"[{finding.get('code', finding.get('finding_id', '?'))}]: "
+                    f"{finding.get('message', '')} Recommended action: "
+                    f"{finding.get('recommended_action', '')}"
+                )
+    if independent_review.get("current"):
+        print(
+            "INDEPENDENT REVIEW: "
+            f"{independent_review.get('outcome')} / "
+            f"{independent_review.get('blocking_count', 0)} blocking / "
+            f"{independent_review.get('advisory_count', 0)} advisory"
+        )
+    else:
+        print(
+            "INDEPENDENT REVIEW: "
+            f"{independent_review.get('status', 'missing')} - optional pilot unavailable or stale; "
+            "continuing with deterministic Stage 3 preflight only."
+        )
     print_stage3_preflight_summary(allocation, errors)
     if errors:
         for error in errors:
@@ -2217,6 +2259,7 @@ def main(argv: list[str] | None = None) -> int:
         "meal_policy_rule": meal_policy_rule(),
         "meal_daily_cap_checks": meal_checks,
         "hotel_cap_checks": hotel_checks,
+        "independent_review": subagent_protocol.review_record(independent_review),
         "checks": [
             {
                 "name": "meal_daily_caps",
@@ -2255,7 +2298,6 @@ def main(argv: list[str] | None = None) -> int:
     ])
     workbook_path = Path(args.output)
     payload["workbook_sha256"] = hashlib.sha256(workbook_path.read_bytes()).hexdigest()
-    process_dir = Path(args.process_dir)
     integrity.stamp(payload, "write_reimbursement_template.py")
     write_json(process_dir / "final-expense-rows.json", payload)
     (process_dir / "final-expense-rows.md").write_text(build_markdown(payload, Path(args.output)), encoding="utf-8")

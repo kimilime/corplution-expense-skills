@@ -20,6 +20,7 @@ from typing import Any
 import integrity
 import allocate_expenses
 import allocation_generations
+import subagent_protocol
 
 
 def configure_stdio() -> None:
@@ -196,6 +197,7 @@ def inspect_workflow(
     integrity_blocked = False
     stages: dict[str, dict[str, Any]] = {}
     artifacts: dict[str, dict[str, Any]] = {}
+    subagents: dict[str, Any] = {"recommended": []}
 
     def set_next(candidate: dict[str, Any], *, priority: int = 0) -> None:
         nonlocal pending_next, pending_priority
@@ -655,7 +657,108 @@ def inspect_workflow(
                 missing=["confirmation for remaining draft allocation units"],
             ))
 
+        analyst_state = subagent_protocol.analysis_state(
+            pdir,
+            allocation_path,
+            extraction_path,
+        )
+        subagents["allocation_analyst"] = analyst_state
+        if analyst_state.get("current"):
+            lines.append(
+                "  - Otako allocation analysis: current "
+                f"({analyst_state.get('proposal_count', 0)} proposal(s), "
+                f"{analyst_state.get('question_count', 0)} question(s)); advisory only"
+            )
+        else:
+            lines.append(
+                "  - Otako allocation analysis: "
+                f"{analyst_state.get('status', 'missing')} (optional; does not change Stage 2 state)"
+            )
+            analyst_can_help = bool(open_qs or unconfirmed) and not any([
+                not ok,
+                generation_mismatch,
+                context_mismatch,
+                upstream_unavailable,
+                hint_ledger_missing,
+                rebase_lineage_error,
+                answers_current,
+                rebase_available,
+                rebase_current and rebase_action_count,
+            ])
+            if analyst_can_help:
+                subagents["recommended"].append({
+                    "role": "allocation_analyst",
+                    "display_name": "Otako - Allocation Analyst",
+                    "reason": "fresh independent allocation pass before relaying unresolved items",
+                })
+
     stage2_ready = stages.get("allocation", {}).get("status") == "ready"
+
+    if allocation and alloc_fp:
+        independent_review = subagent_protocol.review_state(
+            pdir,
+            allocation,
+            allocation_path,
+            extraction_path,
+        )
+    else:
+        independent_review = {
+            "status": "unavailable",
+            "current": False,
+            "outcome": "not_run",
+            "blocking_count": 0,
+            "advisory_count": 0,
+            "result_fingerprint": "",
+            "findings": [],
+            "reason": "allocation is not ready for independent review",
+            "path": str(pdir / "stage3-independent-review.json"),
+        }
+    subagents["independent_reviewer"] = independent_review
+    artifacts["independent_review"] = {
+        "path": independent_review.get("path", str(pdir / "stage3-independent-review.json")),
+        "status": independent_review.get("status", "missing"),
+        "outcome": independent_review.get("outcome", "not_run"),
+        "source_allocation_fingerprint": alloc_fp if independent_review.get("current") else "",
+        "result_fingerprint": independent_review.get("result_fingerprint", ""),
+    }
+    review_blocks_stage3 = bool(
+        stage2_ready
+        and independent_review.get("current")
+        and independent_review.get("outcome") == "block"
+        and int(independent_review.get("blocking_count", 0) or 0) > 0
+    )
+    if stage2_ready:
+        if independent_review.get("current"):
+            lines.append(
+                "Kaede independent review: "
+                f"{independent_review.get('outcome')} "
+                f"({independent_review.get('blocking_count', 0)} blocking / "
+                f"{independent_review.get('advisory_count', 0)} advisory)"
+            )
+        else:
+            lines.append(
+                "Kaede independent review: "
+                f"{independent_review.get('status', 'missing')} - optional fail-open pilot; "
+                "deterministic Stage 3 preflight remains authoritative"
+            )
+            subagents["recommended"].append({
+                "role": "independent_reviewer",
+                "display_name": "Kaede - Independent Reviewer",
+                "reason": "fresh independent audit before Stage 3",
+            })
+    if review_blocks_stage3:
+        set_next(next_step(
+            "needs_user",
+            "workbook",
+            "Resolve the current independent review's blocking findings through the normal "
+            "Composer/Updater flow, then run a fresh review before Stage 3.",
+            operation="compose",
+            missing=[
+                f"{finding.get('code', 'review finding')}: {finding.get('message', '')}"
+                for finding in independent_review.get("findings", [])
+                if finding.get("severity") == "blocking"
+            ],
+        ), priority=30)
 
     # Stage 3
     rows_path = pdir / "final-expense-rows.json"
@@ -718,10 +821,25 @@ def inspect_workflow(
             except OSError:
                 workbook_exists = False
         workbook_mismatch = bool(workbook_sha and actual_workbook_sha and workbook_sha != actual_workbook_sha)
+        recorded_review = rows.get("independent_review", {})
+        if not isinstance(recorded_review, dict):
+            recorded_review = {}
+        recorded_review_fp = str(recorded_review.get("result_fingerprint", ""))
+        current_review_fp = str(independent_review.get("result_fingerprint", ""))
+        review_changed_after_workbook = bool(
+            independent_review.get("current")
+            and not review_blocks_stage3
+            and current_review_fp
+            and current_review_fp != recorded_review_fp
+        )
         if not rows_ok:
             state = f"✗ 完整性失败（{rows_reason}）"
         elif upstream_unavailable:
             state = "✗ 上游 allocation 未就绪"
+        elif review_blocks_stage3:
+            state = "… 独立复核有阻断事项"
+        elif review_changed_after_workbook:
+            state = "✗ 独立复核结果晚于当前工作簿，需重跑 Stage 3"
         elif not workbook_sha:
             state = "✗ 缺少工作簿哈希，不能验证或打包"
         elif not hint_ledger_present or unresolved_hint_count < 0:
@@ -744,7 +862,9 @@ def inspect_workflow(
         lines.append(f"Stage 3 报销表: {state}，行数 {len(rows.get('rows', []))}，未决餐费/酒店检查 {blocking} 个")
         if rows_ready:
             stage3_status = "ready"
-        elif not rows_ok or upstream_unavailable or not workbook_sha or not hint_ledger_present or unresolved_hint_count < 0 or stale or preview:
+        elif review_blocks_stage3:
+            stage3_status = "needs_user"
+        elif not rows_ok or upstream_unavailable or review_changed_after_workbook or not workbook_sha or not hint_ledger_present or unresolved_hint_count < 0 or stale or preview:
             stage3_status = "blocked"
         elif blocking or unresolved_hint_count:
             stage3_status = "needs_user"
@@ -762,6 +882,9 @@ def inspect_workflow(
             "allocation_stale": stale,
             "workbook_exists": workbook_exists,
             "workbook_hash_matches": bool(actual_workbook_sha and actual_workbook_sha == workbook_sha),
+            "independent_review_blocking": review_blocks_stage3,
+            "independent_review_changed_after_workbook": review_changed_after_workbook,
+            "independent_review_result_fingerprint": recorded_review_fp,
         }
         artifacts["final_rows"] = {
             "path": str(rows_path),
@@ -788,7 +911,7 @@ def inspect_workflow(
                 "workbook",
                 "The upstream allocation is not ready; resolve the earlier stage before regenerating Stage 3.",
             ))
-        elif not workbook_sha or not hint_ledger_present or unresolved_hint_count < 0 or stale or preview or not workbook_exists or workbook_mismatch:
+        elif review_changed_after_workbook or not workbook_sha or not hint_ledger_present or unresolved_hint_count < 0 or stale or preview or not workbook_exists or workbook_mismatch:
             requester = str(rows.get("requester", ""))
             write_parameters = {"requester": requester, "output": recorded_workbook}
             missing_write_source: list[str] = []
@@ -947,6 +1070,7 @@ def inspect_workflow(
         "output_root": str(root),
         "stages": stages,
         "artifacts": artifacts,
+        "subagents": subagents,
         "lines": lines,
         "next": pending_next,
         "integrity_blocked": integrity_blocked,

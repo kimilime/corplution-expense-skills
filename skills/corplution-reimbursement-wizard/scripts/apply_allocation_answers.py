@@ -727,6 +727,27 @@ def validate_update(update: dict[str, Any], lenient: bool) -> list[str]:
         if lenient:
             continue
         errors.append(message)
+    for field, value in update.items():
+        if field not in ALLOWED_UNIT_FIELDS:
+            continue
+        if field in {"attendees", "corrected_fields"}:
+            if isinstance(value, (dict, tuple, set)):
+                errors.append(f"Invalid value type for {field}: expected text or a list of scalar values")
+            elif isinstance(value, list) and any(isinstance(item, (dict, list, tuple, set)) for item in value):
+                errors.append(f"Invalid nested value in {field}: expected a flat list of scalar values")
+            continue
+        if field == "issues":
+            if not isinstance(value, list) or any(
+                not isinstance(item, dict)
+                or set(item) - {"field", "problem"}
+                or not isinstance(item.get("field", ""), str)
+                or not isinstance(item.get("problem", ""), str)
+                for item in value
+            ):
+                errors.append("Invalid issues value: expected a list of {field, problem} text objects")
+            continue
+        if isinstance(value, (dict, list, tuple, set)):
+            errors.append(f"Invalid value type for {field}: nested objects/lists are not allowed")
     if not any(field in ALLOWED_UNIT_FIELDS for field in update):
         errors.append("Unit update has no fields to apply; correct or remove this decision entry.")
     column = update.get("final_template_column")

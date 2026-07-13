@@ -34,6 +34,9 @@ RUN_METADATA = {
     "apply": ("stage2-update", "apply_allocation_answers.py"),
     "trace": ("stage2-query", "trace_expense_item.py"),
     "rebase": ("stage2-rebase", "rebase_allocation_decisions.py"),
+    "prepare-agent": ("subagent-pilot", "subagent_protocol.py"),
+    "accept-agent": ("subagent-pilot", "subagent_protocol.py"),
+    "promote-proposals": ("subagent-pilot", "subagent_protocol.py"),
     "write": ("stage3", "write_reimbursement_template.py"),
     "package": ("stage4", "package_reimbursement_files.py"),
 }
@@ -71,7 +74,9 @@ def add_run_parsers(run_parser: argparse.ArgumentParser) -> None:
 
     compose = stages.add_parser("compose", help="Compose and dry-run allocation answers.")
     compose.add_argument("--set", action="append", default=[], dest="specs")
-    compose.add_argument("--decisions")
+    compose_source = compose.add_mutually_exclusive_group()
+    compose_source.add_argument("--decisions")
+    compose_source.add_argument("--proposal")
 
     apply_answers = stages.add_parser("apply", help="Apply current allocation answers through the updater.")
     apply_answers.add_argument("--answers", help="Defaults to process/allocation-answers.json.")
@@ -79,6 +84,38 @@ def add_run_parsers(run_parser: argparse.ArgumentParser) -> None:
 
     rebase = stages.add_parser("rebase", help="Carry decisions across an allocation regeneration by evidence ref.")
     rebase.add_argument("--old", help="Optional explicit source; otherwise discover the latest decided lineage generation.")
+
+    prepare_agent = stages.add_parser(
+        "prepare-agent",
+        help="Prepare a path-free immutable task packet for an optional read-only subagent.",
+    )
+    prepare_agent.add_argument(
+        "--role",
+        choices=["allocation_analyst", "independent_reviewer"],
+        required=True,
+    )
+
+    accept_agent = stages.add_parser(
+        "accept-agent",
+        help="Validate and stamp a returned subagent JSON result.",
+    )
+    accept_agent.add_argument(
+        "--role",
+        choices=["allocation_analyst", "independent_reviewer"],
+        required=True,
+    )
+    accept_agent.add_argument("--result", required=True, help="UTF-8 JSON returned by the fresh subagent.")
+
+    promote = stages.add_parser(
+        "promote-proposals",
+        help="Promote explicitly reviewed Otako proposal IDs into canonical decisions.",
+    )
+    selection = promote.add_mutually_exclusive_group(required=True)
+    selection.add_argument("--select", action="append", default=[])
+    selection.add_argument("--all", action="store_true")
+    promote.add_argument("--reviewed-by", choices=["coordinator", "applicant"], required=True)
+    promote.add_argument("--note", default="")
+    promote.add_argument("--output")
 
     trace = stages.add_parser("trace", help="Trace a user-facing expense item to source evidence.")
     trace.add_argument("--item", required=True)
@@ -181,8 +218,8 @@ def build_child_command(args: argparse.Namespace) -> tuple[str, str, list[str]]:
             "--output", str(paths["process"]),
         ])
     elif stage == "compose":
-        if not args.specs and not args.decisions:
-            raise OrchestratorError("compose requires at least one --set or --decisions input")
+        if not args.specs and not args.decisions and not args.proposal:
+            raise OrchestratorError("compose requires at least one --set, --decisions, or --proposal input")
         child.extend([
             "--allocation", str(paths["allocation"]),
             "--output", str(paths["answers"]),
@@ -191,6 +228,8 @@ def build_child_command(args: argparse.Namespace) -> tuple[str, str, list[str]]:
             child.extend(["--set", spec])
         if args.decisions:
             child.extend(["--decisions", args.decisions])
+        if args.proposal:
+            child.extend(["--proposal", args.proposal])
     elif stage == "apply":
         child.extend([
             "--allocation", str(paths["allocation"]),
@@ -205,6 +244,55 @@ def build_child_command(args: argparse.Namespace) -> tuple[str, str, list[str]]:
             "--new", str(paths["allocation"]),
             "--output", str(paths["process"] / "rebase-decisions.json"),
         ])
+    elif stage == "prepare-agent":
+        display_name = (
+            "Otako - Allocation Analyst"
+            if args.role == "allocation_analyst"
+            else "Kaede - Independent Reviewer"
+        )
+        journal_stage = f"subagent-{args.role}"
+        script_name = f"{display_name} via subagent_protocol.py"
+        child.extend([
+            "prepare",
+            "--role", args.role,
+            "--allocation", str(paths["allocation"]),
+            "--extraction", str(paths["extraction"]),
+            "--process-dir", str(paths["process"]),
+        ])
+    elif stage == "accept-agent":
+        display_name = (
+            "Otako - Allocation Analyst"
+            if args.role == "allocation_analyst"
+            else "Kaede - Independent Reviewer"
+        )
+        journal_stage = f"subagent-{args.role}"
+        script_name = f"{display_name} via subagent_protocol.py"
+        child.extend([
+            "accept",
+            "--role", args.role,
+            "--allocation", str(paths["allocation"]),
+            "--extraction", str(paths["extraction"]),
+            "--process-dir", str(paths["process"]),
+            "--result", args.result,
+        ])
+    elif stage == "promote-proposals":
+        journal_stage = "subagent-allocation_analyst"
+        script_name = "Otako - Allocation Analyst proposal promotion via subagent_protocol.py"
+        child.extend([
+            "promote",
+            "--allocation", str(paths["allocation"]),
+            "--extraction", str(paths["extraction"]),
+            "--process-dir", str(paths["process"]),
+            "--reviewed-by", args.reviewed_by,
+        ])
+        for group in args.select:
+            child.extend(["--select", group])
+        if args.all:
+            child.append("--all")
+        if args.note:
+            child.extend(["--note", args.note])
+        if args.output:
+            child.extend(["--output", args.output])
     elif stage == "trace":
         child.extend([
             "--allocation", str(paths["allocation"]),
@@ -358,10 +446,22 @@ def chief_argv(
         return [*base, "--answers", answers] if answers else base
     if operation == "compose":
         decisions = str(parameters.get("decisions", ""))
-        return [*base, "--decisions", decisions] if decisions else None
+        proposal = str(parameters.get("proposal", ""))
+        if decisions:
+            return [*base, "--decisions", decisions]
+        if proposal:
+            return [*base, "--proposal", proposal]
+        return None
     if operation == "rebase":
         old = str(parameters.get("old", ""))
         return [*base, "--old", old] if old else base
+    if operation == "prepare-agent":
+        role = str(parameters.get("role", ""))
+        return [*base, "--role", role] if role else None
+    if operation == "accept-agent":
+        role = str(parameters.get("role", ""))
+        result = str(parameters.get("result", ""))
+        return [*base, "--role", role, "--result", result] if role and result else None
     if operation == "package":
         return base
     return None
@@ -384,6 +484,23 @@ def enrich_next(state: dict[str, Any], journal: str | None = None) -> dict[str, 
             result["missing"].append("parameters required to construct the next command")
     else:
         result["argv"] = None
+    result["delegations"] = []
+    for recommendation in (state.get("subagents") or {}).get("recommended", []):
+        role = str(recommendation.get("role", ""))
+        command = chief_argv(
+            "prepare-agent",
+            {"role": role},
+            process_dir=str(state.get("process_dir", "process")),
+            output_root=str(state.get("output_root", "output")),
+            journal=journal,
+        )
+        if command:
+            result["delegations"].append({
+                "role": role,
+                "display_name": str(recommendation.get("display_name", role)),
+                "reason": str(recommendation.get("reason", "optional independent pass")),
+                "argv": command,
+            })
     return result
 
 
@@ -406,6 +523,14 @@ def render_next(step: dict[str, Any]) -> str:
     if argv:
         lines.append("Command:")
         lines.append(format_command(argv))
+    delegations = step.get("delegations") or []
+    if delegations:
+        lines.append("Optional subagent pilot (does not replace the NEXT action):")
+        for delegation in delegations:
+            lines.append(
+                f"- {delegation.get('display_name')}: {delegation.get('reason')}"
+            )
+            lines.append(f"  Prepare: {format_command(delegation.get('argv') or [])}")
     return "\n".join(lines)
 
 

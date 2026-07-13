@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import json
 import integrity
+import subagent_protocol
 import re
 import shutil
 import sys
@@ -202,6 +203,36 @@ def build_package(
               "modified after stage 3 ran — the workbook is stale. NEXT: re-run "
               "write_reimbursement_template.py, then package again.", file=sys.stderr)
         raise SystemExit(2)
+    independent_review = subagent_protocol.review_state(
+        final_rows_path.parent,
+        allocation,
+        allocation_path,
+        extraction_path,
+    )
+    if (
+        independent_review.get("current")
+        and independent_review.get("outcome") == "block"
+        and int(independent_review.get("blocking_count", 0) or 0) > 0
+    ):
+        print(
+            "ERROR: the current Kaede independent review contains blocking findings. "
+            "NEXT: resolve them through Composer/Updater, obtain a fresh review, rerun Stage 3, then package.",
+            file=sys.stderr,
+        )
+        raise SystemExit(2)
+    if independent_review.get("current"):
+        recorded_review = final_rows.get("independent_review", {})
+        if not isinstance(recorded_review, dict):
+            recorded_review = {}
+        current_review_fp = str(independent_review.get("result_fingerprint", ""))
+        recorded_review_fp = str(recorded_review.get("result_fingerprint", ""))
+        if current_review_fp and current_review_fp != recorded_review_fp:
+            print(
+                "ERROR: the current independent review was accepted after this workbook was generated. "
+                "NEXT: rerun Stage 3 so final rows consume the current review result, then package.",
+                file=sys.stderr,
+            )
+            raise SystemExit(2)
     if final_rows.get("generated_with_allow_unconfirmed"):
         print("ERROR: this workbook was generated with --allow-unconfirmed (a PREVIEW past open "
               "gates) and must not be packaged as the deliverable. NEXT: resolve remaining "
