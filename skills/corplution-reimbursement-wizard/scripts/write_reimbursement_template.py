@@ -983,6 +983,98 @@ def included_units(allocation: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+# Neutral fallback label for a supporting document whose type the user left unset.
+SUPPORT_DOC_DEFAULT_TYPE = "支持文档"  # 支持文档
+
+
+def _resolve_path(value: str) -> str:
+    value = clean(value)
+    if not value:
+        return ""
+    try:
+        return str(Path(value).resolve())
+    except OSError:
+        return value
+
+
+def _unit_invoice_doc_ids(units: list[dict[str, Any]]) -> set[str]:
+    """Document ids that a supporting document may legitimately name as its invoice."""
+    ids: set[str] = set()
+    for unit in units:
+        for field in ("supporting_invoice_document_id", "source_document_id"):
+            value = clean(unit.get(field))
+            if value:
+                ids.add(value)
+    return ids
+
+
+def _substitute_approval_sources(units: list[dict[str, Any]]) -> set[str]:
+    """Resolved paths already packaged via the substitute-invoice approval_file path."""
+    out: set[str] = set()
+    for unit in units:
+        if unit.get("is_substitute_invoice"):
+            resolved = _resolve_path(unit.get("approval_file", ""))
+            if resolved:
+                out.add(resolved)
+    return out
+
+
+def collect_support_documents(
+    extraction: dict[str, Any], units: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split standalone supporting documents into mounted vs. orphan.
+
+    A supporting document is *mounted* when it names, via ``supports_document_id``,
+    an invoice that survives into an included expense unit — it will be packaged
+    under that invoice's proof number. A substitute-invoice approval screenshot is
+    already carried through the substitute unit's ``approval_file`` and is skipped
+    here to avoid double packaging. Everything else is an *orphan*: evidence the
+    user kept but did not tie to any invoice, which hard-blocks Stage 3.
+    """
+    valid_invoice_ids = _unit_invoice_doc_ids(units)
+    substitute_sources = _substitute_approval_sources(units)
+    mounted: list[dict[str, Any]] = []
+    orphans: list[dict[str, Any]] = []
+    for doc in extraction.get("documents", []):
+        if doc.get("excluded_by_user"):
+            continue
+        if doc.get("document_role") != "supporting_document":
+            continue
+        source = clean(doc.get("source_file"))
+        if source and _resolve_path(source) in substitute_sources:
+            continue
+        supports = clean(doc.get("supports_document_id"))
+        if supports and supports in valid_invoice_ids:
+            mounted.append({
+                "document_id": doc.get("document_id"),
+                "source_file": source,
+                "support_type": clean(doc.get("support_type")) or SUPPORT_DOC_DEFAULT_TYPE,
+                "supports_document_id": supports,
+            })
+        else:
+            orphans.append(doc)
+    return mounted, orphans
+
+
+def attach_support_documents_to_groups(
+    proof_groups: list[dict[str, Any]], mounted: list[dict[str, Any]]
+) -> None:
+    """Add each mounted support document to the proof group of the invoice it backs."""
+    group_by_invoice: dict[str, dict[str, Any]] = {}
+    for group in proof_groups:
+        for doc_id in group.get("source_document_ids", []):
+            group_by_invoice.setdefault(doc_id, group)
+    for item in mounted:
+        group = group_by_invoice.get(item["supports_document_id"])
+        if group is None:
+            continue  # unreachable once preflight has passed; guard defensively
+        group.setdefault("support_documents", []).append({
+            "document_id": item["document_id"],
+            "source_file": item["source_file"],
+            "support_type": item["support_type"],
+        })
+
+
 def proof_type(unit: dict[str, Any]) -> str:
     subtype = unit.get("document_subtype", "")
     source = unit.get("source_category", "")
@@ -2186,6 +2278,18 @@ def main(argv: list[str] | None = None) -> int:
                 "Unsupported input files still need a recorded user decision: " + names + ". "
                 "Resolve them through apply_extraction_corrections.py, then re-run Stage 1 and Stage 2."
             )
+        _, support_orphans = collect_support_documents(extraction, included_units(allocation))
+        if support_orphans:
+            names = ", ".join(
+                f"{doc.get('document_id')} ({Path(str(doc.get('source_file', ''))).name})"
+                for doc in support_orphans
+            )
+            errors.append(
+                "These supporting documents are not tied to any invoice and cannot be packaged: "
+                + names + ". For each, record the invoice it backs (supports_document_id) and an "
+                "optional support_type via apply_extraction_corrections.py, or exclude it with the "
+                "user's reason, then re-run Stage 1 and Stage 2."
+            )
     independent_review = subagent_protocol.review_state(
         process_dir,
         allocation,
@@ -2226,6 +2330,8 @@ def main(argv: list[str] | None = None) -> int:
 
     units = included_units(allocation)
     proof_groups = assign_proof_numbers(units)
+    mounted_support, _ = collect_support_documents(extraction, units)
+    attach_support_documents_to_groups(proof_groups, mounted_support)
     rows = make_rows(units, args.requester)
     rows.sort(key=lambda r: (r["client"], r["client_charge_code"], ROW_ORDER.get(r["row_order_type"], 99), r["expense_date"], r["proof_no"]))
     annotate_meal_policies(rows)

@@ -454,7 +454,21 @@ Only generate the final taxi note after both endpoint types are known or confirm
 
 ## Substitute Invoices
 
-When the user says an invoice is a substitute invoice, replacement invoice, or "替票":
+Substitute status is user-declared, never inferred. Set `is_substitute_invoice: true`
+**only** when the user explicitly says a specific invoice/item is a substitute invoice,
+replacement invoice, "替票", or "抵用发票". This is strictly one-directional:
+
+- Substitute invoice ⟹ needs a partner approval screenshot.
+- Partner approval screenshot ⟹ does **not** make anything a substitute invoice.
+
+Do NOT flag an item as a substitute just because an approval screenshot exists, because a
+file is named "审批"/"approval", or because a partner approved the expense. Approvals attach
+to many ordinary expenses (over-cap, special categories) that are not substitutes. An
+approval screenshot the user has not tied to a declared substitute is just evidence: keep it
+as a `supporting_document` (see Unclaimed Approval Screenshots below), and never append `（抵）`
+to its expense on that basis alone.
+
+When — and only when — the user explicitly declares an item a substitute:
 
 - Set `is_substitute_invoice: true`.
 - Ask the user to provide the partner approval screenshot file.
@@ -464,6 +478,14 @@ When the user says an invoice is a substitute invoice, replacement invoice, or "
 - Record approval screenshot file path when provided.
 - Set `approval_file_status: provided` when the file path is known and `approval_file_status: missing` when it is not.
 - Add an issue if the screenshot is required but missing.
+
+### Unclaimed Approval Screenshots
+
+A partner approval screenshot the user provides without declaring the related item a
+substitute stays a plain `supporting_document`. Do not create an expense row for it, do not
+set `is_substitute_invoice`, and do not add `（抵）` to any note. If it is unclear which
+expense the screenshot supports or whether the user intends a substitute, ask — do not assume
+substitute.
 
 The final file-packaging stage must include the partner approval screenshot.
 

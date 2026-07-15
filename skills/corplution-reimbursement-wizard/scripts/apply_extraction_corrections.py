@@ -6,7 +6,12 @@ Typical uses:
 - An agent with vision looked at an image the classifier marked unknown and
   identified it as an invoice (fill the invoice fields it read).
 - The user says an unknown file is a partner approval screenshot or an
-  Alipay/receipt payment proof -> document_role: supporting_document.
+  Alipay/receipt payment proof -> document_role: supporting_document. Also
+  set `support_type` (free-text label, e.g. 付款小票 / 审批截图) and
+  `supports_document_id` (the document_id of the invoice it backs) so Stage 4
+  can package it under the same proof number as that invoice. A
+  supporting_document with no `supports_document_id` is a hard block at Stage 3
+  until the user names the invoice it supports or excludes it.
 - The user says a file is not reimbursement evidence -> action: exclude
   with their reason.
 

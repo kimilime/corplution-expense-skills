@@ -34,6 +34,11 @@ ALLOWED_SET_FIELDS = {
     "needs_review",
     "invoice",
     "classification",
+    # Support-document packaging metadata. A supporting_document (payment
+    # receipt, partner approval screenshot, or other user-provided evidence)
+    # is packaged only when it names the invoice it backs.
+    "support_type",            # free-text label shown in the package (付款小票/审批截图/…)
+    "supports_document_id",    # document_id of the invoice/proof this evidence supports
 }
 ALLOWED_ACTIONS = {"correct", "exclude"}
 ALLOWED_SOURCES = {"agent_vision", "agent_ocr", "user", "user_transcription"}
@@ -87,6 +92,13 @@ def validate_correction(entry: dict[str, Any]) -> list[str]:
         role = set_fields.get("document_role")
         if role is not None and role not in ALLOWED_ROLES:
             errors.append(f"document_role must be one of {sorted(ALLOWED_ROLES)}, got {role!r}")
+        for key in ("support_type", "supports_document_id"):
+            value = set_fields.get(key)
+            if value is not None and not isinstance(value, str):
+                errors.append(f"{key} must be a string, got {type(value).__name__}")
+        # Whether supports_document_id resolves to a real invoice is validated at
+        # Stage 3 (write), where the final proof groups exist; an unresolved link
+        # surfaces there as a hard block rather than a correction-time error.
     source = entry.get("corrected_by", "user")
     if source not in ALLOWED_SOURCES:
         errors.append(f"corrected_by must be one of {sorted(ALLOWED_SOURCES)}, got {source!r}")

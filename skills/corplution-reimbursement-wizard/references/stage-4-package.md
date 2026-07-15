@@ -93,11 +93,12 @@ Examples:
 006-替票审批.png
 ```
 
-Support document types:
+Support document types are open-ended — respect the user's judgement rather than a fixed list. Every supporting document the user keeps is packaged under the proof number of the invoice it backs (support file No. = that invoice's No.), with its type as the label:
 
-- `行程单` for Didi/Gaode trip reports.
-- `替票审批` for partner approval screenshots.
-- User-provided type for unusual support files.
+- `行程单` / `高德行程单` for Didi/Gaode trip reports.
+- `替票审批` only for the approval screenshot of an item the user declared a substitute invoice (`is_substitute_invoice: true`). Do not apply this label to ordinary approval screenshots — a partner approval that is not tied to a declared substitute is not a 替票审批.
+- The document's own `support_type` for standalone supporting documents (e.g. `付款小票`, `审批截图`, or any user-provided label); defaults to `支持文档` when unset.
+- A `supporting_document` that names no invoice (`supports_document_id`) is a hard block at Stage 3 — it is neither silently packaged nor silently dropped. Record its `supports_document_id` (and optional `support_type`) via `apply_extraction_corrections.py`, or exclude it with the user's reason.
 
 Rules:
 

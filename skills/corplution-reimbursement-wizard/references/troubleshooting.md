@@ -72,7 +72,7 @@ Separate identity evidence from the decision being replayed. A field that the ap
 | --- | --- | --- |
 | Invoice-based expense / 普通发票费用 | Original source filename; invoice number when present; seller/provider; invoice amount; add travel route/date or hotel stay when applicable | Client, code, expense date, category correction, hotel nights, reimbursable amount, substitute status |
 | Didi/Gaode ride / 滴滴高德单笔行程 | Trip-report filename; ride date/time; amount; origin and destination; linked invoice filename/number when available | Project assignment, origin/destination place types, overtime/business purpose |
-| Supporting document / 支持文件 | Original filename; document role; linked invoice filename/number or the business matter it supports | Trip-report link, substitute approval link, payment-proof role, exclusion reason |
+| Supporting document / 支持文件 | Original filename; document role; the invoice it backs (`supports_document_id`) and its `support_type` label, or the business matter it supports | Trip-report link, substitute approval link, payment-proof role, support type/invoice association, exclusion reason |
 | Applicant expense hint / 用户文字费用记录 | Original note text; project context; supplied date, amount, merchant, and attendees when present | Matched invoice, combined-invoice coverage, `not_reimbursed`, or `pending_invoice` |
 | Project context / 项目上下文 | Client name; charge code; city; date range; project/event description | Project identity, travel window, Admin matter description |
 | Exact duplicate-copy decision / 完全重复副本决定 | Canonical source filename and each duplicate source filename; shared SHA may be recorded only to prove content equality | Keep canonical copy; exclude specifically named duplicate copies |

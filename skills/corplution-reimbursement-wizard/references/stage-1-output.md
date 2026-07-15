@@ -96,6 +96,7 @@ Each source document must have:
 - `page_count`
 - `document_role`: `invoice`, `supporting_schedule`, `supporting_document`, or `unknown`
 - `document_subtype`
+- For a `supporting_document` (payment receipt, partner approval screenshot, or other user-kept evidence): also record, via `apply_extraction_corrections.py`, a free-text `support_type` (e.g. `付款小票` / `审批截图`) and `supports_document_id` (the `document_id` of the invoice it backs). Stage 4 packages it under that invoice's proof number. A `supporting_document` with no `supports_document_id` is a hard block at Stage 3 until the user names the invoice it supports or excludes it.
 - `extraction_method`: `text_layer`, `ocr`, `hybrid`, or `manual_review`
 - `ocr_required`
 - `confidence`

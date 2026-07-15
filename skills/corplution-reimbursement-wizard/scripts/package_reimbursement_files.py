@@ -26,6 +26,7 @@ C = {
     "trip_report": "\u884c\u7a0b\u5355",
     "gaode_trip_report": "\u9ad8\u5fb7\u884c\u7a0b\u5355",
     "substitute_approval": "\u66ff\u7968\u5ba1\u6279",
+    "support_document": "\u652f\u6301\u6587\u6863",
 }
 
 
@@ -343,7 +344,36 @@ def build_package(
 
     rows_lookup = rows_by_proof(final_rows)
     copied_support_files: set[tuple[Any, str, str]] = set()
+    # Guards one physical file being packaged twice under two labels within the
+    # same proof (e.g. a substitute approval that was also mounted generically).
+    copied_support_sources: set[tuple[Any, str]] = set()
     used_support_filenames: set[str] = set()
+
+    def add_support_file(proof_no: Any, source: Path, support_type: str) -> None:
+        """Copy one existing support file into the package under its type label.
+
+        Deduplicates by (proof, type) and by (proof, physical source) so the same
+        evidence is never packaged twice, and never overwrites another file.
+        """
+        resolved = str(source.resolve())
+        if (proof_no, resolved) in copied_support_sources:
+            return
+        support_key = (proof_no, support_type, resolved)
+        if support_key in copied_support_files:
+            return
+        copied_support_files.add(support_key)
+        copied_support_sources.add((proof_no, resolved))
+        filename = reserve_filename(support_filename(proof_no, support_type, source), used_support_filenames)
+        target = support_dir / filename
+        copy_file(source, target)
+        manifest["support_files"].append({
+            "proof_no": proof_no,
+            "filename": filename,
+            "sha256": sha256_file(target),
+            "source_file": str(source),
+            "type": support_type,
+        })
+
     for group in final_rows.get("proof_groups", []):
         proof_no = group.get("proof_no")
         invoice_doc = None
@@ -391,42 +421,28 @@ def build_package(
                     "problem": f"Support source file not found: {source}",
                 })
                 continue
-            filename = support_filename(proof_no, support_type, source)
-            support_key = (proof_no, support_type, str(source.resolve()))
-            if support_key in copied_support_files:
+            add_support_file(proof_no, source, support_type)
+
+        # Standalone supporting documents (payment receipts, non-substitute
+        # approval screenshots, other user-kept evidence) the user tied to this
+        # proof's invoice via supports_document_id. Each carries its own label.
+        for support in group.get("support_documents", []):
+            source = Path(support.get("source_file", ""))
+            label = (support.get("support_type") or "").strip() or C["support_document"]
+            if not source.exists():
+                manifest["issues"].append({
+                    "proof_no": proof_no,
+                    "problem": f"Support source file not found: {source}",
+                })
                 continue
-            copied_support_files.add(support_key)
-            filename = reserve_filename(filename, used_support_filenames)
-            target = support_dir / filename
-            copy_file(source, target)
-            manifest["support_files"].append({
-                "proof_no": proof_no,
-                "filename": filename,
-                "sha256": sha256_file(target),
-                "source_file": str(source),
-                "type": support_type,
-            })
+            add_support_file(proof_no, source, label)
 
         for row in rows_lookup.get(int(proof_no), []):
             approval_file = row.get("approval_file") or ""
             if row.get("is_substitute_invoice") and approval_file:
                 source = Path(approval_file)
                 if source.exists():
-                    filename = support_filename(proof_no, C["substitute_approval"], source)
-                    support_key = (proof_no, C["substitute_approval"], str(source.resolve()))
-                    if support_key in copied_support_files:
-                        continue
-                    copied_support_files.add(support_key)
-                    filename = reserve_filename(filename, used_support_filenames)
-                    target = support_dir / filename
-                    copy_file(source, target)
-                    manifest["support_files"].append({
-                        "proof_no": proof_no,
-                        "filename": filename,
-                        "sha256": sha256_file(target),
-                        "source_file": str(source),
-                        "type": C["substitute_approval"],
-                    })
+                    add_support_file(proof_no, source, C["substitute_approval"])
                 else:
                     manifest["issues"].append({
                         "proof_no": proof_no,

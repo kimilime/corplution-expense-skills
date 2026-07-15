@@ -605,6 +605,16 @@ def print_document_reconciliation(extraction: dict[str, Any], units: list[dict[s
           f" + supporting documents {len(supporting)} + excluded by user {len(excluded)}")
     for d in excluded:
         print(f"  * excluded: {Path(str(d.get('source_file',''))).name} ({d.get('exclusion_reason','')})")
+    unassociated_support = [
+        d for d in supporting if not clean(d.get("supports_document_id"))
+    ]
+    if unassociated_support:
+        print(f"- Supporting documents not yet tied to an invoice: {len(unassociated_support)} "
+              "(each must name the invoice it backs via supports_document_id, or be excluded, "
+              "before Stage 3/packaging — this is a hard block):")
+        for d in unassociated_support:
+            print(f"  * {d['document_id']}: {Path(str(d.get('source_file',''))).name} "
+                  f"(support_type={clean(d.get('support_type')) or '<unset>'})")
     if unknown_units:
         print(f"- Unidentified documents held as BLOCKING questions: {len(unknown_units)} (resolve via chat + apply_extraction_corrections.py)")
     if unaccounted:
@@ -834,7 +844,11 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
 
         if role == "supporting_document":
             # Legitimate evidence with no expense row of its own (approval
-            # screenshots, payment receipts); packaging picks it up later.
+            # screenshots, payment receipts). It has no allocation unit; Stage 3
+            # (write) mounts it onto the proof group of the invoice named by its
+            # `supports_document_id` and packages it under that proof number.
+            # A supporting_document that names no invoice is a hard block at
+            # Stage 3 (see mount_support_documents in write_reimbursement_template).
             continue
 
         # Catch-all: every document the pipeline does not recognize becomes a
