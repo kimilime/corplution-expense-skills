@@ -86,51 +86,40 @@ Allocation validates the project-context schema before creating any units, refus
 
 Treat every concrete expense line supplied by the applicant as an expected-record item. Put a meal record in `meal_hints` or another record in `expense_hints`, never duplicate the same record in both arrays; Stage 2 nevertheless deduplicates legacy cross-array copies by context/category/date/amount and compatible merchant evidence. It writes `expense_hint_reconciliation` for every distinct record. Records without unique extracted matches are grouped by expense type in chat and labeled with generation-safe `R1@ref` tokens. Translate every full R@ref answer into `expense_hint_resolutions` using one canonical action: `matched_existing`, `covered_by_invoice`, `not_reimbursed`, or `pending_invoice`. The first three close that record when valid; `pending_invoice` records the applicant's intention but remains blocking until evidence is supplied or the applicant changes it to `not_reimbursed`. Never close these questions through free-text `question_updates`. Dropping a linked unit reopens the record.
 
-The allocation script prints an applicant review list, then a ready-to-send 转发块 containing all blocking questions in Chinese. When the host exposes a genuinely fresh isolated Agent, run the Otako checkpoint described below before asking the applicant; skip it only when that capability is unavailable or the user explicitly opts out. Relay the allocator's 转发块 VERBATIM — do not summarize or shorten it — and add only clearly separated Otako questions/advisories when useful, then wait for the user's answers. Never silently replace or close an official blocking question from an advisory proposal. If terminal output is garbled, read the Markdown process file instead of creating temporary print/extraction scripts.
+The allocation script prints an applicant review list, then a ready-to-send 转发块 containing all blocking questions in Chinese. Relay the allocator's 转发块 VERBATIM — do not summarize or shorten it — then wait for the user's answers. The Mirror Warden and Gate Challenger audits run later, immediately before Stage 3 (see Preferred Subagent Checkpoints), not at this point. If terminal output is garbled, read the Markdown process file instead of creating temporary print/extraction scripts.
 
 When the user answers allocation questions, use the bundled Composer to turn those decisions into the current allocation's canonical `unit_updates` and `expense_hint_resolutions`; do not invent another schema such as `answers[].allocations`. Composer resolves the actual `user_no` values printed in chat, supports unit/question/context/hint-resolution updates plus confirm/drop/exclude actions, binds the live allocation fingerprint, dry-runs the updater, and publishes `process/allocation-answers.json` only after validation succeeds. Then run the updater and repeat until no blocking questions remain. After ANY extraction or allocation re-run, treat every old `DOC-xxx`, `UNIT-xxx`, displayed item number, and bare/old `R1@ref` reference as expired. Rebind explicit user-confirmed facts to the new review list using the source descriptors in `references/troubleshooting.md`; never replay number-only memory or an old decisions file.
 
 ### Preferred Subagent Checkpoints
 
-When the host supports fresh subagents, these two checkpoints are the default execution order before the canonical next action printed by Chief. Skip only when no genuinely fresh isolated Agent capability exists or the user explicitly opts out; workflow complexity or prior errors are not reasons to skip. The deterministic workflow remains the fail-open fallback. Subagents are read-only reasoning passes: never give them filesystem paths or mutation tools, and never let them write process JSON.
+Immediately before Stage 3, run two independent read-only audits over the confirmed allocation. Both are the default execution order before the canonical next action printed by Chief; skip only when no genuinely fresh isolated Agent capability exists or the user explicitly opts out (workflow complexity or prior errors are not reasons to skip). The deterministic Stage 3 preflight remains the fail-open fallback. Subagents are read-only reasoning passes: never give them filesystem paths or mutation tools, and never let them write process JSON.
 
-After allocation and any required lineage rebase are current, but before relaying unresolved allocation questions, prepare Otako's task:
+On Claude Code, the fresh isolated Agent IS the built-in Agent/Task tool: spawn a general-purpose subagent and pass the packet plus result template inline in its prompt (there is no attachment channel — paste the complete JSON into the prompt). That is the concrete handoff. Do not treat "fresh subagent" as unavailable merely because there is no resource-attachment mechanism.
+
+**Otako, the Mirror Warden** — reconcile the confirmed allocation against the evidence (attribution, journey coherence, dates/routes, amounts, duplicates, completeness):
 
 ```bash
-python scripts/chief_orchestrator.py run prepare-agent --role allocation_analyst
+python scripts/chief_orchestrator.py run prepare-agent --role mirror_warden
 ```
 
-Read the generated compact task packet and result template yourself. Give both directly to a fresh subagent with no prior conversation context: use the host's read-only attachment/resource handoff when available, otherwise include their complete JSON contents in its initial message. Never tell the subagent to find or read a workspace file. When the host supports structured output, pass the packet's `response_json_schema`; otherwise require the exact result-template shape. The packet embeds `references/otako-allocation-analyst.md`. Save the exact JSON response outside `process/`, then validate it:
+Read the generated compact task packet and result template yourself, then hand both to a fresh Agent/Task-tool subagent with no prior conversation context by pasting their complete JSON into its initial prompt. Never tell the subagent to find or read a workspace file. When the host supports structured output, pass the packet's `response_json_schema`; otherwise require the exact result-template shape. The packet embeds `references/otako-mirror-warden.md`. Save the exact JSON response outside `process/`, then validate it:
 
 ```bash
 python scripts/chief_orchestrator.py run accept-agent \
-    --role allocation_analyst --result <utf8-result.json>
+    --role mirror_warden --result <utf8-result.json>
 ```
 
-Otako's report and generated `.unreviewed.json` proposal packet are advisory and are intentionally rejected by Composer. Use its grouped questions, but do not treat proposals as applicant-confirmed facts. After the coordinator/applicant selects or confirms proposal IDs, promote only that explicit selection:
+**Kaede, the Gate Challenger** — pre-screen the same confirmed allocation as the company finance/audit reviewer would (policy compliance, required approvals, business justification, audit red flags, under-claiming, package readiness, presentation):
 
 ```bash
-python scripts/chief_orchestrator.py run promote-proposals \
-    --select P-001,P-003 --reviewed-by coordinator
-```
-
-Then compile the stamped `.reviewed.json` path printed by that command through the exact-fingerprint route:
-
-```bash
-python scripts/chief_orchestrator.py run compose --proposal <reviewed-proposal.json>
-```
-
-Immediately before Stage 3, prepare Kaede's independent task from the confirmed allocation:
-
-```bash
-python scripts/chief_orchestrator.py run prepare-agent --role independent_reviewer
+python scripts/chief_orchestrator.py run prepare-agent --role gate_challenger
 python scripts/chief_orchestrator.py run accept-agent \
-    --role independent_reviewer --result <utf8-result.json>
+    --role gate_challenger --result <utf8-result.json>
 ```
 
-The packet embeds `references/kaede-independent-reviewer.md`. Kaede can be prepared or accepted only after Stage 2 is fully ready. The packet's `coverage[].status` only permits `completed` or `not_applicable`; `pass`/`advisory`/`block`/`unavailable` belong only in `outcome`, and every finding uses the exact schema printed in the packet. A current validated `block` result prevents Stage 3 and packaging until the findings are resolved through Composer/Updater and a fresh review is run. Every accepted review is written first to an immutable task-generation archive under `process/subagent-review-generations/`; deleting or corrupting the convenience sidecar cannot clear an accepted blocker. `pass`, `advisory`, and explicit `unavailable` results are recorded in final rows. Only the absence of any accepted current-task review (including missing/stale/invalid results with no valid current archive) fails open to the existing deterministic preflight; never synthesize a pass. The integrity stamp proves only that the accepted result was not subsequently edited, not that the model was truly independent.
+The packets embed `references/otako-mirror-warden.md` and `references/kaede-gate-challenger.md`. Both can be prepared or accepted only after Stage 2 is fully ready. Each result's `coverage[].status` only permits `completed` or `not_applicable`; `pass`/`advisory`/`block`/`unavailable` belong only in `outcome`, and every finding uses the exact schema printed in the packet. A current validated `block` result from EITHER role (a blocking finding) prevents Stage 3 and packaging until the cited items are resolved through Composer/Updater and a fresh audit is run. Every accepted audit is written first to an immutable per-role archive under `process/subagent-audit-generations/<role>/`; deleting or corrupting the convenience sidecar cannot clear an accepted blocker. `pass`, `advisory`, and explicit `unavailable` results are recorded in final rows. Only the absence of any accepted current-task audit (missing/stale/invalid with no valid current archive) fails open to the deterministic preflight; never synthesize a pass. The integrity stamp proves only that the accepted result was not subsequently edited, not that the model was truly independent.
 
-If the host cannot start a fresh isolated subagent, skip these checkpoints and continue the existing single-agent workflow. Do not imitate independence by asking the same context-laden agent to rubber-stamp its own work.
+If the host cannot start a fresh isolated subagent, skip these checkpoints and continue the deterministic workflow. Do not imitate independence by asking the same context-laden agent to rubber-stamp its own work.
 
 ### Batch Answers
 
@@ -290,7 +279,7 @@ Read `references/stage-3-excel-output.md` before writing the reimbursement workb
 - On hotel corrections, setting either `city` or `hotel_city` updates the other; conflicting values are rejected. Do not ask the applicant for the same city twice or retry with a second field name.
 - Hotel final notes must not keep placeholders such as `X晚`, `入住日`, or `离店日`. If hotel nights/check-in/check-out are known, the scripts regenerate `出差酒店（X晚，入住日-离店日）` with actual values; if those fields are missing, Stage 3 preflight blocks workbook generation.
 - Always show or summarize `STAGE 3 PREFLIGHT CHECK TO SHOW IN CHAT`. If the writer exits with code `2`, no workbook was written because allocation is not structurally ready: open questions, invalid categories/columns, missing dates/client/code/amount, admin/mobile conflicts, raw ticket notes, or missing taxi place types must be fixed first.
-- If a current accepted Kaede review contains blocking findings, Stage 3 exits with code `2` before workbook creation. The writer requires `--process-dir` to be the same canonical directory that contains `--allocation`, so a second process folder cannot hide the gate. Resolve the cited `N@ref` items through Composer/Updater and run a fresh review. Keep these findings separate from deterministic meal/hotel `blocking_policy_checks`.
+- If a current accepted subagent audit (Otako Mirror Warden or Kaede Gate Challenger) contains blocking findings, Stage 3 exits with code `2` before workbook creation. The writer requires `--process-dir` to be the same canonical directory that contains `--allocation`, so a second process folder cannot hide the gate. Resolve the cited `N@ref` items through Composer/Updater and run a fresh audit. Keep these findings separate from deterministic meal/hotel `blocking_policy_checks`.
 - If any stage script exits with code `4`, a process JSON failed its integrity check (modified outside the sanctioned flow); follow the printed recovery steps and do not patch further.
 - If `write_reimbursement_template.py` exits with code `3`, the workbook and final row files were written, but the `STAGE 3 REVIEW SUMMARY TO SHOW IN CHAT` block contains blocking meal/hotel policy checks that must be shown to the applicant and resolved before final submission.
 - Assign overall proof numbers by substantive proof order: flight/rail, hotel, taxi/Didi, Gaode, meal, mobile, other.
@@ -330,6 +319,6 @@ Before declaring the workflow complete:
 - Every distinct applicant expense record in `meal_hints`/`expense_hints` appears in `expense_hint_reconciliation` and is either uniquely matched to active evidence, covered by an identified invoice, or explicitly marked `not_reimbursed`; no `pending_invoice` remains at finalization, and the same record duplicated across both hint arrays is counted once.
 - Allocation, final rows, workbook, and package manifest belong to the same current extraction/allocation generations; a stale generation is regenerated rather than patched.
 - Stage 3 output has a requester, no unconfirmed blocking items, one amount column per row, no duplicate Didi/Gaode summary rows, meal and hotel cap checks shown in chat, and totals reconcile to confirmed allocation units.
-- Preferred subagent tasks contain role-scoped, path-free snapshots bound to full allocation/extraction fingerprints and capped at 80 KiB. Use a host read-only attachment/resource handoff when available; never ask a subagent to locate workspace files. Each task carries the exact result template plus a JSON Schema and enum constraints for structured-output hosts. When the host offered a fresh Agent and the user did not opt out, Otako and Kaede ran at their eligible checkpoints; Otako proposals were reviewed rather than auto-applied, any current Kaede blocker was resolved before Stage 3, and the consumed review fingerprint is recorded in final rows. An unavailable host remains fail-open and never fabricates a pass.
+- Preferred subagent tasks contain role-scoped, path-free snapshots bound to full allocation/extraction fingerprints and capped at 80 KiB. On Claude Code, paste the packet JSON into a fresh Agent/Task-tool subagent's prompt; never ask a subagent to locate workspace files. Each task carries the exact result template plus a JSON Schema and enum constraints for structured-output hosts. When the host offered a fresh Agent and the user did not opt out, the Mirror Warden and Gate Challenger audits ran immediately before Stage 3; any current blocking finding from either was resolved before Stage 3, and the consumed audit fingerprints are recorded in final rows. An unavailable host remains fail-open and never fabricates a pass.
 - Substitute invoice metadata and approval screenshot paths remain in `final-expense-rows.json` even though they are not written into the visible Excel rows.
 - Stage 4 package has a stamped manifest bound to the current final-rows fingerprint and workbook hash; every listed invoice/support file exists and matches its manifest hash, and the manifest has no unresolved issues.
