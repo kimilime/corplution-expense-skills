@@ -201,6 +201,15 @@ def apply_overlay(payload: dict[str, Any], overlay: dict[str, Any]) -> list[str]
                 doc["correction_note"] = str(entry["reason"]).strip()
             if "needs_review" not in set_fields and set_fields.get("document_role") in ALLOWED_ROLES - {"unknown"}:
                 doc["needs_review"] = False
+            if doc.get("needs_review"):
+                # Filling missing fields (e.g. invoice number/date/seller) does NOT
+                # auto-clear needs_review unless the correction also (re)sets a known
+                # document_role. Tell the caller how to clear it explicitly.
+                log.append(
+                    f"{doc.get('document_id')}: still flagged needs_review after this correction. "
+                    "If the required fields are now complete, add \"needs_review\": false to this "
+                    "correction's set to clear it."
+                )
             log.append(f"{doc.get('document_id')}: corrected -> role={doc.get('document_role')} ({doc.get('corrected_by')})")
     return log
 

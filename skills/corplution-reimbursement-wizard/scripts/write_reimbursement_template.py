@@ -828,6 +828,9 @@ def travel_destination_context(unit: dict[str, Any], contexts: list[dict[str, An
         if date_in_context(unit.get("expense_date", ""), ctx)
         and clean(ctx.get("city"))
         and clean(ctx.get("city")) in destination
+        # Admin is not a project you travel to; never treat it as a destination
+        # match (consistent with allocate_expenses.non_admin_contexts).
+        and clean(ctx.get("client_charge_code")).upper() != ADMIN_CODE
     ]
     context_ids = {clean(ctx.get("context_id")) for ctx in candidates}
     if len(context_ids) == 1:
