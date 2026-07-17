@@ -1,7 +1,28 @@
 # 结论备忘：双子 Agent 检查点在大额报销下"被绕开"
 
-> 状态：**待下次讨论**。本文记录排查结论 + 备选方案，供下次继续。
+> 状态：**已解决（2026/07/16）**。原排查结论 + 备选方案见下方（保留作历史）。
 > 相关脚本：`skills/corplution-reimbursement-wizard/scripts/subagent_protocol.py`、`SKILL.md`
+
+## 已解决：本轮定案与实现（2026/07/16）
+
+**决策（对应"下次讨论要定的点"）**
+
+1. **cap 抬到 384 KiB**（`MAX_HANDOFF_PACKET_BYTES = 384 * 1024`）。依据：packet 是整体贴进 fresh Agent/Task prompt 的 inline 预算（非传输限制）；固定 ~10 KiB + ~870 B/单元下 384 KiB 可容 ~430 单，远超现实体量，且对 200K 上下文模型 inline 仍有余裕。
+2. **分片：本轮不做**。cap 抬高 + fail-open 明确化已足以断掉"被绕开"；分片（按 charge_code / 单元块切分 + 各自指纹 + 结果合并）留作治本后续。
+3. **超 cap = 干净 fail-open 降格，不再 hard-raise 误导**。
+
+**实现**
+
+- 新增异常 `HandoffTooLarge(ProtocolError)`，携带 `display_name` / `packet_bytes`；文案只讲"降格到确定性 Stage-3 preflight、禁止手动拼包/手工 accept"，删去原来"用 attachment / 拆成 scoped packets"这两个在 Claude Code 上根本走不了的误导出路。
+- cap 校验从 `_build_task` 移出（size 只对 inline handoff 有意义，不该让 accept/`audit_state` 的指纹重算因体量失败），改由新 helper `_enforce_handoff_cap(task)` 在两处把关：
+  - `prepare_task`：**写任何文件之前**校验；超限 → 抛 `HandoffTooLarge`，不留半个 handoff。`main` 的 `prepare` 分支捕获后打印 `DEGRADE` 并 **exit 0**，Chief 照常走到 Stage-3 write，既有 fail-open（无受理 audit → preflight 权威）自然接管。
+  - `accept_result`：超限 → 抛 `HandoffTooLarge`，`main` 的 `accept` 分支 **exit 2 拒绝**（降格任务的任何 result 必是手工拼的）。
+- `SKILL.md:322` 同步：80 KiB → 384 KiB，并加"超 cap 则 prepare 降格、accept 拒绝、直接走 preflight、禁止手动拼包"一句。
+
+**测试**：`tests/test_subagent_audit.py` 新增 8 例（cap 值、异常形态、helper 上下界、prepare 降格不落盘、accept 拒绝、main 路由 prepare exit0 / accept exit2、under-cap 落盘）。全量套件 **45 通过**。
+
+---
+
 
 ## 一句话结论
 

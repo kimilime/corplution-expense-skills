@@ -39,7 +39,12 @@ TASK_SCHEMA = "subagent_task.v2"
 # other role's audit.
 AUDIT_SCHEMA = "subagent_audit.v1"
 
-MAX_HANDOFF_PACKET_BYTES = 80 * 1024
+# Inline handoff cap. The packet is pasted whole into a fresh Agent/Task-tool prompt
+# (Claude Code has no attachment channel), so this bounds the inline prompt cost, not a
+# transport limit. At ~10 KiB fixed + ~870 B/compacted-unit, 384 KiB clears ~430 units,
+# well past any realistic reimbursement; a packet still over this fails open to the
+# deterministic Stage-3 preflight (see HandoffTooLarge) rather than being hand-assembled.
+MAX_HANDOFF_PACKET_BYTES = 384 * 1024
 PACKET_TEXT_LIMIT = 480
 PACKET_NESTED_LIST_LIMIT = 24
 COVERAGE_STATUSES = ("completed", "not_applicable")
@@ -185,6 +190,27 @@ UNRESOLVED_INPUT_PACKET_FIELDS = (
 
 class ProtocolError(ValueError):
     pass
+
+
+class HandoffTooLarge(ProtocolError):
+    """The compact packet exceeds the inline cap.
+
+    This is a fail-open DEGRADE to the deterministic Stage-3 preflight, not a defect to
+    hand-fix. The coordinator must never hand-assemble a packet, split it manually, or
+    manually accept a result for a degraded task — that bypasses the fingerprint binding
+    and immutable archive that make the audit trustworthy. `prepare` treats it as a clean
+    degrade (exit 0); `accept` treats it as a refusal.
+    """
+
+    def __init__(self, display_name: str, packet_bytes: int) -> None:
+        self.display_name = display_name
+        self.packet_bytes = packet_bytes
+        super().__init__(
+            f"{display_name} compact handoff is {packet_bytes:,} bytes, over the "
+            f"{MAX_HANDOFF_PACKET_BYTES:,}-byte inline cap. Fail open: this audit degrades to the "
+            "deterministic Stage-3 preflight, which stays authoritative. Do not hand-assemble a "
+            "packet, split it manually, or manually accept a result — proceed to Stage 3 write."
+        )
 
 
 def configure_stdio() -> None:
@@ -388,6 +414,19 @@ def _compact_task_snapshot(
 
 def task_packet_size_bytes(task: dict[str, Any]) -> int:
     return len(_json_bytes(task))
+
+
+def _enforce_handoff_cap(task: dict[str, Any]) -> int:
+    """Return the packet size, raising HandoffTooLarge when it exceeds the inline cap.
+
+    Kept out of _build_task on purpose: size only matters for the inline handoff, not for
+    the fingerprint validation that accept/audit_state rebuild the task for. Only prepare
+    and accept gate on it.
+    """
+    packet_bytes = task_packet_size_bytes(task)
+    if packet_bytes > MAX_HANDOFF_PACKET_BYTES:
+        raise HandoffTooLarge(clean(task.get("display_name")) or "subagent", packet_bytes)
+    return packet_bytes
 
 
 def response_contract(role: str, coverage: list[str]) -> dict[str, Any]:
@@ -703,13 +742,9 @@ def _build_task(
         ],
     }
     integrity.stamp(task, "subagent_protocol.py")
-    packet_bytes = task_packet_size_bytes(task)
-    if packet_bytes > MAX_HANDOFF_PACKET_BYTES:
-        raise ProtocolError(
-            f"compact {spec['display_name']} handoff is {packet_bytes:,} bytes, exceeding the "
-            f"{MAX_HANDOFF_PACKET_BYTES:,}-byte cap. Use a host read-only resource attachment or split the "
-            "review into explicitly scoped packets; never make the subagent browse workspace files."
-        )
+    # Size is not enforced here: accept/audit_state rebuild the task only to recompute
+    # fingerprints, and a large allocation must not make those paths fail. prepare and
+    # accept call _enforce_handoff_cap themselves to gate the actual inline handoff.
     return task, allocation
 
 
@@ -761,6 +796,9 @@ def prepare_task(
 ) -> tuple[dict[str, Any], dict[str, Path]]:
     _require_canonical_process_dir(process_dir, allocation_path)
     task, _allocation = _build_task(role, allocation_path, extraction_path)
+    # Gate before writing anything: an over-cap packet degrades (HandoffTooLarge) and must
+    # leave no half-written handoff behind for a coordinator to pick up and accept.
+    _enforce_handoff_cap(task)
     paths = task_paths(process_dir, task)
     write_json(paths["task"], task)
     write_json(paths["template"], result_template(task))
@@ -1000,6 +1038,9 @@ def accept_result(
             "save the response under analysis/ or another session path"
         )
     task, allocation = _build_task(role, allocation_path, extraction_path)
+    # A degraded (over-cap) task never produced a real subagent handoff, so any result for
+    # it was hand-assembled. Refuse it and keep the deterministic preflight authoritative.
+    _enforce_handoff_cap(task)
     candidate = load_json(result_path)
     validate_result(candidate, task, allocation)
     accepted = dict(candidate)
@@ -1223,6 +1264,19 @@ def main(argv: list[str] | None = None) -> int:
         _full_fingerprint(allocation, "allocation")
         print(json.dumps(audit_state(args.role, Path(args.process_dir), allocation), ensure_ascii=False, indent=2))
         return 0
+    except HandoffTooLarge as degrade:
+        # Over-cap is a designed fail-open, not a failure to fix. For prepare it degrades
+        # cleanly (exit 0) so Chief keeps going straight to the deterministic Stage-3
+        # preflight; for accept it is a refusal (a result for a degraded task was hand-made).
+        if args.command == "prepare":
+            print(f"DEGRADE: {degrade}")
+            print(
+                "NEXT: skip this subagent audit and run Chief write; the deterministic Stage-3 "
+                "preflight is authoritative. Do not hand-assemble a packet or manually accept a result."
+            )
+            return 0
+        print(f"REFUSED: {degrade}", file=sys.stderr)
+        return 2
     except ProtocolError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         print("NEXT: regenerate the task from the current allocation and return JSON matching its generated template.", file=sys.stderr)

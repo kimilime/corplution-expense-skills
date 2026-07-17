@@ -146,5 +146,141 @@ class ValidateResultRoundTrip(unittest.TestCase):
             sp.validate_result(mismatch, task, alloc)
 
 
+class HandoffCapDegrade(unittest.TestCase):
+    """Over-cap packets fail open to the deterministic preflight instead of hard-erroring
+    with misleading 'use an attachment / split into scoped packets' advice."""
+
+    def test_cap_raised_to_384_kib(self):
+        self.assertEqual(sp.MAX_HANDOFF_PACKET_BYTES, 384 * 1024)
+
+    def test_handoff_too_large_is_a_protocol_error_carrying_size(self):
+        self.assertTrue(issubclass(sp.HandoffTooLarge, sp.ProtocolError))
+        exc = sp.HandoffTooLarge("Otako - Mirror Warden", 500_000)
+        self.assertEqual(exc.packet_bytes, 500_000)
+        self.assertEqual(exc.display_name, "Otako - Mirror Warden")
+        text = str(exc)
+        self.assertIn("Fail open", text)
+        self.assertIn("preflight", text)
+        # The retired inducements must not reappear in the message.
+        self.assertNotIn("attachment", text.lower())
+        self.assertNotIn("scoped packet", text.lower())
+
+    def test_enforce_cap_returns_size_under_cap_and_raises_over(self):
+        small = {"display_name": "X", "payload": "a" * 100}
+        self.assertGreater(sp._enforce_handoff_cap(small), 0)
+        big = {"display_name": "Otako - Mirror Warden", "payload": "x" * (400 * 1024)}
+        with self.assertRaises(sp.HandoffTooLarge):
+            sp._enforce_handoff_cap(big)
+
+    def test_prepare_task_degrades_without_writing_handoff(self):
+        import tempfile
+        oversize = {"display_name": "Otako - Mirror Warden", "payload": "x" * (400 * 1024)}
+        with tempfile.TemporaryDirectory() as tmp:
+            process_dir = Path(tmp)
+            orig_canonical = sp._require_canonical_process_dir
+            orig_build = sp._build_task
+            sp._require_canonical_process_dir = lambda *a, **k: None
+            sp._build_task = lambda *a, **k: (oversize, {})
+            try:
+                with self.assertRaises(sp.HandoffTooLarge):
+                    sp.prepare_task("mirror_warden", Path("a.json"), Path("e.json"), process_dir)
+            finally:
+                sp._require_canonical_process_dir = orig_canonical
+                sp._build_task = orig_build
+            # No handoff task/template may be left behind for a coordinator to accept.
+            self.assertEqual(list(process_dir.iterdir()), [])
+
+    def test_prepare_task_writes_handoff_under_cap(self):
+        import tempfile
+        small_task = {
+            "task_id": "t-happy",
+            "role_id": "mirror_warden",
+            "display_name": "Otako - Mirror Warden",
+            "contract_version": "cv-1",
+            "required_coverage": ["c1"],
+            "source_generation": {
+                "source_allocation_fingerprint": "f" * 64,
+                "source_extraction_fingerprint": "e" * 64,
+            },
+            "integrity": {"fingerprint": "a" * 64},
+            "payload": "small",
+        }
+        with tempfile.TemporaryDirectory() as tmp:
+            process_dir = Path(tmp) / "process"
+            process_dir.mkdir()
+            orig_canonical = sp._require_canonical_process_dir
+            orig_build = sp._build_task
+            sp._require_canonical_process_dir = lambda *a, **k: None
+            sp._build_task = lambda *a, **k: (small_task, {})
+            try:
+                _task, paths = sp.prepare_task(
+                    "mirror_warden", Path("a.json"), Path("e.json"), process_dir
+                )
+            finally:
+                sp._require_canonical_process_dir = orig_canonical
+                sp._build_task = orig_build
+            # Under cap the real handoff task + result template are written.
+            self.assertTrue(paths["task"].is_file())
+            self.assertTrue(paths["template"].is_file())
+
+    def test_accept_refuses_a_degraded_tasks_result(self):
+        oversize = {"display_name": "Otako - Mirror Warden", "payload": "x" * (400 * 1024)}
+        orig_canonical = sp._require_canonical_process_dir
+        orig_build = sp._build_task
+        sp._require_canonical_process_dir = lambda *a, **k: None
+        sp._build_task = lambda *a, **k: (oversize, {})
+        try:
+            with self.assertRaises(sp.HandoffTooLarge):
+                sp.accept_result(
+                    "mirror_warden", Path("a.json"), Path("e.json"),
+                    Path("proc"), Path("result.json"),
+                )
+        finally:
+            sp._require_canonical_process_dir = orig_canonical
+            sp._build_task = orig_build
+
+
+class MainDegradeRouting(unittest.TestCase):
+    """prepare degrades cleanly (exit 0); accept refuses (exit 2)."""
+
+    def _run(self, argv):
+        import io
+        import contextlib
+        out, err = io.StringIO(), io.StringIO()
+        with contextlib.redirect_stdout(out), contextlib.redirect_stderr(err):
+            code = sp.main(argv)
+        return code, out.getvalue(), err.getvalue()
+
+    def test_prepare_over_cap_exits_zero_with_degrade_notice(self):
+        orig = sp.prepare_task
+        sp.prepare_task = lambda *a, **k: (_ for _ in ()).throw(
+            sp.HandoffTooLarge("Otako - Mirror Warden", 500_000)
+        )
+        try:
+            code, out, _err = self._run(
+                ["prepare", "--role", "mirror_warden", "--allocation", "a.json", "--extraction", "e.json"]
+            )
+        finally:
+            sp.prepare_task = orig
+        self.assertEqual(code, 0)
+        self.assertIn("DEGRADE", out)
+        self.assertIn("preflight", out)
+
+    def test_accept_over_cap_is_refused(self):
+        orig = sp.accept_result
+        sp.accept_result = lambda *a, **k: (_ for _ in ()).throw(
+            sp.HandoffTooLarge("Otako - Mirror Warden", 500_000)
+        )
+        try:
+            code, _out, err = self._run(
+                ["accept", "--role", "mirror_warden", "--allocation", "a.json",
+                 "--extraction", "e.json", "--result", "r.json"]
+            )
+        finally:
+            sp.accept_result = orig
+        self.assertEqual(code, 2)
+        self.assertIn("REFUSED", err)
+
+
 if __name__ == "__main__":
     unittest.main()

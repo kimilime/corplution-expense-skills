@@ -4,6 +4,8 @@
 
 Corplution 专用 Codex skill，用于报销工作流：发票提取、项目分摊、报销工作簿生成，以及最终文件打包。
 
+使用者安装、调用和注意事项见：[使用指南](docs/user-guide.md)。
+
 ## Skill
 
 该 skill 位于：
@@ -35,33 +37,24 @@ C:\Users\<you>\.codex\skills\corplution-reimbursement-wizard
 
 本实验分支默认通过 `chief_orchestrator.py` 进入流程。Chief 只负责状态导航、规范参数调度和最小化运行日志；提取、归集、受控更新、写表和打包仍由原脚本完成。
 
-## 双子 Agent 优先检查点
+## 双子 Agent 审计检查点
 
-该分支增加两个只读角色：`Otako - Allocation Analyst` 在 Stage 2 初步归集后独立检查项目、行程链、接驳和用户费用记录；`Kaede - Independent Reviewer` 在 Stage 3 前从头审查材料完整性、项目归属、形式重于实质、Notes 和政策检查前提。宿主具备真正独立的新子 Agent 能力时，这两个检查点默认先于 Chief 的常规下一步执行；仅当能力不存在或用户明确跳过时才降级到原确定性流程。流程复杂、前面发生过错误或“先跑通再说”都不是跳过理由。子 Agent 不接收本地路径或写入权限，只接收由 `subagent_protocol.py` 生成的角色专用、路径无关、上限 80 KiB 的不可变数据快照，并以绑定完整 allocation/extraction 指纹的 JSON 返回。宿主应使用只读附件/资源交接；不能要求子 Agent 自己去工作区找任务文件。任务包同时提供 JSON Schema、枚举约束和结果模板。
+Stage 2 完全确认后、写 Excel 前，本版本可运行两个只读审计角色：`Otako - Mirror Warden` 复核归集是否真实符合证据和行程；`Kaede - Gate Challenger` 以财务/审批人视角复核合规、材料完整性与可报性。宿主具备真正新鲜独立子 Agent 能力时，两项审计默认执行；仅当能力不存在或用户明确跳过时，才降级到确定性的 Stage 3 preflight。两个 Agent 都不接收本地路径或写入权限，只接收由 `subagent_protocol.py` 生成、绑定完整 allocation/extraction 指纹的紧凑任务包。
 
 ```bash
-# Otako：先生成任务，通过宿主的只读附件/资源交给新子 Agent；仅在不支持时才在初始消息中嵌入两个紧凑 JSON 的完整内容。
+# 在 Stage 2 完全确认后，分别生成并验收两个审计结果。
 python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
-  run prepare-agent --role allocation_analyst
+  run prepare-agent --role mirror_warden
 python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
-  run accept-agent --role allocation_analyst --result <otako-result.json>
+  run accept-agent --role mirror_warden --result <otako-result.json>
 
-# 原始建议是 unreviewed，Composer 会拒绝。先显式选择 proposal ID。
 python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
-  run promote-proposals --select P-001,P-003 --reviewed-by coordinator
-
-# 再把 promote 命令打印的 .reviewed.json 文件交给 Composer。
+  run prepare-agent --role gate_challenger
 python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
-  run compose --proposal <reviewed-otako-proposals.json>
-
-# Kaede：在 Stage 2 完全确认后、Stage 3 前运行。
-python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
-  run prepare-agent --role independent_reviewer
-python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
-  run accept-agent --role independent_reviewer --result <kaede-result.json>
+  run accept-agent --role gate_challenger --result <kaede-result.json>
 ```
 
-Otako 建议不会自动修改 allocation；未经过 `promote-proposals` 显式选择和盖章的建议也不能进入 Composer。Kaede 只能在 Stage 2 完全就绪后运行；当前且验章通过的 `block` 会阻断写表和打包。每份受理结果先进入 `process/subagent-review-generations/` 的不可变世代归档，因此删除或损坏便捷 sidecar 不能清除已受理阻断；`pass/advisory/unavailable` 会写入 final rows。只有当前任务确实不存在任何有效受理结果时，流程才 fail-open 到现有确定性预检，而不会伪造一个 `pass`。完整性印章只能证明结果验收后未被修改，不能证明模型身份或独立性。
+在 Claude Code 中，将任务包和结果模板完整粘贴给一个新鲜 Agent/Task 子代理；不要让它自行查找工作区文件。任务包上限为 `384 KiB` 的 inline prompt 预算。极端大批次超过上限时，`prepare-agent` 会打印 `DEGRADE`、不写交接文件，并直接让确定性的 Stage 3 preflight 接管；禁止手工拼包、分片或手动受理结果。任何当前且验章通过的 `block` 会阻断写表和打包。受理的审计结果写入 `process/subagent-audit-generations/<role>/` 的不可变归档；`pass/advisory/unavailable` 会记录进 final rows。完整性印章只能证明结果受理后未被修改，不能证明模型身份或独立性。
 
 报销工作簿由脚本直接生成，并使用 `skills/corplution-reimbursement-wizard/assets/reimbursement-workbook-layout.toml` 定义静态布局，例如 sheet 名称、字体、行高、列宽、说明文字、表头和示例行样式。旧版模板仍随包保留在 `skills/corplution-reimbursement-wizard/assets/reimbursement-template.xlsx`，并可通过 `--template bundled` 作为备用方案使用。
 
@@ -220,6 +213,8 @@ Author: Terence Wang
 
 Corplution-specific Codex skill for reimbursement workflows: invoice extraction, project allocation, reimbursement workbook generation, and final file packaging.
 
+For installation, invocation, and operating notes, see the [User Guide](docs/user-guide.md).
+
 ## Skill
 
 The skill lives at:
@@ -251,33 +246,24 @@ After updating the repo, sync that folder again so Codex does not keep using an 
 
 This experimental branch uses `chief_orchestrator.py` as the default entry point. Chief handles state navigation, canonical dispatch, and privacy-minimized run logging only; the existing scripts still perform extraction, allocation, controlled updates, workbook generation, and packaging.
 
-## Preferred Two-Subagent Checkpoints
+## Preferred Two-Subagent Audits
 
-This branch adds two read-only roles. `Otako - Allocation Analyst` independently checks Stage 2 project matching, journey chains, transfers, and applicant expense records. `Kaede - Independent Reviewer` audits evidence completeness, project allocation, form-over-substance classification, Notes, and policy prerequisites immediately before Stage 3. When the host provides genuinely fresh isolated subagents, these checkpoints run by default before Chief's canonical next action; skip only when that capability is unavailable or the user opts out. Workflow difficulty, earlier errors, or a desire to “get the main flow working first” are not skip conditions. Neither receives local paths or write capability; `subagent_protocol.py` supplies an immutable, role-scoped, path-free snapshot capped at 80 KiB and accepts only JSON bound to the full allocation/extraction fingerprints. Use a read-only attachment/resource handoff rather than asking a subagent to locate workspace task files. The packet also carries a JSON Schema, enum constraints, and a result template.
+After Stage 2 is fully confirmed and before the workbook is written, this version can run two read-only audit roles. `Otako - Mirror Warden` checks whether allocation is genuinely supported by evidence and the itinerary. `Kaede - Gate Challenger` checks the claim as a finance approver would: compliance, evidence completeness, and claimability. When the host offers genuinely fresh isolated subagents, both audits run by default; skip only when that capability is unavailable or the user opts out. Neither receives local paths or write capability. `subagent_protocol.py` produces compact tasks bound to the full allocation/extraction fingerprints.
 
 ```bash
-# Otako: hand the fresh subagent the compact task and result-template JSON through host read-only resources; only embed both complete JSON values in its initial message when resources are unavailable.
+# After Stage 2 is fully confirmed, prepare and accept both audit results.
 python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
-  run prepare-agent --role allocation_analyst
+  run prepare-agent --role mirror_warden
 python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
-  run accept-agent --role allocation_analyst --result <otako-result.json>
+  run accept-agent --role mirror_warden --result <otako-result.json>
 
-# Raw proposals are unreviewed and rejected by Composer. Select proposal IDs explicitly.
 python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
-  run promote-proposals --select P-001,P-003 --reviewed-by coordinator
-
-# Give Composer the stamped .reviewed.json file printed by promotion.
+  run prepare-agent --role gate_challenger
 python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
-  run compose --proposal <reviewed-otako-proposals.json>
-
-# Kaede: run after Stage 2 is fully confirmed and before Stage 3.
-python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
-  run prepare-agent --role independent_reviewer
-python skills/corplution-reimbursement-wizard/scripts/chief_orchestrator.py \
-  run accept-agent --role independent_reviewer --result <kaede-result.json>
+  run accept-agent --role gate_challenger --result <kaede-result.json>
 ```
 
-Otako proposals never mutate allocation automatically, and an unreviewed proposal cannot enter Composer until `promote-proposals` explicitly selects and stamps it. Kaede can run only after Stage 2 is fully ready. A current validated `block` prevents workbook generation and packaging, and every accepted result is first retained under the immutable `process/subagent-review-generations/` archive, so deleting or corrupting the convenience sidecar cannot clear a blocker. `pass/advisory/unavailable` is recorded in final rows. Only when no valid accepted result exists for the current task does the pilot fail open to the deterministic preflight; it never fabricates `pass`. The integrity stamp proves post-acceptance immutability, not reviewer identity or independence.
+On Claude Code, paste the complete task packet and result template into a fresh Agent/Task subagent prompt; never ask it to find workspace files. The packet cap is a `384 KiB` inline-prompt budget. At extreme scale, `prepare-agent` prints `DEGRADE`, writes no handoff, and lets the deterministic Stage 3 preflight take over; never hand-assemble, split, or manually accept an audit result. A current validated `block` prevents workbook generation and packaging. Accepted audit results are retained under `process/subagent-audit-generations/<role>/`; `pass/advisory/unavailable` is recorded in final rows. The integrity stamp proves post-acceptance immutability, not model identity or independence.
 
 The reimbursement workbook is generated directly by script using `skills/corplution-reimbursement-wizard/assets/reimbursement-workbook-layout.toml` for static layout such as sheet name, fonts, row heights, column widths, instruction text, headers, and sample-row styles. The legacy template is still bundled at `skills/corplution-reimbursement-wizard/assets/reimbursement-template.xlsx` and can be used as a fallback with `--template bundled`.
 
