@@ -465,6 +465,25 @@ def classify_meal_policy(value: dict[str, Any]) -> tuple[dict[str, Any] | None, 
     if clean(value.get("source_category")) != "meal":
         return None, None
 
+    # Event-declared, one-off daily cap wins over the generic two-tier policy.
+    # It is stamped by annotate_event_meal_standards() from the meal's
+    # project_context meal_standards; never inferred from city/amount column.
+    event_cap = clean(value.get("event_meal_cap"))
+    if event_cap:
+        context_id = clean(value.get("event_meal_context_id"))
+        label = clean(value.get("event_meal_label")) or "事件餐标"
+        direction = clean(value.get("event_meal_direction")) or "unknown"
+        return {
+            "policy": f"event_declared:{context_id}" if context_id else "event_declared",
+            "policy_name": label,
+            "cap": Decimal(money(event_cap)),
+            "basis": [
+                f"event-declared daily cap {money(event_cap)} from "
+                f"{context_id or 'project_context'} ({label}); user-declared via "
+                f"project_context.meal_standards; direction={direction}"
+            ],
+        }, None
+
     note = clean(value.get("note") or value.get("final_note"))
     context = clean(value.get("meal_context"))
     trip_signals: list[str] = []
@@ -1199,6 +1218,7 @@ def make_rows(units: list[dict[str, Any]], requester: str) -> list[dict[str, Any
             "requester": requester,
             "client": normalized_client_name(unit),
             "client_charge_code": unit.get("client_charge_code", ""),
+            "project_context_id": clean(unit.get("project_context_id")),
             "expenses_nature": expense_nature(unit),
             "note": final_note(unit),
             "amount_column": amount_col,
@@ -1261,6 +1281,78 @@ def make_rows(units: list[dict[str, Any]], requester: str) -> list[dict[str, Any
 def meal_cap_policy(row: dict[str, Any]) -> dict[str, Any] | None:
     policy, _error = classify_meal_policy(row)
     return policy
+
+
+def _context_meal_standard(
+    contexts: list[dict[str, Any]], context_id: str, normalized_date: str
+) -> dict[str, Any] | None:
+    """One-off daily meal cap the user declared for this context on this date.
+
+    Matches strictly on context_id + date so a same-date expense in another
+    context is never captured by an event standard.
+    """
+    if not context_id or not normalized_date:
+        return None
+    for ctx in contexts:
+        if not isinstance(ctx, dict) or clean(ctx.get("context_id")) != context_id:
+            continue
+        for standard in ctx.get("meal_standards", []) or []:
+            if not isinstance(standard, dict):
+                continue
+            if date_yyyymmdd(clean(standard.get("date"))) != normalized_date:
+                continue
+            cap = clean(standard.get("daily_cap"))
+            if not cap:
+                return None
+            return {
+                "context_id": context_id,
+                "cap": cap,
+                "label": clean(standard.get("label")) or "事件餐标",
+                "basis": clean(standard.get("basis")) or "用户声明",
+            }
+        return None
+    return None
+
+
+def annotate_event_meal_standards(
+    rows: list[dict[str, Any]], contexts: list[dict[str, Any]]
+) -> None:
+    """Stamp user-declared event daily caps onto meal rows before classification.
+
+    Records the effective cap plus its direction against the generic policy that
+    would otherwise apply, so the deterministic writer and the Gate Challenger
+    both see an auditable provenance for the override.
+    """
+    contexts = contexts or []
+    for row in rows:
+        for field in ("event_meal_cap", "event_meal_label", "event_meal_context_id", "event_meal_direction"):
+            row.pop(field, None)
+        if clean(row.get("source_category")) != "meal":
+            continue
+        context_id = clean(row.get("project_context_id"))
+        normalized_date = clean(row.get("date")) or date_yyyymmdd(row.get("expense_date", ""))
+        standard = _context_meal_standard(contexts, context_id, normalized_date)
+        if not standard:
+            continue
+        # Compute direction against the generic cap that would apply without the
+        # override. classify_meal_policy still returns the generic tier here
+        # because event_meal_cap has not been stamped on the row yet.
+        generic_policy, _error = classify_meal_policy(row)
+        if generic_policy is None:
+            direction = "no_generic_baseline"
+        else:
+            event_cap = Decimal(money(standard["cap"]))
+            generic_cap = generic_policy["cap"]
+            if event_cap > generic_cap:
+                direction = "exceeds_generic"
+            elif event_cap < generic_cap:
+                direction = "conservative"
+            else:
+                direction = "equal"
+        row["event_meal_cap"] = money(standard["cap"])
+        row["event_meal_label"] = standard["label"]
+        row["event_meal_context_id"] = standard["context_id"]
+        row["event_meal_direction"] = direction
 
 
 def annotate_meal_policies(rows: list[dict[str, Any]]) -> None:
@@ -1361,11 +1453,18 @@ def meal_daily_cap_checks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 severity = "blocking"
                 requires_confirmation = True
                 suggestions = suggest_meal_adjustments(day_rows, over_by)
+        event_declared = str(policy["policy"]).startswith("event_declared")
+        event_direction = next(
+            (clean(row.get("event_meal_direction")) for row in day_rows if clean(row.get("event_meal_direction"))),
+            "",
+        )
         checks.append({
             "policy": policy["policy"],
             "policy_name": policy["policy_name"],
             "date": date_value,
             "cap": money(cap),
+            "event_declared": event_declared,
+            "event_meal_direction": event_direction,
             "aggregation_key": "meal_cap_policy + expense_date",
             "cross_column_aggregation": True,
             "policy_basis": sorted({
@@ -2336,6 +2435,7 @@ def main(argv: list[str] | None = None) -> int:
     attach_support_documents_to_groups(proof_groups, mounted_support)
     rows = make_rows(units, args.requester)
     rows.sort(key=lambda r: (r["client"], r["client_charge_code"], ROW_ORDER.get(r["row_order_type"], 99), r["expense_date"], r["proof_no"]))
+    annotate_event_meal_standards(rows, allocation.get("project_contexts", []))
     annotate_meal_policies(rows)
     row_text_issues = text_safety.find_suspect_text(
         text_safety.pick_fields(rows, WORKBOOK_ROW_TEXT_FIELDS),

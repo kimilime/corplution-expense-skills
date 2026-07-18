@@ -296,6 +296,7 @@ PROJECT_CONTEXT_OPTIONAL_FIELDS = {
     "status",
     "meal_hints",
     "expense_hints",
+    "meal_standards",
 }
 PROJECT_CONTEXT_FIELDS = PROJECT_CONTEXT_REQUIRED_FIELDS | PROJECT_CONTEXT_OPTIONAL_FIELDS
 PROJECT_CONTEXT_ROOT_FIELDS = {"schema_version", "project_contexts"}
@@ -372,6 +373,20 @@ def context_schema_errors(payload: Any) -> list[str]:
             hints = context.get(hints_field, [])
             if not isinstance(hints, list) or any(not isinstance(item, dict) for item in hints):
                 errors.append(f"{label}.{hints_field} must be an array of objects")
+        standards = context.get("meal_standards", [])
+        if not isinstance(standards, list) or any(not isinstance(item, dict) for item in standards):
+            errors.append(f"{label}.meal_standards must be an array of objects")
+        else:
+            for s_index, standard in enumerate(standards):
+                s_label = f"{label}.meal_standards[{s_index}]"
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", clean(standard.get("date"))):
+                    errors.append(f"{s_label}.date must be YYYY-MM-DD")
+                cap_text = clean(standard.get("daily_cap"))
+                try:
+                    if Decimal(cap_text) < 0:
+                        raise ValueError
+                except (InvalidOperation, ValueError):
+                    errors.append(f"{s_label}.daily_cap must be a non-negative decimal amount")
     return errors
 
 
@@ -407,6 +422,7 @@ def load_context(path: Path | None) -> tuple[list[dict[str, Any]], str, list[dic
         item.setdefault("status", "draft")
         item.setdefault("meal_hints", [])
         item.setdefault("expense_hints", [])
+        item.setdefault("meal_standards", [])
         normalized.append(item)
     return normalized, "", []
 

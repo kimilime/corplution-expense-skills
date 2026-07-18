@@ -13,7 +13,8 @@
       "travel_buffer_days": 1,
       "status": "draft",
       "meal_hints": [],
-      "expense_hints": []
+      "expense_hints": [],
+      "meal_standards": []
     }
   ]
 }

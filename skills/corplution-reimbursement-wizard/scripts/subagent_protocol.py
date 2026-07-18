@@ -156,7 +156,7 @@ GATE_CHALLENGER_UNIT_PACKET_FIELDS = COMMON_UNIT_PACKET_FIELDS + (
 PROJECT_CONTEXT_PACKET_FIELDS = (
     "context_id", "date_start", "date_end", "city", "cities", "client_name",
     "client_charge_code", "project_description", "user_notes", "travel_buffer_days", "status",
-    "local_match_keywords", "meal_hints", "expense_hints",
+    "local_match_keywords", "meal_hints", "expense_hints", "meal_standards",
 )
 QUESTION_PACKET_FIELDS = (
     "question_id", "question_type", "status", "blocking", "unit_ids", "user_nos", "hint_ids",

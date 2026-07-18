@@ -282,5 +282,36 @@ class MainDegradeRouting(unittest.TestCase):
         self.assertIn("REFUSED", err)
 
 
+class EventMealStandardPacket(unittest.TestCase):
+    """The auditors read Stage-2 units, so the one-off event meal standards must
+    reach them through the project-context packet, not writer-computed row fields."""
+
+    def test_project_context_packet_carries_meal_standards(self):
+        self.assertIn("meal_standards", sp.PROJECT_CONTEXT_PACKET_FIELDS)
+
+    def test_compact_snapshot_includes_declared_standards(self):
+        allocation = {
+            "allocation_units": [{"unit_id": "UNIT-001", "user_no": "1", "unit_ref": "abc123"}],
+            "project_contexts": [{
+                "context_id": "CTX-003",
+                "date_start": "2026-07-17",
+                "date_end": "2026-07-18",
+                "city": "上海",
+                "client_name": "年会",
+                "client_charge_code": "CORP-2026-ADMIN",
+                "meal_standards": [
+                    {"date": "2026-07-17", "daily_cap": "60.00", "label": "年会自理餐标"},
+                    {"date": "2026-07-18", "daily_cap": "150.00", "label": "年会自理餐标"},
+                ],
+            }],
+        }
+        for role in ("gate_challenger", "mirror_warden"):
+            snapshot = sp._compact_task_snapshot(role, allocation, {"documents": []})
+            ctx = snapshot["project_contexts"][0]
+            self.assertIn("meal_standards", ctx, role)
+            dates = {entry.get("date") for entry in ctx["meal_standards"]}
+            self.assertEqual(dates, {"2026-07-17", "2026-07-18"}, role)
+
+
 if __name__ == "__main__":
     unittest.main()

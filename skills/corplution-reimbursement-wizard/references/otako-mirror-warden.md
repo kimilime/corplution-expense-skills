@@ -14,7 +14,7 @@ Return exactly one UTF-8 JSON object matching the result contract in the task pa
 
 Complete every coverage check in the packet, even when the result is `not_applicable`:
 
-- `evidence_attribution`: every included expense's project/client/charge-code is supported by concrete evidence — route, endpoint, city, date, itinerary, or an explicit applicant statement — not merely a plausible city/date coincidence.
+- `evidence_attribution`: every included expense's project/client/charge-code is supported by concrete evidence — route, endpoint, city, date, itinerary, or an explicit applicant statement — not merely a plausible city/date coincidence. When a meal's cap derives from a declared event standard (`project_contexts[].meal_standards`), treat that declaration as an explicit applicant statement: verify the event actually occurred on the declared dates and that meals charged to it genuinely belong to it (matching `project_context_id` + `expense_date`). Flag a meal that borrows an event standard from a date or context it does not belong to. Do not recompute the cap — that is the deterministic writer's and Kaede's lens.
 - `journey_coherence`: flights, railway chains, hotels, and rides form a coherent chronological journey. No orphaned leg, no impossible overlap (two cities at once), no hotel night outside the trip window.
 - `date_route_consistency`: expense dates, printed travel dates, hotel stay dates, and ride timestamps are mutually consistent and match the trip the expense is assigned to. Invoice dates are not reliable occurrence dates.
 - `amount_evidence_match`: each claimed and reimbursable amount matches the invoice/evidence; flag partial reimbursements with no stated reason and any invoice/claim amount mismatch.
