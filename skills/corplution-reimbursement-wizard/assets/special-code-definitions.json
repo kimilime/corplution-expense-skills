@@ -1,0 +1,8 @@
+{
+  "schema_version": "special_code_definitions.v1",
+  "_comment": "年度 charge code 定义（BD/ADMIN）。到新财年时用 `python scripts/special_codes.py set-year 2027` 或 `set --admin CORP-2027-ADMIN --bd CORP-2027-BD` 更新，全流程会从这里读。仅定义 code 字符串，不改变分配逻辑：通讯费仍自动进 ADMIN，其他 ADMIN 事项（年会/半年会/客户会等）仍需用户提及才归入。缺失或损坏时回退到 policy.toml。",
+  "codes": {
+    "shared_bd": "CORP-2026-BD",
+    "admin": "CORP-2026-ADMIN"
+  }
+}

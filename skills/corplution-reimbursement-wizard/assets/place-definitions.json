@@ -1,0 +1,14 @@
+{
+  "schema_version": "place_definitions.v1",
+  "_comment": "自定义地点↔类型记忆，跨月复用。Stage 2 生成打车备注时先读本文件命中即采用；用户在对话中确认某地点类型后会自动追加到这里。place_type 取值：公司/机场/火车站/酒店/客户/家/餐厅/其他。每条含 name（必填）、place_type（必填）、可选 aliases（别名数组）/client_name（客户名）/note/added_on。加载失败会 fail-open 回退到脚本内置默认，不阻断报销。",
+  "places": [
+    {
+      "name": "友力国际大厦",
+      "aliases": [
+        "江宁路"
+      ],
+      "place_type": "公司",
+      "note": "上海总部办公室"
+    }
+  ]
+}

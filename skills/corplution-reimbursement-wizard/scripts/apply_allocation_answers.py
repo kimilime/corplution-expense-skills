@@ -18,6 +18,10 @@ CLOSED_UNIT_STATUSES = {"confirmed", "fixed", "dropped", "excluded", "non_reimbu
 ALLOWED_UNIT_STATUSES = OPEN_STATUSES | CLOSED_UNIT_STATUSES
 # Policy values come from assets/policy.toml; edit that file when policy changes.
 from policy_config import load_policy
+# Persistent place -> place-type memory: confirmed taxi endpoints are written back
+# so next month's allocation resolves them without re-asking.
+import place_config
+from place_config import PlaceBook
 import allocation_generations
 import integrity
 import text_safety
@@ -906,6 +910,33 @@ def validate_update(update: dict[str, Any], lenient: bool) -> list[str]:
     return errors
 
 
+def collect_place_memory(
+    unit: dict[str, Any], update: dict[str, Any], sink: list[dict[str, Any]]
+) -> None:
+    """Queue user-confirmed taxi endpoints for the persistent place memory.
+
+    Only when THIS answer explicitly set a place type (canonical field or the
+    `origin_type`/`destination_type` Composer alias) do we record the raw endpoint
+    text -> confirmed type. Model auto-guesses from create_units are never recorded.
+    """
+    endpoints = (
+        ("origin", "origin_place_type", ("origin_place_type", "origin_type")),
+        ("destination", "destination_place_type", ("destination_place_type", "destination_type")),
+    )
+    for text_field, type_field, answer_keys in endpoints:
+        if not any(key in update for key in answer_keys):
+            continue
+        name = clean(unit.get(text_field))
+        place_type = clean(unit.get(type_field))
+        if not name or not place_type:
+            continue
+        # Skip public places (airport/rail/hotel) — they are inferred without any
+        # memory, so memorizing 虹桥T2 -> 机场 would only clutter the file.
+        if place_config.public_place_type(name):
+            continue
+        sink.append({"name": name, "place_type": place_type})
+
+
 def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: bool) -> dict[str, Any]:
     errors = validate_update(update, lenient)
     if errors:
@@ -1506,6 +1537,7 @@ def apply_answers(
     merge_contexts(payload, context_updates)
     changes = []
     touched_units: set[str] = set()
+    place_memory: list[dict[str, Any]] = []
     for update in unit_updates:
         unit_refs = as_list(update.get("unit_ids") or update.get("unit_id") or update.get("unit_nos") or update.get("unit_no"))
         if not unit_refs:
@@ -1525,6 +1557,7 @@ def apply_answers(
             signal_error = guard_meal_reclass_signal(unit, update, was_meal)
             if signal_error:
                 raise ValueError(signal_error)
+            collect_place_memory(unit, update, place_memory)
             touched_units.add(unit["unit_id"])
 
     refresh_rail_chain_assignments(payload, touched_units)
@@ -1575,6 +1608,12 @@ def apply_answers(
         integrity.stamp(payload, "apply_allocation_answers.py")
         write_json(output_path, payload)
         markdown_path.write_text(build_markdown(payload), encoding="utf-8")
+        # Fail-open write-back: remember user-confirmed taxi endpoints for next month.
+        # A memory-write failure prints an advisory and never changes the exit code.
+        if place_memory:
+            added = PlaceBook.load().remember(place_memory)
+            if added:
+                print(f"NOTE: memorized {added} confirmed place->type mapping(s) for future runs.")
         remaining = [q for q in payload.get("questions", []) if q.get("status", "open") == "open"]
         if remaining:
             print(f"NEXT: {len(remaining)} blocking question(s) still open — relay them to the user "

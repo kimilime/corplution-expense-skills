@@ -17,12 +17,24 @@ from typing import Any
 # Policy numbers and year-coded charge codes come from assets/policy.toml;
 # edit that file (not this one) when company policy changes.
 from policy_config import load_policy, policy_path
+# Persistent, cross-run place -> place-type memory (assets/place-definitions.json).
+import place_config
+from place_config import PlaceBook
 import allocation_generations
 import hint_refs
 import integrity
 import unit_refs
 
 _POLICY = load_policy()
+_PLACE_BOOK: PlaceBook | None = None
+
+
+def get_place_book() -> PlaceBook:
+    """Lazily load the place-definitions memory (fails open to built-ins)."""
+    global _PLACE_BOOK
+    if _PLACE_BOOK is None:
+        _PLACE_BOOK = PlaceBook.load()
+    return _PLACE_BOOK
 
 RAIL_CHAIN_MAX_DEPARTURE_GAP_HOURS = 18
 RAIL_CHAIN_HIGH_CONFIDENCE_HOURS = 12
@@ -521,18 +533,26 @@ def normalize_taxi_column(unit: dict[str, Any]) -> None:
         unit["final_template_column"] = formal_taxi_column(unit)
 
 
-def classify_place_type(place: str, contexts: list[dict[str, Any]]) -> tuple[str, str, bool]:
+def classify_place_type(
+    place: str,
+    contexts: list[dict[str, Any]],
+    place_book: PlaceBook | None = None,
+) -> tuple[str, str, bool]:
     text = clean(place)
     if not text:
         return "", "low", True
-    if any(k in text for k in ["\u6c5f\u5b81\u8def", "\u53cb\u529b\u56fd\u9645\u5927\u53a6"]):
-        return C["company"], "high", False
-    if any(k in text for k in ["\u673a\u573a", "\u822a\u7ad9\u697c", "T1", "T2", "T3", "3F", "\u51fa\u53d1", "\u5230\u8fbe"]):
-        return C["airport"], "high", False
-    if any(k in text for k in ["\u706b\u8f66\u7ad9", "\u9ad8\u94c1\u7ad9", "\u8f66\u7ad9", "\u8679\u6865\u7ad9"]):
-        return C["railway_station"], "high", False
-    if any(k in text for k in ["\u9152\u5e97", "\u5bbe\u9986", "\u4e9a\u6735", "\u5168\u5b63", "\u559c\u6765\u767b", "\u6c49\u5ead"]):
-        return C["hotel"], "high", False
+    # Consult the persistent place memory first: a user-declared private place
+    # (office, home, a client's site) is authoritative \u2014 high confidence, no
+    # confirmation. No private facts are hard-coded here anymore; they live in
+    # assets/place-definitions.json.
+    remembered = (place_book or get_place_book()).lookup(text)
+    if remembered is not None:
+        return remembered
+    # Public places (airport/rail station/hotel) are general knowledge \u2014 inferred
+    # without any memory (\u8679\u6865T2 -> \u673a\u573a), so they are neither stored nor asked.
+    public = place_config.public_place_type(text)
+    if public is not None:
+        return public, "high", False
     for ctx in contexts:
         client = clean(ctx.get("client_name"))
         if client and client in text:
@@ -3130,7 +3150,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--extraction", required=True, help="Path to process/invoice-extraction.json.")
     parser.add_argument("--context", help="Optional project context JSON or text file.")
     parser.add_argument("--output", "-o", default="process", help="Output folder.")
+    parser.add_argument(
+        "--place-definitions",
+        help="Optional override path for the place -> place-type memory JSON "
+        "(default: assets/place-definitions.json).",
+    )
     args = parser.parse_args(argv)
+
+    if args.place_definitions:
+        global _PLACE_BOOK
+        _PLACE_BOOK = PlaceBook.load(Path(args.place_definitions))
 
     extraction_path = Path(args.extraction)
     extraction = load_json(extraction_path)

@@ -424,11 +424,40 @@ Do not use the verbose evidence note from stage 1 as the final reimbursement not
 
 ## Place Type Classification For Taxi Notes
 
+### Persistent Place Memory (read first, remembered on confirm)
+
+Custom place↔type relationships that only this applicant knows — 友力国际大厦=公司,
+某某公寓=家, 中关村产业园=某客户 — are kept in a persistent, cross-run memory file at
+`assets/place-definitions.json` (schema `place_definitions.v1`). Allocation consults it
+**before** any heuristic or question: a place recorded there is authoritative and resolves
+as `高` confidence with no confirmation, so private locations are not re-asked every month.
+
+- The file survives the per-run `process/` reset because it lives under the skill assets dir.
+  No private facts are hard-coded anywhere: the office 友力国际大厦=公司 lives only in this JSON.
+- **Public places need no memory.** Airports, rail stations, and hotels (虹桥T2→机场,
+  虹桥火车站→火车站, 全季酒店→酒店) are general knowledge, classified by keyword heuristics
+  (`place_config.public_place_type`). They are never stored in the file and never written back —
+  only private POIs (office, home, a specific client's site) go in the memory.
+- Each entry is `{ "name", "place_type", "aliases"?, "client_name"?, "note"? }`; `place_type`
+  must be one of `公司/机场/火车站/酒店/客户/家/餐厅/其他`. Matching is case-insensitive
+  substring of `name` or any alias against the ride endpoint text.
+- **Write-back is automatic.** When the applicant confirms a taxi endpoint's type in chat and
+  that answer is applied through Composer/Updater (an explicit `origin_type`/`destination_type`,
+  i.e. canonical `origin_place_type`/`destination_place_type`), the updater records the raw
+  endpoint text → confirmed type into `place-definitions.json`, deduped by name+type, skipping
+  any public place. Next month the same private POI resolves silently. Model auto-guesses are
+  never memorized — only applicant-confirmed answers.
+- The file is fully user/agent-editable: edit the JSON directly, or use the CLI —
+  `python scripts/place_config.py add --name 友力国际大厦 --type 公司 --alias 江宁路`,
+  `python scripts/place_config.py list`, `python scripts/place_config.py remove --name 友力国际大厦`.
+- Loading fails open: a missing or malformed file degrades to an EMPTY memory (unknown places are
+  simply asked as usual) and prints a non-blocking advisory; it never blocks allocation.
+
 Classify taxi/Didi/Gaode origin and destination into place types:
 
 | Evidence | Place Type |
 | --- | --- |
-| `江宁路`, `友力国际大厦`, company office aliases, or known office address | `公司` |
+| Any place recorded in `assets/place-definitions.json` (name or alias) | its recorded type (authoritative) |
 | Airport names, terminals, arrivals, departures, or `机场` | `机场` |
 | Railway stations, high-speed rail stations, train stations, or `火车站` | `火车站` |
 | Hotel names or addresses that clearly look like lodging | `酒店` |
@@ -442,6 +471,10 @@ Use LLM judgment for obvious place types, but do not guess sensitive or ambiguou
 ```text
 这笔打车的出发地/目的地「XXX」我无法确定类型，应该写成 公司/客户/酒店/机场/火车站/家/餐厅/其他 哪一种？
 ```
+
+Once the user answers, apply it through Composer/Updater with `origin_type`/`destination_type`
+so the confirmed mapping is written back to `assets/place-definitions.json` automatically. Do
+not re-ask a place already resolved by the persistent memory.
 
 Store:
 
