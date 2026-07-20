@@ -620,6 +620,17 @@ def stage3_rule_errors(unit: dict[str, Any]) -> list[str]:
         if policy_error:
             errors.append(policy_error)
 
+    # A doc/template placeholder such as <ADMIN_CODE>/<BD_CODE>/CORP-<FY>-ADMIN must
+    # never reach the workbook. Angle brackets never appear in a real fiscal-year
+    # code, so treat any as an unresolved placeholder and block generation.
+    code_text = clean(unit.get("client_charge_code"))
+    if "<" in code_text or ">" in code_text:
+        errors.append(
+            f"client_charge_code still contains a template placeholder ({code_text!r}); "
+            "use the current fiscal-year BD/ADMIN code from assets/special-code-definitions.json "
+            "(roll it with special_codes.py set-year), never a <...> placeholder"
+        )
+
     if not normalized_note_base(unit) and category != "other":
         errors.append("final note cannot be derived from the confirmed allocation")
     if parse_date(unit.get("expense_date")) is None:

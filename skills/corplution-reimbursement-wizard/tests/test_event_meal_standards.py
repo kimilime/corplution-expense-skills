@@ -1,6 +1,8 @@
 from __future__ import annotations
 
+import json
 import sys
+import tempfile
 import unittest
 from pathlib import Path
 
@@ -11,6 +13,7 @@ sys.path.insert(0, str(SCRIPTS))
 import write_reimbursement_template as wr  # noqa: E402
 import check_workflow_status as cw  # noqa: E402
 import allocate_expenses  # noqa: E402
+import integrity  # noqa: E402
 
 
 def meal_row(*, ctx, date, amount, attendees="", note="", meal_context=""):
@@ -140,18 +143,43 @@ class EventMealStandardTests(unittest.TestCase):
         self.assertEqual(c["policy_name"], "年会自理餐标")
         self.assertTrue(any("CTX-003" in b for b in c["policy_basis"]))
 
-    def test_mirror_parity_check_workflow_status(self):
-        # The status checker mirrors the writer's cap logic; assert parity on the
-        # over-cap-without-attendees case.
+    def test_writer_event_cap_over_without_attendees(self):
+        # Event-declared meal-cap logic lives solely in write_reimbursement_template.
+        # Assert the writer flags the over-cap-without-attendees case.
         rows_w = [meal_row(ctx="CTX-003", date="2026-07-17", amount="70.00")]
-        cw.annotate_event_meal_standards(rows_w, NIANHUI)
-        cw.annotate_meal_policies(rows_w)
-        checks = cw.meal_daily_cap_checks(rows_w)
-        c = next(c for c in checks if c["date"] == "20260717")
+        checks = annotate_and_check(rows_w, NIANHUI)
+        c = check_for_date(checks, "20260717")
         self.assertEqual(c["cap"], "60.00")
         self.assertEqual(c["over_by"], "10.00")
         self.assertTrue(c["requires_user_confirmation"])
         self.assertTrue(c["event_declared"])
+
+    def test_status_engine_surfaces_event_meal_flag(self):
+        # Option 2: the status engine never recomputes caps; it reads the writer's
+        # final-expense-rows.meal_daily_cap_checks and surfaces event-declared /
+        # confirmation-required items. Build a stamped Stage 3 artifact and assert
+        # inspect_workflow relays the flag rather than re-deriving it.
+        checks = annotate_and_check(
+            [meal_row(ctx="CTX-003", date="2026-07-17", amount="70.00")], NIANHUI
+        )
+        rows_payload = {
+            "schema_version": "final_expense_rows.v1",
+            "rows": [],
+            "meal_daily_cap_checks": checks,
+            "blocking_policy_checks": 1,
+        }
+        integrity.stamp(rows_payload, "write_reimbursement_template.py")
+        with tempfile.TemporaryDirectory() as d:
+            pdir = Path(d) / "process"
+            pdir.mkdir()
+            (pdir / "final-expense-rows.json").write_text(
+                json.dumps(rows_payload, ensure_ascii=False), encoding="utf-8"
+            )
+            state = cw.inspect_workflow(pdir, Path(d) / "output")
+        self.assertGreaterEqual(
+            state["stages"]["workbook"]["event_meal_standard_flag_count"], 1
+        )
+        self.assertTrue(any("事件餐标" in line for line in state["lines"]))
 
 
 class ContextSchemaTests(unittest.TestCase):

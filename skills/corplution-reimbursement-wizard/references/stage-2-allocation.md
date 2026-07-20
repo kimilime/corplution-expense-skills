@@ -96,7 +96,9 @@ Project identity is composite:
 client_name + city + date_start/date_end + client_charge_code + project_description
 ```
 
-Never use `client_charge_code` alone as the project key. Multiple distinct projects may share `CORP-2026-BD` while belonging to different clients.
+Never use `client_charge_code` alone as the project key. Multiple distinct projects may share `<BD_CODE>` while belonging to different clients.
+
+> **Fiscal-year codes:** `<ADMIN_CODE>` and `<BD_CODE>` are placeholders for the current fiscal-year charge codes, defined in `assets/special-code-definitions.json` and rolled each fiscal year with `python scripts/special_codes.py set-year <year>`. Substitute the current codes; never write a literal `<...>` placeholder or hardcode a year — Stage 3 rejects any charge code containing `<`/`>`.
 
 When the user provides concrete meal or expense notes, translate them into structured hints inside the relevant project context whenever possible:
 
@@ -179,7 +181,7 @@ For ordinary meal, taxi summary, hotel-without-stay-date, and `unknown` invoices
 
 For each allocation unit, score candidate project contexts using:
 
-- Candidate filter: for hotel, meal, taxi, Didi/Gaode, railway, and flight auto-matching, exclude `CORP-2026-ADMIN` contexts before city/date scoring. Admin is not a Shanghai project.
+- Candidate filter: for hotel, meal, taxi, Didi/Gaode, railway, and flight auto-matching, exclude `<ADMIN_CODE>` contexts before city/date scoring. Admin is not a Shanghai project.
 - Date fit: inside project date range, or within the allowed travel buffer for airport/station transfer.
 - City fit: exact city match, destination city match, route endpoint match, or strong textual city evidence.
 - Expense-type logic: taxi, travel, hotel, meal, mobile, other.
@@ -203,7 +205,7 @@ Use type-specific pre-allocation rules. Do not apply one generic city/date rule 
 - Railway: before per-ticket matching, group connected ticket segments into a journey chain when travel dates/times are ordered and each intermediate destination station/city matches the next origin station/city. Allocate the chain as one journey; do not treat a transfer station as a separate project destination.
 - Standalone flight/rail: match by route destination and travel date, allowing a reasonable +/- 1 day project buffer.
 - For taxi/ride transfers, do not require the ride city to equal the project city when the ride is clearly to/from an airport or railway station. A Shanghai ride to Hongqiao station/airport can belong to the out-of-town destination project if it supports that journey.
-- Never assign unmatched taxi/travel/hotel/meal to `CORP-2026-ADMIN`, Client `通讯费`, or the mobile amount column. If transfer logic does not identify a project, ask the user.
+- Never assign unmatched taxi/travel/hotel/meal to `<ADMIN_CODE>`, Client `通讯费`, or the mobile amount column. If transfer logic does not identify a project, ask the user.
 - Other and unknown: do not pre-match by invoice city. Ask the user for accounting note and project/admin matter because issuer city can be misleading for SaaS, online meeting, association, platform, or generic service expenses. For pure `other`, temporarily use the invoice issue date as Date and advise the user to confirm/correct it; for `unknown`, ask for the actual date until reclassified.
 
 Record deterministic pre-allocation in `auto_project_match` with values such as `hotel_stay_dates`, `hotel_unique_city`, `unique_non_shanghai_city`, `taxi_explicit_project_evidence`, `taxi_transfer_to_next_project`, `taxi_transfer_matches_travel_unit`, `taxi_city_date`, `rail_transfer_chain_destination`, `rail_transfer_chain_return`, `travel_destination_date`, or `travel_route_date`, and explain the basis in `match_reason`.
@@ -365,7 +367,7 @@ If the user says only part of a meal invoice should be reimbursed, keep `amount`
 
 Assign mobile/telecom expenses to:
 
-- `client_charge_code`: `CORP-2026-ADMIN`
+- `client_charge_code`: `<ADMIN_CODE>`
 - `client_name`: `通讯费`
 - confidence: `fixed`
 
@@ -379,7 +381,7 @@ Use the billing period, not the invoice issue date, when available. For example,
 
 ### Admin Matter Client Names
 
-Never use `Admin` as the final `client_name` for `CORP-2026-ADMIN` rows. The Client column should describe the matter:
+Never use `Admin` as the final `client_name` for `<ADMIN_CODE>` rows. The Client column should describe the matter:
 
 - Mobile/telecom: use `通讯费` automatically and do not ask the user.
 - Other admin expenses: use the specific matter when known, such as `年会`, `半年会`, `客户会`, or `行业协会会议`.
@@ -387,7 +389,7 @@ Never use `Admin` as the final `client_name` for `CORP-2026-ADMIN` rows. The Cli
 
 This prompt is advisory only. Do not block stage 3 Excel output merely because the admin matter name is still the default.
 
-`CORP-2026-ADMIN` is not a fallback bucket. Taxi, Didi/Gaode, railway, flight, hotel, and meal expenses must not be assigned to `CORP-2026-ADMIN` or Client `通讯费` unless the source category is genuinely mobile/telecom. If a transport item cannot be matched, keep it in the blocking question queue.
+`<ADMIN_CODE>` is not a fallback bucket. Taxi, Didi/Gaode, railway, flight, hotel, and meal expenses must not be assigned to `<ADMIN_CODE>` or Client `通讯费` unless the source category is genuinely mobile/telecom. If a transport item cannot be matched, keep it in the blocking question queue.
 
 ### Other
 
@@ -919,6 +921,6 @@ Stage 2 is complete when:
 - Every included allocation unit has a reliable `expense_date`, a pure-`other` provisional invoice-date `expense_date` with an advisory review item, or a blocking open question asking the applicant for the actual date to record.
 - Every distinct applicant hint is represented once in `expense_hint_reconciliation` and is either uniquely matched to active evidence, covered by an identified invoice, or explicitly marked `not_reimbursed`; `pending_invoice` is not Stage 2 complete.
 - Meals have actual date/project/attendee details when needed.
-- `CORP-2026-BD` collisions are separated by client/city/date context.
+- `<BD_CODE>` collisions are separated by client/city/date context.
 - Substitute invoices are marked and screenshot requirements are recorded.
 - The Markdown and JSON allocation files agree.

@@ -86,5 +86,31 @@ class PolicyIntegrationTests(unittest.TestCase):
         self.assertTrue(policy.shared_bd_code)
 
 
+class ChargeCodePlaceholderGuardTests(unittest.TestCase):
+    """A doc/template placeholder code must be intercepted before the workbook."""
+
+    def _unit(self, code: str) -> dict:
+        return {
+            "source_category": "other",
+            "client_charge_code": code,
+            "expense_date": "2026-07-17",
+            "final_note": "会议费",
+        }
+
+    def test_stage3_blocks_angle_bracket_placeholder(self) -> None:
+        import write_reimbursement_template as wr
+        for code in ("<ADMIN_CODE>", "<BD_CODE>", "CORP-<FY>-ADMIN"):
+            errors = wr.stage3_rule_errors(self._unit(code))
+            self.assertTrue(
+                any("placeholder" in e for e in errors),
+                f"expected placeholder block for {code!r}",
+            )
+
+    def test_stage3_allows_real_fiscal_year_code(self) -> None:
+        import write_reimbursement_template as wr
+        errors = wr.stage3_rule_errors(self._unit("CORP-2026-ADMIN"))
+        self.assertFalse(any("placeholder" in e for e in errors))
+
+
 if __name__ == "__main__":
     unittest.main()

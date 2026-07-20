@@ -29,6 +29,8 @@ If a new current review is accepted after a workbook was generated, Stage 3 beco
 
 ## Blocking Checks Before Writing
 
+> **Fiscal-year codes:** `<ADMIN_CODE>` and `<BD_CODE>` are placeholders for the current fiscal-year charge codes, defined in `assets/special-code-definitions.json` and rolled each fiscal year with `python scripts/special_codes.py set-year <year>`. Substitute the current codes; never write a literal `<...>` placeholder or hardcode a year — Stage 3 rejects any charge code containing `<`/`>`.
+
 Do not write the final workbook until:
 
 - `Requester` is known.
@@ -37,7 +39,7 @@ Do not write the final workbook until:
 - Open questions that affect client, charge code, final template column, amount, date, note, or proof number are resolved.
 - No included unit has `date_required: true`, and no included unit has a blank `expense_date`. Pure `other` rows may use a provisional invoice-date `expense_date` when `date_is_provisional: true`; this is advisory, not blocking.
 - No non-mobile row uses Client `通讯费`, final column `mobile`, or a note containing `通讯费`.
-- No taxi/travel row is assigned to `CORP-2026-ADMIN`. Admin is not a fallback for unmatched transport.
+- No taxi/travel row is assigned to `<ADMIN_CODE>`. Admin is not a fallback for unmatched transport.
 - Standalone flight/rail whose route destination uniquely matches a project context is assigned to that destination project, not the origin project.
 - Every active railway journey chain has at least two continuous ticket segments, one shared project assignment, no open whole-chain question, and current length/member/route metadata. A dropped or corrected segment requires Stage 2 to rebuild the chain. Skip per-ticket destination-project enforcement for intermediate transfer segments; validate the chain as a whole instead.
 - Every applicant expense hint has a current reverse-reconciliation entry. Valid final outcomes are active evidence matched through `matched_existing`, identified `covered_by_invoice`, automatic unique matching, or `not_reimbursed`. `pending_invoice` remains blocking; a matched hint whose unit was dropped must be resolved again.
@@ -54,7 +56,7 @@ Write these fields:
 | --- | --- |
 | `Date (YYYYMMDD)` | confirmed, reliable, or pure-`other` provisional `expense_date` formatted as `YYYYMMDD`; do not fall back to invoice issue date for non-`other` items |
 | `Requester` | ask user if missing |
-| `Client` | confirmed `client_name`; for `CORP-2026-ADMIN`, normalize mobile to `通讯费` and other missing/admin placeholders to `项目、调研以外的其他费用` |
+| `Client` | confirmed `client_name`; for `<ADMIN_CODE>`, normalize mobile to `通讯费` and other missing/admin placeholders to `项目、调研以外的其他费用` |
 | `Client Charge Code` | confirmed `client_charge_code` |
 | `Expenses Nature` | formal local/trip rule below |
 | `Note` | confirmed `final_note` from stage 2 |
@@ -212,9 +214,9 @@ The workbook is organized by project blocks. A project is identified by:
 Client + Client Charge Code
 ```
 
-If two projects share the same `Client Charge Code` but have different `Client` values, treat them as separate project blocks. This is common when several pending projects use `CORP-2026-BD`.
+If two projects share the same `Client Charge Code` but have different `Client` values, treat them as separate project blocks. This is common when several pending projects use `<BD_CODE>`.
 
-For `CORP-2026-ADMIN`, do not group all rows under `Admin`. Treat the Client value as the admin matter name. Mobile rows should group under `通讯费 / CORP-2026-ADMIN`; other admin rows should use the specific matter name when provided, or `项目、调研以外的其他费用 / CORP-2026-ADMIN` as the non-blocking default.
+For `<ADMIN_CODE>`, do not group all rows under `Admin`. Treat the Client value as the admin matter name. Mobile rows should group under `通讯费 / <ADMIN_CODE>`; other admin rows should use the specific matter name when provided, or `项目、调研以外的其他费用 / <ADMIN_CODE>` as the non-blocking default.
 
 For each project block:
 
@@ -631,7 +633,7 @@ Before delivering the workbook:
 - `Status` evaluates to `TRUE` only when Total equals Grand Total.
 - Didi/Gaode rides are split into ride rows and share the linked invoice proof number.
 - No Didi/Gaode summary invoice is also written as a duplicate row.
-- No taxi/travel/meal/hotel row falls back to Client `通讯费`, mobile column, or `CORP-2026-ADMIN`.
+- No taxi/travel/meal/hotel row falls back to Client `通讯费`, mobile column, or `<ADMIN_CODE>`.
 - Meal amount columns follow the formal invoice/restaurant city rule: Shanghai -> `meal`; non-Shanghai -> `travel`.
 - Taxi/Didi/Gaode amount columns follow the ride city rule: Shanghai -> `taxi`; non-Shanghai -> `travel`.
 - Taxi/Didi/Gaode final notes do not contain literal `出发地类型` or `目的地类型` placeholders.

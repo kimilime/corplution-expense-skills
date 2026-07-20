@@ -225,10 +225,12 @@ Stage 2 must normalize final notes using `references/stage-2-allocation.md`. Kee
 
 Read `references/stage-2-allocation.md` before allocating expenses. Keep these core rules in mind:
 
-- Treat project identity as `client_name + city + date_range + charge_code + user_description`; do not treat charge code alone as unique because many pending projects may share `CORP-2026-BD`.
+> **Fiscal-year codes:** `<ADMIN_CODE>` and `<BD_CODE>` are placeholders for the current fiscal-year charge codes, defined in `assets/special-code-definitions.json` and rolled each fiscal year with `python scripts/special_codes.py set-year <year>`. Substitute the current codes; never write a literal `<...>` placeholder or hardcode a year — Stage 3 rejects any charge code containing `<`/`>`.
+
+- Treat project identity as `client_name + city + date_range + charge_code + user_description`; do not treat charge code alone as unique because many pending projects may share `<BD_CODE>`.
 - Use LLM judgment for first-pass matching, but ask the user about low-confidence or conflicting items.
 - Treat `invoice.issue_date` as evidence, not a default occurrence date. Reliable occurrence dates are: printed flight/rail travel date, printed hotel check-in/check-out dates, Didi/Gaode ride datetime from a trip report, and mobile month-end from the billing period or invoice month. For pure `other` expenses, you may temporarily use `invoice.issue_date` as `expense_date`, but mark it provisional and show a non-blocking advisory for user review.
-- Exclude `CORP-2026-ADMIN` contexts from hotel/meal/taxi/travel automatic city/date scoring. Admin is not a Shanghai project and must not win fallback matching.
+- Exclude `<ADMIN_CODE>` contexts from hotel/meal/taxi/travel automatic city/date scoring. Admin is not a Shanghai project and must not win fallback matching.
 - Match hotels first by hotel city plus stay dates; when stay dates or project dates are missing, use city uniqueness only for project pre-allocation, and still ask for missing nights/check-in/check-out needed for hotel caps.
 - Match meals by explicit user-provided meal notes when available. Parse notes such as `6.1 德克士 61.8` into meal hints, then match by combined amount/date/merchant evidence instead of any single strict field. Otherwise treat invoice dates as unreliable and auto-assign only when a non-Shanghai invoice city has exactly one project in the period. Show inferred meals as advisory so the user can batch-correct dates/attendees/amounts.
 - Reconcile user notes in both directions. Every distinct structured expense hint must point to an active expense unit, be covered by an identified invoice, or carry an explicit `not_reimbursed` decision. A `pending_invoice` decision is valid progress but remains blocking. Never let an unmatched note disappear merely because no unit was created for it.
@@ -245,9 +247,9 @@ Read `references/stage-2-allocation.md` before allocating expenses. Keep these c
 - Match standalone railway tickets and flight travel by route destination and travel date with a reasonable +/- 1 day project buffer.
 - When travel connects two project cities, assign it to the destination/project being traveled to, not the origin project. Never override this merely because the origin station city matches a previous project.
 - Do not pre-match `other` or `unknown` by invoice city. Ask the user; invoice issuer city can be misleading for SaaS, online meetings, associations, and other services.
-- Allocate mobile expenses to `CORP-2026-ADMIN` with `client_name = 通讯费`, not `Admin`; fill Date as that month's last day.
-- Never use `CORP-2026-ADMIN`, `通讯费`, or the mobile amount column as a fallback for unmatched taxi/travel/meal/hotel expenses. Unmatched transport remains a blocking question unless a transfer/travel rule matches it to a project.
-- For other `CORP-2026-ADMIN` expenses, use a specific matter name as `client_name` when known, such as `年会`, `半年会`, `客户会`, or `行业协会会议`; if missing, use `项目、调研以外的其他费用` and show a non-blocking chat prompt so the applicant can refine it.
+- Allocate mobile expenses to `<ADMIN_CODE>` with `client_name = 通讯费`, not `Admin`; fill Date as that month's last day.
+- Never use `<ADMIN_CODE>`, `通讯费`, or the mobile amount column as a fallback for unmatched taxi/travel/meal/hotel expenses. Unmatched transport remains a blocking question unless a transfer/travel rule matches it to a project.
+- For other `<ADMIN_CODE>` expenses, use a specific matter name as `client_name` when known, such as `年会`, `半年会`, `客户会`, or `行业协会会议`; if missing, use `项目、调研以外的其他费用` and show a non-blocking chat prompt so the applicant can refine it.
 - Ask about `other` and `unknown` expenses by default. For `other`, project/note/accounting treatment may still be blocking, but the date can temporarily use the invoice date with an advisory. For `unknown`, ask for the actual date unless the user reclassifies it as pure `other`.
 - Ask follow-up questions directly in the current conversation. Use `process/expense-allocation.md/json` as internal process files only; do not tell the user to inspect those files. Group repetitive uncertainties by expense type, such as one meal batch question listing all meal item numbers, files, invoice numbers, dates, amounts, and suggested projects.
 - If the user gives meal details in natural language, including "with X", "和X一起", "同事X", or dining counterparties, capture them into `attendees` even when the daily meal cap is not exceeded. Do not rely on the cap check as the only attendee collection point.
