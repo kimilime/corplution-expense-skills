@@ -147,7 +147,15 @@ class PlaceBook:
         return best[1], "high", False
 
     def remember(self, entries: list[dict[str, Any]], path: Path | None = None) -> int:
-        """Append new (name, place_type) pairs to the on-disk memory, deduped.
+        """Upsert (name -> place_type) mappings into the on-disk memory by NAME.
+
+        A place has exactly one current type, so this is an upsert keyed on name,
+        not an append keyed on (name, place_type): correcting a place's type
+        REPLACES the type on its existing record instead of leaving a stale second
+        row for the same name (which older builds did, and which `lookup` would then
+        resolve to the wrong, first-written type). Pre-existing duplicate names left
+        by that bug are healed here too — the last-written type wins, which is the
+        correction the user actually made.
 
         Fails open: on any error it prints an advisory and returns 0 without raising,
         so a memory-write problem can never change a caller's exit code.
@@ -166,27 +174,59 @@ class PlaceBook:
             places = payload.get("places")
             if not isinstance(places, list):
                 places = []
-            existing = {
-                (_clean(p.get("name")), _clean(p.get("place_type")))
-                for p in places
-                if isinstance(p, dict)
-            }
-            added = 0
-            for entry in candidates:
-                key = (entry["name"], entry["place_type"])
-                if key in existing:
+
+            # Collapse the file to one record per name, healing legacy duplicates.
+            # A later duplicate is treated as a correction: its type wins.
+            ordered: list[dict[str, Any]] = []
+            by_name: dict[str, dict[str, Any]] = {}
+            healed = False
+            for raw in places:
+                if not isinstance(raw, dict):
                     continue
-                existing.add(key)
-                places.append(entry)
-                added += 1
-            if not added:
+                name = _clean(raw.get("name"))
+                if not name:
+                    continue
+                if name in by_name:
+                    healed = True
+                    later_type = _clean(raw.get("place_type"))
+                    if later_type:
+                        by_name[name]["place_type"] = later_type
+                    for extra in ("aliases", "client_name", "note", "added_on"):
+                        if raw.get(extra):
+                            by_name[name][extra] = raw[extra]
+                    continue
+                by_name[name] = raw
+                ordered.append(raw)
+
+            changed = 0
+            for entry in candidates:
+                current = by_name.get(entry["name"])
+                if current is None:
+                    by_name[entry["name"]] = entry
+                    ordered.append(entry)
+                    changed += 1
+                    continue
+                if _clean(current.get("place_type")) != entry["place_type"]:
+                    current["place_type"] = entry["place_type"]
+                    changed += 1
+                # Preserve prior aliases/notes; add anything the new answer supplied.
+                merged_aliases = list(dict.fromkeys(
+                    [*current.get("aliases", []), *entry.get("aliases", [])]
+                ))
+                if merged_aliases:
+                    current["aliases"] = merged_aliases
+                for optional in ("client_name", "note", "added_on"):
+                    if entry.get(optional):
+                        current[optional] = entry[optional]
+
+            if not changed and not healed:
                 return 0
-            payload["places"] = places
+            payload["places"] = ordered
             target.parent.mkdir(parents=True, exist_ok=True)
             tmp = target.with_suffix(target.suffix + ".tmp")
             tmp.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
             os.replace(tmp, target)
-            return added
+            return changed
         except (OSError, UnicodeError, ValueError, json.JSONDecodeError) as exc:
             print(
                 f"ADVISORY: could not update place-definitions memory at {target} "

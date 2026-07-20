@@ -856,9 +856,9 @@ def inspect_workflow(
 
     AUDIT_ROLES = (
         ("mirror_warden", "Otako - Mirror Warden",
-         "reconcile the confirmed allocation against evidence before Stage 3"),
+         "precision-first factual reconciliation against claimed evidence before Stage 3"),
         ("gate_challenger", "Kaede - Gate Challenger",
-         "finance/audit pre-screen of the confirmed claim before Stage 3"),
+         "narrow explicit-policy and required-approval gate before Stage 3"),
     )
     audit_states = {}
     for _role, _display, _reason in AUDIT_ROLES:
@@ -904,9 +904,16 @@ def inspect_workflow(
         for _role, _display, _reason in AUDIT_ROLES:
             _st = audit_states[_role]
             if _st.get("current"):
+                _advisory_note = (
+                    "; advisory is informational only and needs no applicant reply"
+                    if int(_st.get("advisory_count", 0) or 0)
+                    and not int(_st.get("blocking_count", 0) or 0)
+                    else ""
+                )
                 lines.append(
                     f"{_display} audit: {_st.get('outcome')} "
                     f"({_st.get('blocking_count', 0)} blocking / {_st.get('advisory_count', 0)} advisory)"
+                    f"{_advisory_note}"
                 )
             else:
                 lines.append(

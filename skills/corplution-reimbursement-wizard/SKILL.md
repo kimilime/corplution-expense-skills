@@ -96,7 +96,7 @@ Immediately before Stage 3, run two independent read-only audits over the confir
 
 On Claude Code, the fresh isolated Agent IS the built-in Agent/Task tool: spawn a general-purpose subagent and pass the packet plus result template inline in its prompt (there is no attachment channel — paste the complete JSON into the prompt). That is the concrete handoff. Do not treat "fresh subagent" as unavailable merely because there is no resource-attachment mechanism.
 
-**Otako, the Mirror Warden** — reconcile the confirmed allocation against the evidence (attribution, journey coherence, dates/routes, amounts, duplicates, completeness):
+**Otako, the Mirror Warden** — precision-first factual reconciliation of the confirmed allocation against claimed evidence (attribution, journey coherence, dates/routes, over-claiming, true duplicate economic expenses, and genuinely unresolved material). Otako does not invent document requirements for unclaimed contextual travel or question ordinary trip behavior.
 
 ```bash
 python scripts/chief_orchestrator.py run prepare-agent --role mirror_warden
@@ -109,7 +109,7 @@ python scripts/chief_orchestrator.py run accept-agent \
     --role mirror_warden --result <utf8-result.json>
 ```
 
-**Kaede, the Gate Challenger** — pre-screen the same confirmed allocation as the company finance/audit reviewer would (policy compliance, required approvals, business justification, audit red flags, under-claiming, package readiness, presentation):
+**Kaede, the Gate Challenger** — narrow policy gate for explicit treatment rules, required approvals, plainly non-reimbursable expenses, Admin semantics, and substitute-invoice compliance. Kaede never optimizes the claim amount, recomputes daily caps, treats unrelated categories as duplicates, or reviews Stage 3/4 presentation/package artifacts before they exist.
 
 ```bash
 python scripts/chief_orchestrator.py run prepare-agent --role gate_challenger
@@ -117,7 +117,11 @@ python scripts/chief_orchestrator.py run accept-agent \
     --role gate_challenger --result <utf8-result.json>
 ```
 
-The packets embed `references/otako-mirror-warden.md` and `references/kaede-gate-challenger.md`. Both can be prepared or accepted only after Stage 2 is fully ready. Each result's `coverage[].status` only permits `completed` or `not_applicable`; `pass`/`advisory`/`block`/`unavailable` belong only in `outcome`, and every finding uses the exact schema printed in the packet. A current validated `block` result from EITHER role (a blocking finding) prevents Stage 3 and packaging until the cited items are resolved through Composer/Updater and a fresh audit is run. Every accepted audit is written first to an immutable per-role archive under `process/subagent-audit-generations/<role>/`; deleting or corrupting the convenience sidecar cannot clear an accepted blocker. `pass`, `advisory`, and explicit `unavailable` results are recorded in final rows. Only the absence of any accepted current-task audit (missing/stale/invalid with no valid current archive) fails open to the deterministic preflight; never synthesize a pass. The integrity stamp proves only that the accepted result was not subsequently edited, not that the model was truly independent.
+The packets embed `references/otako-mirror-warden.md` and `references/kaede-gate-challenger.md`. Both can be prepared or accepted only after Stage 2 is fully ready. Each result's `coverage[].status` only permits `completed` or `not_applicable`; `pass`/`advisory`/`block`/`unavailable` belong only in `outcome`, and every finding must use a role-specific code and severity allowed by the generated contract. A current validated `block` result from EITHER role prevents Stage 3 and packaging until the cited items are resolved through Composer/Updater and a fresh audit is run. Every accepted audit is written first to an immutable per-role archive under `process/subagent-audit-generations/<role>/`; deleting or corrupting the convenience sidecar cannot clear an accepted blocker. `pass`, `advisory`, and explicit `unavailable` results are recorded in final rows. Only the absence of any accepted current-task audit (missing/stale/invalid with no valid current archive) fails open to the deterministic preflight; never synthesize a pass. The integrity stamp proves only that the accepted result was not subsequently edited, not that the model was truly independent.
+
+After `accept-agent`, relay the generated `SUBAGENT REVIEW SUMMARY TO SHOW IN CHAT` block verbatim. Only its `需要处理（阻断）` section may become applicant questions. Its `供参考（无需回复）` section is never a decision list: do not ask the applicant to choose, do not alter allocation automatically, and continue the standard workflow. Deterministic Stage 3/4 results override conflicting subagent arithmetic, placeholder, column, or package opinions.
+
+When the applicant resolves a blocker by supplying a durable fact rather than changing an amount/project — for example, `该航班由公司携程商旅统一采购，不由个人报销或开票` — persist that fact through Composer/Updater in the relevant `project_contexts[].user_notes` or item `expense_note`, then run a fresh audit. Do not leave a fact needed by a fresh subagent only in conversation history.
 
 If the host cannot start a fresh isolated subagent, skip these checkpoints and continue the deterministic workflow. Do not imitate independence by asking the same context-laden agent to rubber-stamp its own work.
 

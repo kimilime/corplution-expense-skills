@@ -94,13 +94,63 @@ class RememberTests(unittest.TestCase):
             book = PlaceBook.load(path)  # missing -> built-ins only, empty file
             added = book.remember([{"name": "环球金融中心", "place_type": "客户"}], path=path)
             self.assertEqual(added, 1)
-            # Same name+type is not re-added.
+            # Same name+type is a no-op upsert.
             again = book.remember([{"name": "环球金融中心", "place_type": "客户"}], path=path)
             self.assertEqual(again, 0)
             data = json.loads(path.read_text(encoding="utf-8"))
             names = [p["name"] for p in data["places"]]
             self.assertEqual(names.count("环球金融中心"), 1)
             self.assertEqual(data["schema_version"], place_config.SCHEMA_VERSION)
+
+    def test_correction_updates_existing_record_not_appends(self) -> None:
+        # The reported bug: correcting a place's type must EDIT its record, not add
+        # a second row for the same name that lookup would then resolve wrongly.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "place-definitions.json"
+            book = PlaceBook.load(path)
+            book.remember([{"name": "友力国际大厦", "place_type": "客户"}], path=path)  # wrong first
+            changed = book.remember([{"name": "友力国际大厦", "place_type": "公司"}], path=path)  # correct
+            self.assertEqual(changed, 1)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            rows = [p for p in data["places"] if p["name"] == "友力国际大厦"]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["place_type"], "公司")
+            # The corrected memory now resolves to the right type.
+            self.assertEqual(PlaceBook.load(path).lookup("友力国际大厦B座"), ("公司", "high", False))
+
+    def test_correction_preserves_prior_aliases_and_note(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "place-definitions.json"
+            book = PlaceBook.load(path)
+            book.remember(
+                [{"name": "友力国际大厦", "place_type": "客户", "aliases": ["江宁路"], "note": "keep me"}],
+                path=path,
+            )
+            book.remember([{"name": "友力国际大厦", "place_type": "公司"}], path=path)
+            row = next(p for p in json.loads(path.read_text(encoding="utf-8"))["places"]
+                       if p["name"] == "友力国际大厦")
+            self.assertEqual(row["place_type"], "公司")
+            self.assertIn("江宁路", row.get("aliases", []))
+            self.assertEqual(row.get("note"), "keep me")
+
+    def test_legacy_duplicate_names_are_healed_last_type_wins(self) -> None:
+        # A file already corrupted by the old append-on-correction bug must collapse
+        # to one record per name on the next write, with the later (corrected) type.
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "place-definitions.json"
+            path.write_text(json.dumps({
+                "schema_version": place_config.SCHEMA_VERSION,
+                "places": [
+                    {"name": "友力国际大厦", "place_type": "客户"},
+                    {"name": "友力国际大厦", "place_type": "公司"},
+                ],
+            }, ensure_ascii=False), encoding="utf-8")
+            # Any subsequent remember() triggers the heal, even for an unrelated place.
+            PlaceBook.load(path).remember([{"name": "别处大厦", "place_type": "客户"}], path=path)
+            data = json.loads(path.read_text(encoding="utf-8"))
+            rows = [p for p in data["places"] if p["name"] == "友力国际大厦"]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["place_type"], "公司")
 
     def test_invalid_entries_skipped(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -185,6 +235,34 @@ class CollectPlaceMemoryTests(unittest.TestCase):
         )
         # Only the private office is memorized; the public airport is skipped.
         self.assertEqual(sink, [{"name": "友力国际大厦", "place_type": "公司"}])
+
+
+class CorrectionRoundTripTests(unittest.TestCase):
+    """End-to-end: a later user correction must overwrite an earlier memorized
+    place type through the real collect -> remember path, leaving one record."""
+
+    def test_correction_overwrites_memorized_type_end_to_end(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "place-definitions.json"
+
+            # First run: an answer sets a (wrong) type; it gets memorized.
+            unit = {"origin": "友力国际大厦", "origin_place_type": "客户"}
+            sink: list[dict] = []
+            apply_allocation_answers.collect_place_memory(unit, {"origin_place_type": "客户"}, sink)
+            PlaceBook.load(path).remember(sink, path=path)
+            self.assertEqual(PlaceBook.load(path).lookup("友力国际大厦"), ("客户", "high", False))
+
+            # Correction run: the user says it is 公司; the new answer sets it.
+            unit2 = {"origin": "友力国际大厦", "origin_place_type": "公司"}
+            sink2: list[dict] = []
+            apply_allocation_answers.collect_place_memory(unit2, {"origin_place_type": "公司"}, sink2)
+            PlaceBook.load(path).remember(sink2, path=path)
+
+            data = json.loads(path.read_text(encoding="utf-8"))
+            rows = [p for p in data["places"] if p["name"] == "友力国际大厦"]
+            self.assertEqual(len(rows), 1)
+            self.assertEqual(rows[0]["place_type"], "公司")
+            self.assertEqual(PlaceBook.load(path).lookup("友力国际大厦"), ("公司", "high", False))
 
 
 if __name__ == "__main__":

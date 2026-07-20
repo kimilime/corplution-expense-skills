@@ -61,6 +61,16 @@ class UnifiedAuditShape(unittest.TestCase):
         self.assertIn("finding", contract)
         self.assertNotIn("proposal", contract)
 
+    def test_each_role_exposes_only_its_finding_codes(self):
+        mirror = sp.response_json_schema("mirror_warden", sp.ROLE_SPECS["mirror_warden"]["coverage"])
+        gate = sp.response_json_schema("gate_challenger", sp.ROLE_SPECS["gate_challenger"]["coverage"])
+        mirror_codes = mirror["properties"]["findings"]["items"]["properties"]["code"]["enum"]
+        gate_codes = gate["properties"]["findings"]["items"]["properties"]["code"]["enum"]
+        self.assertIn("duplicate_claim", mirror_codes)
+        self.assertNotIn("duplicate_claim", gate_codes)
+        self.assertIn("missing_required_approval", gate_codes)
+        self.assertNotIn("missing_required_approval", mirror_codes)
+
 
 class CliSurface(unittest.TestCase):
     def test_prepare_accept_take_new_roles_and_promote_gone(self):
@@ -90,7 +100,11 @@ class ValidateResultRoundTrip(unittest.TestCase):
     def _task_and_alloc(self):
         import integrity
         coverage = sp.ROLE_SPECS[self.role]["coverage"]
-        alloc = {"allocation_units": [{"unit_id": "UNIT-001", "user_no": "1", "unit_ref": "abc123"}]}
+        alloc = {"allocation_units": [{
+            "unit_id": "UNIT-001", "user_no": "1", "unit_ref": "abc123",
+            "approval_required": "partner_approval_screenshot",
+            "approval_file_status": "missing",
+        }]}
         task = {
             "schema_version": sp.TASK_SCHEMA, "task_id": "t123", "role_id": self.role,
             "codename": sp.ROLE_SPECS[self.role]["codename"],
@@ -144,6 +158,205 @@ class ValidateResultRoundTrip(unittest.TestCase):
              "unit_refs": ["1@abc123"], "evidence_refs": [], "recommended_action": "a"}])
         with self.assertRaises(sp.ProtocolError):
             sp.validate_result(mismatch, task, alloc)
+
+
+class FindingGuardrails(unittest.TestCase):
+    def _fixture(self, role="mirror_warden", *, units=None, documents=None, hints=None):
+        import integrity
+        units = units or [{
+            "unit_id": "UNIT-001",
+            "user_no": "1",
+            "unit_ref": "abc123",
+            "source_category": "meal",
+            "source_document_id": "DOC-MEAL",
+            "supporting_invoice_document_id": "DOC-MEAL",
+            "amount": "91.60",
+            "invoice_amount": "91.60",
+            "reimbursable_amount": "87.00",
+        }]
+        documents = documents or [{"document_id": "DOC-MEAL", "source_file": "meal.pdf"}]
+        hints = hints or []
+        coverage = sp.ROLE_SPECS[role]["coverage"]
+        allocation = {"allocation_units": units}
+        task = {
+            "schema_version": sp.TASK_SCHEMA,
+            "task_id": "guard-task",
+            "role_id": role,
+            "codename": sp.ROLE_SPECS[role]["codename"],
+            "display_name": sp.ROLE_SPECS[role]["display_name"],
+            "role_title": sp.ROLE_SPECS[role]["role_title"],
+            "contract_version": sp.ROLE_SPECS[role]["contract_version"],
+            "source_generation": {
+                "source_allocation_fingerprint": "f" * 64,
+                "source_extraction_fingerprint": "e" * 64,
+            },
+            "required_coverage": list(coverage),
+            "evidence_index": documents,
+            "expense_hint_reconciliation": hints,
+        }
+        integrity.stamp(task, "subagent_protocol.py")
+        return task, allocation, coverage
+
+    def _result(self, task, coverage, *, outcome, findings):
+        return {
+            "schema_version": sp.AUDIT_SCHEMA,
+            "audit_contract_version": task["contract_version"],
+            "task_id": task["task_id"],
+            "source_task_fingerprint": task["integrity"]["fingerprint"],
+            "source_allocation_fingerprint": "f" * 64,
+            "source_extraction_fingerprint": "e" * 64,
+            "agent_id": task["role_id"],
+            "agent_display_name": task["display_name"],
+            "coverage": [
+                {"check_id": check, "status": "completed", "notes": "checked"}
+                for check in coverage
+            ],
+            "summary": "precision-first review",
+            "outcome": outcome,
+            "findings": findings,
+        }
+
+    def _finding(self, code, *, severity="blocking", units=None, evidence=None):
+        return {
+            "finding_id": "F-001",
+            "severity": severity,
+            "code": code,
+            "message": "Concrete cited issue.",
+            "unit_refs": units or [],
+            "evidence_refs": evidence or [],
+            "recommended_action": "Correct the cited item through Composer/Updater.",
+        }
+
+    def test_real_attribution_conflict_still_validates(self):
+        task, allocation, coverage = self._fixture()
+        finding = self._finding("attribution_conflict", units=["1@abc123"])
+        sp.validate_result(
+            self._result(task, coverage, outcome="block", findings=[finding]),
+            task,
+            allocation,
+        )
+
+    def test_gate_cannot_emit_under_claiming_code(self):
+        task, allocation, coverage = self._fixture(role="gate_challenger")
+        finding = self._finding(
+            "under_claiming", severity="advisory", units=["1@abc123"]
+        )
+        with self.assertRaisesRegex(sp.ProtocolError, "outside the gate_challenger role"):
+            sp.validate_result(
+                self._result(task, coverage, outcome="advisory", findings=[finding]),
+                task,
+                allocation,
+            )
+
+    def test_lower_reimbursable_amount_is_not_evidence_conflict(self):
+        task, allocation, coverage = self._fixture()
+        finding = self._finding(
+            "amount_evidence_conflict",
+            severity="advisory",
+            units=["1@abc123"],
+            evidence=["DOC-MEAL"],
+        )
+        with self.assertRaisesRegex(sp.ProtocolError, "lower reimbursable amount"):
+            sp.validate_result(
+                self._result(task, coverage, outcome="advisory", findings=[finding]),
+                task,
+                allocation,
+            )
+
+    def test_claim_exceeds_evidence_requires_numeric_support(self):
+        task, allocation, coverage = self._fixture()
+        unsupported = self._finding("claim_exceeds_evidence", units=["1@abc123"])
+        with self.assertRaisesRegex(sp.ProtocolError, "not supported by the cited numeric amounts"):
+            sp.validate_result(
+                self._result(task, coverage, outcome="block", findings=[unsupported]),
+                task,
+                allocation,
+            )
+        allocation["allocation_units"][0]["reimbursable_amount"] = "92.00"
+        sp.validate_result(
+            self._result(task, coverage, outcome="block", findings=[unsupported]),
+            task,
+            allocation,
+        )
+
+    def test_complete_taxi_evidence_cannot_be_blocked_for_contextual_flight_invoice(self):
+        units = [{
+            "unit_id": "UNIT-001",
+            "user_no": "1",
+            "unit_ref": "taxi123",
+            "source_category": "taxi",
+            "source_document_id": "DOC-TRIP",
+            "supporting_invoice_document_id": "DOC-TAXI",
+            "supporting_schedule_document_id": "DOC-TRIP",
+            "amount": "181.30",
+            "invoice_amount": "181.30",
+        }]
+        documents = [
+            {"document_id": "DOC-TAXI", "source_file": "didi-invoice.pdf"},
+            {"document_id": "DOC-TRIP", "source_file": "didi-trip.pdf"},
+        ]
+        task, allocation, coverage = self._fixture(units=units, documents=documents)
+        finding = self._finding("claimed_evidence_missing", units=["1@taxi123"])
+        with self.assertRaisesRegex(sp.ProtocolError, "contextual travel"):
+            sp.validate_result(
+                self._result(task, coverage, outcome="block", findings=[finding]),
+                task,
+                allocation,
+            )
+
+    def test_duplicate_claim_requires_two_distinct_subjects(self):
+        task, allocation, coverage = self._fixture()
+        one = self._finding("duplicate_claim", units=["1@abc123"])
+        with self.assertRaisesRegex(sp.ProtocolError, "cannot duplicate itself"):
+            sp.validate_result(
+                self._result(task, coverage, outcome="block", findings=[one]),
+                task,
+                allocation,
+            )
+
+    def test_duplicate_claim_rejects_two_aliases_of_one_document(self):
+        task, allocation, coverage = self._fixture()
+        finding = self._finding(
+            "duplicate_claim", evidence=["DOC-MEAL", "meal.pdf"]
+        )
+        with self.assertRaisesRegex(sp.ProtocolError, "aliases of one document"):
+            sp.validate_result(
+                self._result(task, coverage, outcome="block", findings=[finding]),
+                task,
+                allocation,
+            )
+
+    def test_resolved_not_reimbursed_hint_is_not_unresolved_material(self):
+        hints = [{
+            "hint_id": "HINT-1",
+            "resolution_status": "resolved",
+            "resolution_action": "not_reimbursed",
+        }]
+        task, allocation, coverage = self._fixture(hints=hints)
+        finding = self._finding(
+            "unresolved_material", severity="advisory", evidence=["HINT-1"]
+        )
+        with self.assertRaisesRegex(sp.ProtocolError, "already allocated, excluded, resolved"):
+            sp.validate_result(
+                self._result(task, coverage, outcome="advisory", findings=[finding]),
+                task,
+                allocation,
+            )
+
+    def test_advisory_summary_is_explicitly_noninteractive(self):
+        report = {
+            "findings": [{
+                "severity": "advisory",
+                "code": "admin_semantics_conflict",
+                "message": "Generic Admin wording can be refined.",
+                "unit_refs": ["1@abc123"],
+                "evidence_refs": [],
+            }]
+        }
+        summary = sp.chat_review_summary(report)
+        self.assertIn("需要处理：无", summary)
+        self.assertIn("供参考（无需回复", summary)
+        self.assertIn("不得改写成待决问题", summary)
 
 
 class HandoffCapDegrade(unittest.TestCase):

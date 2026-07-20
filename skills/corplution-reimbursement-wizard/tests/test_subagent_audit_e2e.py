@@ -208,7 +208,7 @@ class AuditBlockSuppressesGeneration(unittest.TestCase):
     def test_current_block_suppresses_stage3_and_stage4(self):
         with tempfile.TemporaryDirectory() as tmp:
             fx = AuditFixture(Path(tmp))
-            fx.accept_block("mirror_warden", "MEAL_FORM_CITY_CONFLICT",
+            fx.accept_block("mirror_warden", "attribution_conflict",
                             "Formal city evidence conflicts with the selected amount column.")
 
             state = subagent_protocol.audit_state(
@@ -243,7 +243,7 @@ class AuditBlockSurvivesArchive(unittest.TestCase):
         with tempfile.TemporaryDirectory() as tmp:
             fx = AuditFixture(Path(tmp))
             _accepted, paths = fx.accept_block(
-                "mirror_warden", "DURABLE_BLOCK",
+                "mirror_warden", "journey_conflict",
                 "This accepted blocker must survive sidecar deletion.",
             )
             # The immutable archive copy exists; delete the mutable canonical sidecar.

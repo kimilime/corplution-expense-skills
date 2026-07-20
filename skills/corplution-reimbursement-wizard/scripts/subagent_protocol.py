@@ -15,6 +15,7 @@ import json
 import re
 import sys
 from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
 
@@ -37,7 +38,7 @@ TASK_SCHEMA = "subagent_task.v2"
 # Both subagent roles return the same audit shape: outcome + findings. Each role
 # binds its own contract_version (below) so a result cannot be replayed as the
 # other role's audit.
-AUDIT_SCHEMA = "subagent_audit.v1"
+AUDIT_SCHEMA = "subagent_audit.v2"
 
 # Inline handoff cap. The packet is pasted whole into a fresh Agent/Task-tool prompt
 # (Claude Code has no attachment channel), so this bounds the inline prompt cost, not a
@@ -60,14 +61,14 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
         "display_name": "Otako - Mirror Warden",
         "role_title": "Otako, the Mirror Warden",
         "reference": SKILL_DIR / "references" / "otako-mirror-warden.md",
-        "contract_version": "mirror-warden-audit.v1",
+        "contract_version": "mirror-warden-audit.v2",
         "coverage": [
             "evidence_attribution",
             "journey_coherence",
             "date_route_consistency",
             "amount_evidence_match",
-            "duplicate_evidence",
-            "evidence_completeness",
+            "duplicate_claim",
+            "claimed_evidence_completeness",
             "unaccounted_material",
         ],
     },
@@ -76,16 +77,95 @@ ROLE_SPECS: dict[str, dict[str, Any]] = {
         "display_name": "Kaede - Gate Challenger",
         "role_title": "Kaede, the Gate Challenger",
         "reference": SKILL_DIR / "references" / "kaede-gate-challenger.md",
-        "contract_version": "gate-challenger-audit.v1",
+        "contract_version": "gate-challenger-audit.v2",
         "coverage": [
-            "policy_compliance",
+            "policy_treatment",
             "approval_sufficiency",
-            "business_justification",
-            "audit_red_flags",
-            "claim_completeness",
-            "document_package_readiness",
-            "presentation_integrity",
+            "business_claimability",
+            "admin_client_semantics",
+            "substitute_invoice_compliance",
         ],
+    },
+}
+
+# The task packet exposes these rules to the subagent and the accept path enforces
+# them. Descriptions are intentionally short: role references carry the reasoning
+# boundaries, while this map is the machine-checkable vocabulary.
+FINDING_CODE_RULES: dict[str, dict[str, dict[str, Any]]] = {
+    "mirror_warden": {
+        "attribution_conflict": {
+            "severities": ("blocking", "advisory"),
+            "minimum_unit_refs": 1,
+            "description": "Concrete evidence contradicts the assigned project/client/code.",
+        },
+        "journey_conflict": {
+            "severities": ("blocking", "advisory"),
+            "minimum_unit_refs": 1,
+            "description": "Cited journey legs are chronologically or geographically incoherent.",
+        },
+        "date_route_conflict": {
+            "severities": ("blocking", "advisory"),
+            "minimum_unit_refs": 1,
+            "description": "Printed dates/routes directly conflict with the allocation.",
+        },
+        "amount_evidence_conflict": {
+            "severities": ("blocking", "advisory"),
+            "minimum_unit_refs": 1,
+            "minimum_evidence_refs": 1,
+            "description": "The unit amount conflicts with its source evidence, excluding a lower reimbursable amount.",
+        },
+        "claim_exceeds_evidence": {
+            "severities": ("blocking",),
+            "minimum_unit_refs": 1,
+            "description": "The reimbursable amount is numerically greater than the invoice/evidence amount.",
+        },
+        "duplicate_claim": {
+            "severities": ("blocking", "advisory"),
+            "minimum_duplicate_subjects": 2,
+            "description": "Two or more cited units/evidence records claim the same economic expense.",
+        },
+        "claimed_evidence_missing": {
+            "severities": ("blocking", "advisory"),
+            "minimum_unit_refs": 1,
+            "description": "A claimed unit lacks evidence required for that claimed expense itself.",
+        },
+        "unresolved_material": {
+            "severities": ("blocking", "advisory"),
+            "minimum_evidence_refs": 1,
+            "description": "Active evidence or an applicant hint is silently unaccounted for.",
+        },
+    },
+    "gate_challenger": {
+        "policy_treatment_conflict": {
+            "severities": ("blocking", "advisory"),
+            "minimum_unit_refs": 1,
+            "description": "The claim treatment conflicts with an explicit Corplution policy rule.",
+        },
+        "missing_required_approval": {
+            "severities": ("blocking",),
+            "minimum_unit_refs": 1,
+            "description": "The packet marks an approval as required and that approval is absent.",
+        },
+        "plainly_non_reimbursable": {
+            "severities": ("blocking",),
+            "minimum_unit_refs": 1,
+            "description": "Direct evidence makes the cited expense plainly personal or non-reimbursable.",
+        },
+        "admin_semantics_conflict": {
+            "severities": ("advisory",),
+            "minimum_unit_refs": 1,
+            "description": "Admin/client wording conflicts with configured semantics but does not block submission.",
+        },
+        "substitute_invoice_noncompliance": {
+            "severities": ("blocking", "advisory"),
+            "minimum_unit_refs": 1,
+            "description": "A substitute invoice is not marked or supported as policy requires.",
+        },
+        "declared_policy_exception": {
+            "severities": ("advisory",),
+            "minimum_unit_refs": 1,
+            "description": "An applicant-declared exception exceeds the standing policy and is informational only.",
+        },
     },
 }
 
@@ -123,7 +203,8 @@ EMBEDDED_ABSOLUTE_PATHS = (
 
 COMMON_UNIT_PACKET_FIELDS = (
     "unit_id", "user_no", "unit_no", "unit_ref", "source_document_id", "source_doc_id",
-    "source_item_id", "source_file", "source_filename", "document_subtype", "source_category",
+    "source_item_id", "source_file", "source_filename", "source_sha256", "document_subtype",
+    "source_category", "invoice_no", "seller_name",
     "status", "confidence", "needs_user_confirmation", "amount", "invoice_amount",
     "reimbursable_amount", "expense_date",
     "date_source", "date_required", "date_is_provisional", "city", "formal_city", "hotel_city",
@@ -143,8 +224,8 @@ MIRROR_WARDEN_UNIT_PACKET_FIELDS = COMMON_UNIT_PACKET_FIELDS + (
     "hotel_nights", "is_refund_fee", "refund_fee_amount", "is_substitute_invoice",
     "substitute_for", "invoice_no", "issues",
 )
-# Gate Challenger judges claimability: policy framing, approval evidence,
-# business justification, notes/presentation, and package readiness.
+# Gate Challenger is the narrow policy gate: treatment, explicit approval rules,
+# plain non-reimbursability, Admin semantics, and substitute-invoice compliance.
 GATE_CHALLENGER_UNIT_PACKET_FIELDS = COMMON_UNIT_PACKET_FIELDS + (
     "final_note", "expense_note", "meal_context", "attendees", "business_reason",
     "check_in_date", "check_out_date", "hotel_nights", "hotel_shared_with", "shared_room_with",
@@ -429,7 +510,15 @@ def _enforce_handoff_cap(task: dict[str, Any]) -> int:
     return packet_bytes
 
 
+def finding_code_rules(role: str) -> dict[str, dict[str, Any]]:
+    try:
+        return FINDING_CODE_RULES[role]
+    except KeyError as exc:
+        raise ProtocolError(f"no finding-code contract exists for role {role!r}") from exc
+
+
 def response_contract(role: str, coverage: list[str]) -> dict[str, Any]:
+    code_rules = finding_code_rules(role)
     contract: dict[str, Any] = {
         "return_format": "Return exactly one UTF-8 JSON object with no Markdown.",
         "coverage_entry": {
@@ -445,6 +534,10 @@ def response_contract(role: str, coverage: list[str]) -> dict[str, Any]:
             "When the host supports JSON Schema response mode, use response_json_schema. "
             "Otherwise start from the supplied result template exactly."
         ),
+        "interaction_rule": (
+            "Blocking findings require applicant action. Advisory findings are information only: "
+            "do not phrase them as questions or request a decision."
+        ),
     }
     contract.update({
         "outcome": {
@@ -455,12 +548,20 @@ def response_contract(role: str, coverage: list[str]) -> dict[str, Any]:
             "required_and_only_fields": list(FINDING_FIELDS),
             "severity_values": ["blocking", "advisory"],
             "blocking_reference_rule": "A blocking finding needs a current unit_refs or evidence_refs entry.",
+            "allowed_codes": {
+                code: {
+                    "allowed_severities": list(rule["severities"]),
+                    "description": rule["description"],
+                }
+                for code, rule in code_rules.items()
+            },
         },
     })
     return contract
 
 
 def response_json_schema(role: str, coverage: list[str]) -> dict[str, Any]:
+    code_rules = finding_code_rules(role)
     coverage_item = {
         "type": "object",
         "additionalProperties": False,
@@ -500,7 +601,7 @@ def response_json_schema(role: str, coverage: list[str]) -> dict[str, Any]:
                 "properties": {
                     "finding_id": {"type": "string", "minLength": 1},
                     "severity": {"type": "string", "enum": ["blocking", "advisory"]},
-                    "code": {"type": "string", "minLength": 1},
+                    "code": {"type": "string", "enum": sorted(code_rules)},
                     "message": {"type": "string", "minLength": 1},
                     "unit_refs": {"type": "array", "items": {"type": "string"}},
                     "evidence_refs": {"type": "array", "items": {"type": "string"}},
@@ -739,6 +840,8 @@ def _build_task(
             "Return exactly one JSON object and no Markdown.",
             "Do not mutate reimbursement artifacts or claim that any artifact was changed; you only audit.",
             "Bind the result to the exact task and allocation fingerprints in the result template.",
+            "Optimize for precision, not finding count; silence is correct when no concrete material defect exists.",
+            "Only blocking findings require applicant action. Advisory findings are informational and must not ask for a decision.",
         ],
     }
     integrity.stamp(task, "subagent_protocol.py")
@@ -917,10 +1020,236 @@ def _evidence_list(value: Any, known: set[str], label: str) -> list[str]:
     return refs
 
 
+def _decimal_amount(value: Any) -> Decimal | None:
+    raw = clean(value).replace(",", "")
+    if not raw:
+        return None
+    try:
+        return Decimal(raw)
+    except InvalidOperation:
+        return None
+
+
+def _unit_claim_exceeds_evidence(unit: dict[str, Any]) -> bool:
+    invoice = _decimal_amount(unit.get("invoice_amount") or unit.get("amount"))
+    claim = _decimal_amount(unit.get("reimbursable_amount") or unit.get("amount"))
+    return invoice is not None and claim is not None and claim > invoice
+
+
+def _unit_is_only_lower_reimbursement(unit: dict[str, Any]) -> bool:
+    invoice = _decimal_amount(unit.get("invoice_amount"))
+    amount = _decimal_amount(unit.get("amount"))
+    claim = _decimal_amount(unit.get("reimbursable_amount"))
+    return (
+        invoice is not None
+        and amount is not None
+        and claim is not None
+        and amount == invoice
+        and claim < invoice
+    )
+
+
+def _unit_lacks_claim_evidence(unit: dict[str, Any], known_evidence: set[str]) -> bool:
+    def present(field: str) -> bool:
+        value = clean(unit.get(field))
+        return bool(value and value in known_evidence)
+
+    if clean(unit.get("source_category")) == "taxi":
+        return not (
+            present("supporting_invoice_document_id")
+            and present("supporting_schedule_document_id")
+        )
+    return not (
+        present("supporting_invoice_document_id")
+        or present("source_document_id")
+        or present("source_doc_id")
+    )
+
+
+def _unit_lacks_required_approval(unit: dict[str, Any]) -> bool:
+    required = clean(unit.get("approval_required")).lower()
+    if required in {"", "0", "false", "no", "none", "not_required"}:
+        return False
+    status = clean(unit.get("approval_file_status")).lower()
+    if status in {"provided", "linked", "attached", "available", "complete"}:
+        return False
+    return not any(
+        clean(unit.get(field))
+        for field in ("partner_approval_document_id", "approval_screenshot_document_id")
+    )
+
+
+def _truthy(value: Any) -> bool:
+    return clean(value).lower() not in {"", "0", "false", "no", "none", "null"}
+
+
+def _resolved_hint_evidence_refs(task: dict[str, Any]) -> set[str]:
+    resolved: set[str] = set()
+    closed_actions = {"matched_existing", "covered_by_invoice", "not_reimbursed"}
+    closed_statuses = {"resolved", "not_required"}
+    for record in task.get("expense_hint_reconciliation", []):
+        if not isinstance(record, dict):
+            continue
+        action = clean(record.get("resolution_action")).lower()
+        status = clean(record.get("resolution_status")).lower()
+        if action not in closed_actions and status not in closed_statuses:
+            continue
+        for field in ("hint_id", "hint_ref", "display_ref", "display_token", "question_id"):
+            value = clean(record.get(field))
+            if value:
+                resolved.add(value)
+    return resolved
+
+
+def _evidence_subject_aliases(task: dict[str, Any]) -> dict[str, str]:
+    aliases: dict[str, str] = {}
+    for index, document in enumerate(task.get("evidence_index", []), 1):
+        if not isinstance(document, dict):
+            continue
+        subject = clean(document.get("document_id") or document.get("source_sha256") or f"doc-{index}")
+        for field in ("document_id", "source_file", "source_sha256", "sha256"):
+            value = clean(document.get(field))
+            if value:
+                aliases[value] = f"document:{subject}"
+        invoice = document.get("invoice")
+        if isinstance(invoice, dict):
+            number = clean(invoice.get("invoice_number"))
+            if number:
+                aliases[number] = f"document:{subject}"
+    for index, record in enumerate(task.get("expense_hint_reconciliation", []), 1):
+        if not isinstance(record, dict):
+            continue
+        subject = clean(record.get("hint_id") or record.get("hint_ref") or f"hint-{index}")
+        for field in ("hint_id", "hint_ref", "display_ref", "display_token", "question_id"):
+            value = clean(record.get(field))
+            if value:
+                aliases[value] = f"hint:{subject}"
+    return aliases
+
+
+def _accounted_material_refs(
+    task: dict[str, Any],
+    known_units: dict[str, dict[str, Any]],
+) -> set[str]:
+    accounted = _resolved_hint_evidence_refs(task)
+    linked_document_ids = {
+        clean(unit.get(field))
+        for unit in known_units.values()
+        for field in (
+            "source_document_id", "source_doc_id", "supporting_invoice_document_id",
+            "supporting_schedule_document_id", "partner_approval_document_id",
+            "approval_screenshot_document_id",
+        )
+        if clean(unit.get(field))
+    }
+    for document in task.get("evidence_index", []):
+        if not isinstance(document, dict):
+            continue
+        document_id = clean(document.get("document_id"))
+        if document_id not in linked_document_ids and not _truthy(document.get("excluded_by_user")):
+            continue
+        for field in ("document_id", "source_file", "source_sha256", "sha256"):
+            value = clean(document.get(field))
+            if value:
+                accounted.add(value)
+        invoice = document.get("invoice")
+        if isinstance(invoice, dict):
+            number = clean(invoice.get("invoice_number"))
+            if number:
+                accounted.add(number)
+    return accounted
+
+
+def _validate_finding_rule(
+    *,
+    role: str,
+    finding_id: str,
+    severity: str,
+    code: str,
+    unit_refs: list[str],
+    evidence_refs: list[str],
+    known_units: dict[str, dict[str, Any]],
+    known_evidence: set[str],
+    task: dict[str, Any],
+) -> None:
+    rules = finding_code_rules(role)
+    if code not in rules:
+        raise ProtocolError(
+            f"finding {finding_id} code {code!r} is outside the {role} role; "
+            f"allowed codes: {', '.join(sorted(rules))}"
+        )
+    rule = rules[code]
+    if severity not in rule["severities"]:
+        allowed = ", ".join(rule["severities"])
+        raise ProtocolError(
+            f"finding {finding_id} code {code!r} cannot use severity {severity!r}; "
+            f"allowed: {allowed}"
+        )
+    minimum_units = int(rule.get("minimum_unit_refs", 0) or 0)
+    minimum_evidence = int(rule.get("minimum_evidence_refs", 0) or 0)
+    if len(unit_refs) < minimum_units:
+        raise ProtocolError(
+            f"finding {finding_id} code {code!r} requires at least {minimum_units} unit reference(s)"
+        )
+    if len(evidence_refs) < minimum_evidence:
+        raise ProtocolError(
+            f"finding {finding_id} code {code!r} requires at least {minimum_evidence} evidence reference(s)"
+        )
+    if rule.get("minimum_duplicate_subjects"):
+        required = int(rule["minimum_duplicate_subjects"])
+        evidence_aliases = _evidence_subject_aliases(task)
+        evidence_subjects = {evidence_aliases.get(ref, ref) for ref in evidence_refs}
+        if len(unit_refs) < required and len(evidence_subjects) < required:
+            raise ProtocolError(
+                f"finding {finding_id} duplicate_claim requires at least {required} distinct "
+                "unit refs or evidence subjects; aliases of one document cannot duplicate itself"
+            )
+
+    units = [known_units[ref] for ref in unit_refs]
+    if code == "claim_exceeds_evidence" and not any(
+        _unit_claim_exceeds_evidence(unit) for unit in units
+    ):
+        raise ProtocolError(
+            f"finding {finding_id} claim_exceeds_evidence is not supported by the cited numeric amounts"
+        )
+    if code == "amount_evidence_conflict" and units and all(
+        _unit_is_only_lower_reimbursement(unit) for unit in units
+    ):
+        raise ProtocolError(
+            f"finding {finding_id} treats a lower reimbursable amount as an evidence conflict; "
+            "partial reimbursement is valid and Stage 3 records the invoice/claim difference"
+        )
+    if code == "claimed_evidence_missing" and units and not any(
+        _unit_lacks_claim_evidence(unit, known_evidence) for unit in units
+    ):
+        raise ProtocolError(
+            f"finding {finding_id} cites units whose own invoice/schedule evidence is present. "
+            "An unclaimed company-booked flight/rail/hotel is contextual travel, not a required personal invoice"
+        )
+    if code == "missing_required_approval" and units and not any(
+        _unit_lacks_required_approval(unit) for unit in units
+    ):
+        raise ProtocolError(
+            f"finding {finding_id} does not cite a unit marked as requiring a missing approval"
+        )
+    if code == "substitute_invoice_noncompliance" and units and not any(
+        _truthy(unit.get("is_substitute_invoice")) for unit in units
+    ):
+        raise ProtocolError(
+            f"finding {finding_id} does not cite a unit marked as a substitute invoice"
+        )
+    if code == "unresolved_material":
+        accounted_refs = _accounted_material_refs(task, known_units)
+        if evidence_refs and all(ref in accounted_refs for ref in evidence_refs):
+            raise ProtocolError(
+                f"finding {finding_id} cites only material already allocated, excluded, resolved, or marked not reimbursed"
+            )
+
+
 def _validate_audit(
     candidate: dict[str, Any],
     task: dict[str, Any],
-    known_refs: set[str],
+    known_units: dict[str, dict[str, Any]],
     known_evidence: set[str],
 ) -> None:
     allowed = {
@@ -971,7 +1300,7 @@ def _validate_audit(
         if severity not in {"blocking", "advisory"}:
             raise ProtocolError(f"finding {finding_id} severity must be blocking or advisory")
         unit_refs = _validate_ref_list(
-            item.get("unit_refs", []), known_refs, f"finding {finding_id} unit_refs"
+            item.get("unit_refs", []), set(known_units), f"finding {finding_id} unit_refs"
         )
         evidence_refs = _evidence_list(
             item.get("evidence_refs", []), known_evidence, f"finding {finding_id} evidence_refs"
@@ -982,6 +1311,17 @@ def _validate_audit(
             raise ProtocolError(f"finding {finding_id} requires code and message")
         if not clean(item.get("recommended_action")):
             raise ProtocolError(f"finding {finding_id} requires recommended_action")
+        _validate_finding_rule(
+            role=clean(task.get("role_id")),
+            finding_id=finding_id,
+            severity=severity,
+            code=clean(item.get("code")),
+            unit_refs=unit_refs,
+            evidence_refs=evidence_refs,
+            known_units=known_units,
+            known_evidence=known_evidence,
+            task=task,
+        )
         blocking += severity == "blocking"
         advisory += severity == "advisory"
     expected_outcome = "block" if blocking else ("advisory" if advisory else "pass")
@@ -1005,9 +1345,9 @@ def validate_result(candidate: dict[str, Any], task: dict[str, Any], allocation:
     text_issues = text_safety.find_suspect_text(candidate, path="subagent_result")
     if text_issues:
         raise ProtocolError("result contains suspect encoding damage: " + "; ".join(text_issues))
-    known_refs = set(_unit_tokens(allocation))
+    known_units = _unit_tokens(allocation)
     known_evidence = _known_evidence_refs(task)
-    _validate_audit(candidate, task, known_refs, known_evidence)
+    _validate_audit(candidate, task, known_units, known_evidence)
 
 
 def _archive_previous_audit(path: Path, history_dir: Path) -> None:
@@ -1198,6 +1538,43 @@ def review_record(state: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def chat_review_summary(report: dict[str, Any]) -> str:
+    """Render one deterministic applicant-facing triage block.
+
+    The coordinator may relay this block, but must not promote advisory findings
+    into questions. Keeping the interaction rule in generated output helps hosts
+    whose model does not reliably retain the prose workflow instruction.
+    """
+    findings = [item for item in report.get("findings", []) if isinstance(item, dict)]
+    blocking = [item for item in findings if clean(item.get("severity")) == "blocking"]
+    advisory = [item for item in findings if clean(item.get("severity")) == "advisory"]
+
+    def finding_line(item: dict[str, Any]) -> str:
+        refs = [
+            *[clean(ref) for ref in item.get("unit_refs", []) if clean(ref)],
+            *[clean(ref) for ref in item.get("evidence_refs", []) if clean(ref)],
+        ]
+        ref_text = f" ({', '.join(refs)})" if refs else ""
+        return f"- [{clean(item.get('code'))}]{ref_text} {clean(item.get('message'))}"
+
+    lines = ["SUBAGENT REVIEW SUMMARY TO SHOW IN CHAT"]
+    if blocking:
+        lines.append("需要处理（阻断；只就以下事项向申请人提问）：")
+        lines.extend(finding_line(item) for item in blocking)
+    else:
+        lines.append("需要处理：无。不要向申请人提出审计问题，继续标准流程。")
+    if advisory:
+        lines.append("供参考（无需回复；默认保持当前处理，不得改写成待决问题）：")
+        lines.extend(finding_line(item) for item in advisory)
+    else:
+        lines.append("供参考：无。")
+    lines.append(
+        "INTERACTION RULE: advisory 不是用户待办，不阻断、不追问、不自动修改；"
+        "只有 blocking 才进入问答并通过 Composer/Updater 修正。"
+    )
+    return "\n".join(lines)
+
+
 def build_parser() -> argparse.ArgumentParser:
     parser = argparse.ArgumentParser(description="Prepare and validate read-only subagent handoffs.")
     commands = parser.add_subparsers(dest="command", required=True)
@@ -1258,6 +1635,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Accepted {accepted.get('agent_display_name')} result.")
             print(f"Audit result: {paths['audit_result']}")
             print(f"Outcome: {accepted.get('outcome')}")
+            print(chat_review_summary(accepted))
             print("NEXT: run Chief status; a current blocking audit from either role prevents Stage 3.")
             return 0
         allocation = load_json(Path(args.allocation))
