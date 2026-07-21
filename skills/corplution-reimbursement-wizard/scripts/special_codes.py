@@ -28,6 +28,8 @@ import re
 import sys
 from pathlib import Path
 
+from exit_codes import ExitCode
+
 SCHEMA_VERSION = "special_code_definitions.v1"
 
 # Keys mirror policy.toml [charge_codes].
@@ -140,37 +142,37 @@ def _main(argv: list[str] | None = None) -> int:
         print(f"admin     = {policy.admin_code}")
         print(f"shared_bd = {policy.shared_bd_code}")
         print(f"source    = {src}")
-        return 0
+        return ExitCode.SUCCESS
 
     if args.cmd == "set":
         if not (args.admin or args.shared_bd):
             print("ERROR: provide --admin and/or --bd.", file=sys.stderr)
-            return 2
+            return ExitCode.COMMAND_ERROR
         ok = set_codes(admin=args.admin or None, shared_bd=args.shared_bd or None)
         if ok:
             print(f"Updated {special_codes_path()}.")
-            return 0
-        return 1
+            return ExitCode.SUCCESS
+        return ExitCode.OPERATIONAL_ERROR
 
     if args.cmd == "set-year":
         if not re.fullmatch(r"20\d{2}", args.year):
             print("ERROR: year must be four digits like 2027.", file=sys.stderr)
-            return 2
+            return ExitCode.COMMAND_ERROR
         policy = policy_config.load_policy()
         new_admin = _bump_year(policy.admin_code, args.year)
         new_bd = _bump_year(policy.shared_bd_code, args.year)
         if "20" not in policy.admin_code and "20" not in policy.shared_bd_code:
             print("ERROR: current codes contain no 20xx year to roll; use `set --admin --bd`.",
                   file=sys.stderr)
-            return 2
+            return ExitCode.COMMAND_ERROR
         ok = set_codes(admin=new_admin, shared_bd=new_bd)
         if ok:
             print(f"Rolled codes to {args.year}: admin={new_admin}, shared_bd={new_bd}")
             print(f"Updated {special_codes_path()}.")
-            return 0
-        return 1
+            return ExitCode.SUCCESS
+        return ExitCode.OPERATIONAL_ERROR
 
-    return 0
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

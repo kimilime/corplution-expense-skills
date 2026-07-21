@@ -6,6 +6,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -30,6 +32,42 @@ def run_script(script: str, *args: str) -> subprocess.CompletedProcess[str]:
         encoding="utf-8",
         errors="replace",
     )
+
+
+class DocumentReconciliationTests(unittest.TestCase):
+    def test_normal_invoice_source_document_id_is_accounted_for(self) -> None:
+        extraction = {
+            "documents": [{
+                "document_id": "DOC-001",
+                "document_role": "invoice",
+                "source_file": "hotel.pdf",
+            }],
+            "document_links": [],
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            allocate_expenses.print_document_reconciliation(
+                extraction,
+                [{"source_document_id": "DOC-001", "source_category": "hotel"}],
+            )
+
+        self.assertNotIn("unaccounted for", output.getvalue())
+        self.assertIn("expense units/linked 1", output.getvalue())
+
+    def test_unknown_unit_uses_canonical_identity_fields(self) -> None:
+        units, _questions = allocate_expenses.create_units({
+            "documents": [{
+                "document_id": "DOC-001",
+                "document_role": "unexpected_role",
+                "source_file": "mystery.bin",
+            }],
+            "document_links": [],
+        }, [])
+
+        self.assertEqual(1, units[0]["user_no"])
+        self.assertEqual("DOC-001", units[0]["source_document_id"])
+        self.assertNotIn("unit_no", units[0])
+        self.assertNotIn("source_doc_id", units[0])
 
 
 class ProjectContextSchemaTests(unittest.TestCase):
@@ -166,6 +204,57 @@ class ComposerTests(unittest.TestCase):
         self.assertEqual("UNIT-001", answers["unit_updates"][0]["unit_id"])
         self.assertEqual("confirmed", answers["unit_updates"][0]["status"])
         self.assertFalse((self.root / "fill_answers.py").exists())
+
+    def test_relative_approval_path_is_normalized_against_workflow_root(self) -> None:
+        approval = self.root / "evidence" / "approval.png"
+        approval.parent.mkdir()
+        approval.write_bytes(b"approval")
+        result, output = self.compose({
+            "schema_version": "allocation_decisions.v1",
+            "decisions": [{
+                "units": "1@00000001",
+                "set": {
+                    "is_substitute_invoice": True,
+                    "approval_file": "evidence/approval.png",
+                    "status": "confirmed",
+                },
+            }],
+            "question_updates": [],
+            "project_contexts": [],
+            "confirm_units": [],
+            "drop_units": [],
+            "exclude_units": [],
+        })
+        self.assertEqual(0, result.returncode, result.stderr)
+
+        applied = run_script(
+            "apply_allocation_answers.py",
+            "--allocation", str(self.allocation_path),
+            "--answers", str(output),
+        )
+        self.assertEqual(0, applied.returncode, applied.stderr)
+        allocation = json.loads(self.allocation_path.read_text(encoding="utf-8"))
+        unit = allocation["allocation_units"][0]
+        self.assertEqual(str(approval.resolve()), unit["approval_file"])
+        self.assertEqual("provided", unit["approval_file_status"])
+
+    def test_composer_rejects_non_numeric_amount(self) -> None:
+        result, output = self.compose({
+            "schema_version": "allocation_decisions.v1",
+            "decisions": [{
+                "units": "1@00000001",
+                "set": {"invoice_amount": "not-a-number"},
+            }],
+            "question_updates": [],
+            "project_contexts": [],
+            "confirm_units": [],
+            "drop_units": [],
+            "exclude_units": [],
+        })
+
+        self.assertEqual(2, result.returncode)
+        self.assertFalse(output.exists())
+        self.assertIn("invoice_amount must be a finite numeric value", result.stderr)
 
     def test_compact_set_accepts_utf8_chinese_and_unquoted_value_spaces(self) -> None:
         output_path = self.root / "process" / "allocation-answers.json"

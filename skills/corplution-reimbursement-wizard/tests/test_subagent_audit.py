@@ -39,6 +39,33 @@ class RoleSurface(unittest.TestCase):
             self.assertTrue(hasattr(sp, name), f"{name} should exist")
 
 
+class ProtocolErrorClassification(unittest.TestCase):
+    def test_task_binding_mismatch_has_structured_stale_code(self):
+        task = {
+            "task_id": "current-task",
+            "integrity": {"fingerprint": "task-fingerprint"},
+            "source_generation": {
+                "source_allocation_fingerprint": "allocation-fingerprint",
+                "source_extraction_fingerprint": "extraction-fingerprint",
+            },
+            "role_id": "mirror_warden",
+            "display_name": "Otako - Mirror Warden",
+        }
+        candidate = {
+            "task_id": "older-task",
+            "source_task_fingerprint": "task-fingerprint",
+            "source_allocation_fingerprint": "allocation-fingerprint",
+            "source_extraction_fingerprint": "extraction-fingerprint",
+            "agent_id": "mirror_warden",
+            "agent_display_name": "Otako - Mirror Warden",
+        }
+
+        with self.assertRaises(sp.ProtocolError) as raised:
+            sp._validate_binding(candidate, task)
+
+        self.assertEqual(sp.ProtocolError.STALE_TASK, raised.exception.code)
+
+
 class UnifiedAuditShape(unittest.TestCase):
     def test_both_roles_produce_outcome_findings_schema(self):
         for role in ("mirror_warden", "gate_challenger"):
@@ -278,6 +305,13 @@ class FindingGuardrails(unittest.TestCase):
             task,
             allocation,
         )
+
+    def test_claim_exceeds_zero_numeric_invoice_without_truthiness_fallback(self):
+        self.assertTrue(sp._unit_claim_exceeds_evidence({
+            "invoice_amount": 0,
+            "amount": 88,
+            "reimbursable_amount": 1,
+        }))
 
     def test_complete_taxi_evidence_cannot_be_blocked_for_contextual_flight_invoice(self):
         units = [{

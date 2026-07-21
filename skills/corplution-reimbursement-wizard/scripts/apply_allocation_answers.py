@@ -7,7 +7,6 @@ import argparse
 import json
 import re
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -23,8 +22,15 @@ from policy_config import load_policy
 import place_config
 from place_config import PlaceBook
 import allocation_generations
+import evidence_paths
+from exit_codes import ExitCode
 import integrity
+from io_utils import configure_utf8_stdio as configure_stdio
+from json_io import read_json_object as load_json
 import text_safety
+from text_utils import strip_scalar as clean
+import time_utils
+import value_utils
 
 _POLICY = load_policy()
 ADMIN_CODE = _POLICY.admin_code
@@ -45,6 +51,7 @@ ALLOWED_ROOT_FIELDS = {
     "exclude_units",
     "lineage_rebase",
 }
+MONEY_FIELDS = {"amount", "invoice_amount", "reimbursable_amount"}
 
 HINT_RESOLUTION_ACTIONS = {
     "matched_existing",
@@ -172,26 +179,9 @@ ENCODING_CHECK_CONTEXT_FIELDS = {
 }
 
 
-def load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
-
-
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def clean(value: Any) -> str:
-    return "" if value is None else str(value).strip()
-
-
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
 
 
 def list_text(value: Any) -> str:
@@ -439,7 +429,7 @@ def refresh_hotel_note(unit: dict[str, Any], update: dict[str, Any]) -> None:
         unit["final_note"] = note
 
 
-def note_placeholder_errors(unit: dict[str, Any]) -> list[str]:
+def decision_note_errors(unit: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if contains_place_type_placeholder(unit.get("final_note")):
         errors.append("taxi note still contains place-type placeholders")
@@ -899,6 +889,13 @@ def validate_update(update: dict[str, Any], lenient: bool) -> list[str]:
             continue
         if isinstance(value, (dict, list, tuple, set)):
             errors.append(f"Invalid value type for {field}: nested objects/lists are not allowed")
+    for field in MONEY_FIELDS:
+        if field not in update or value_utils.is_blank(update.get(field)):
+            continue
+        try:
+            value_utils.parse_finite_decimal(update.get(field), field=field)
+        except ValueError as exc:
+            errors.append(str(exc))
     if not any(field in ALLOWED_UNIT_FIELDS for field in update):
         errors.append("Unit update has no fields to apply; correct or remove this decision entry.")
     column = update.get("final_template_column")
@@ -937,7 +934,12 @@ def collect_place_memory(
         sink.append({"name": name, "place_type": place_type})
 
 
-def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: bool) -> dict[str, Any]:
+def apply_unit_update(
+    unit: dict[str, Any],
+    update: dict[str, Any],
+    lenient: bool,
+    process_dir: Path | None = None,
+) -> dict[str, Any]:
     errors = validate_update(update, lenient)
     if errors:
         raise ValueError("; ".join(errors))
@@ -983,9 +985,17 @@ def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: boo
 
     if unit.get("is_substitute_invoice"):
         unit["approval_required"] = unit.get("approval_required") or "partner_approval_screenshot"
-        approval_file = clean(unit.get("approval_file"))
+        approval_file = (
+            evidence_paths.normalize_approval_file(unit, process_dir)
+            if process_dir is not None
+            else clean(unit.get("approval_file"))
+        )
+        unit["issues"] = [
+            issue for issue in unit.get("issues", [])
+            if not isinstance(issue, dict) or issue.get("field") != "approval_file"
+        ]
         if approval_file:
-            unit["approval_file_status"] = "provided" if Path(approval_file).exists() else "missing"
+            unit["approval_file_status"] = "provided" if Path(approval_file).is_file() else "missing"
             if unit["approval_file_status"] == "missing":
                 add_issue(unit, "approval_file", f"Substitute approval file not found: {approval_file}")
         else:
@@ -997,7 +1007,7 @@ def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: boo
         unit["place_type_confidence"] = unit.get("place_type_confidence") or "confirmed"
 
     normalize_admin_client(unit)
-    accounting_errors = mobile_accounting_errors(unit) + note_placeholder_errors(unit)
+    accounting_errors = mobile_accounting_errors(unit) + decision_note_errors(unit)
     if accounting_errors:
         raise ValueError(f"{unit.get('unit_id')} accounting conflict: " + "; ".join(accounting_errors))
 
@@ -1249,7 +1259,17 @@ def refresh_expense_hint_reconciliation(payload: dict[str, Any], touched_units: 
 
 
 def current_rail_chain_route(chain_units: list[dict[str, Any]]) -> str:
-    ordered = sorted(chain_units, key=lambda unit: int(unit.get("journey_chain_position") or 0))
+    def position(unit: dict[str, Any]) -> int:
+        try:
+            return value_utils.parse_integer(
+                unit.get("journey_chain_position"),
+                field="journey_chain_position",
+                minimum=1,
+            )
+        except ValueError as exc:
+            raise ValueError(f"{unit.get('unit_id') or '<unknown unit>'}: {exc}") from exc
+
+    ordered = sorted(chain_units, key=position)
     routes = [
         route_from_text(unit.get("route"))
         or route_from_text(unit.get("source_note"))
@@ -1395,8 +1415,9 @@ def build_markdown(payload: dict[str, Any]) -> str:
         lines.append(
             f"| {unit_no(unit)} | {unit['unit_id']} | {unit.get('source_filename','')} | "
             f"{unit.get('source_document_id','')} {unit.get('source_item_id') or ''} | "
-            f"{unit.get('expense_date','')} | {city_route} | {unit.get('invoice_amount') or unit.get('amount','')} | "
-            f"{unit.get('reimbursable_amount') or unit.get('amount','')} | {unit.get('source_category','')} | "
+            f"{unit.get('expense_date','')} | {city_route} | "
+            f"{clean(value_utils.first_nonblank(unit.get('invoice_amount'), unit.get('amount')))} | "
+            f"{clean(value_utils.first_nonblank(unit.get('reimbursable_amount'), unit.get('amount')))} | "
             f"{unit.get('client_name','')} | {unit.get('client_charge_code','')} | {unit.get('final_template_column','')} | "
             f"{unit.get('confidence','')} | {unit.get('status','')} |"
         )
@@ -1550,7 +1571,12 @@ def apply_answers(
             if flip_error:
                 raise ValueError(flip_error)
             was_meal = clean(unit.get("source_category")) == "meal"
-            changes.append(apply_unit_update(unit, update, lenient))
+            changes.append(apply_unit_update(
+                unit,
+                update,
+                lenient,
+                process_dir=allocation_path.parent,
+            ))
             mismatch = guard_meal_note_mismatch(unit)
             if mismatch:
                 raise ValueError(mismatch)
@@ -1588,7 +1614,7 @@ def apply_answers(
         )
     if lineage_rebase:
         payload["removed_evidence_reconciliation"] = removed_evidence_reconciliation
-    payload["generated_at"] = datetime.now().replace(microsecond=0).isoformat()
+    payload["generated_at"] = time_utils.iso_now()
     payload.setdefault("change_log", []).append({
         "timestamp": payload["generated_at"],
         "script": "apply_allocation_answers.py",
@@ -1670,7 +1696,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         print_answers_schema_help(allocation_path)
-        return 2
+        return ExitCode.COMMAND_ERROR
     if args.dry_run:
         print("Dry run OK. No files were written.")
     else:
@@ -1678,7 +1704,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Wrote {markdown_path}")
     print_open_questions(payload)
     print_advisory_questions(payload)
-    return 0
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

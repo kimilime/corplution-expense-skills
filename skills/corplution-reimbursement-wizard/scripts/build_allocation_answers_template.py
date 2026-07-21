@@ -7,9 +7,15 @@ import argparse
 import json
 import integrity
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from io_utils import configure_utf8_stdio as configure_stdio
+from json_io import read_json_object as load_json
+from text_utils import strip_scalar as clean
+import time_utils
+import value_utils
+from exit_codes import ExitCode
 
 
 OPEN_QUESTION_STATUSES = {"open", "needs_confirmation", "draft"}
@@ -27,26 +33,9 @@ RELIABLE_DATE_SOURCES = {
 }
 
 
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
-
-
-def load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
-
-
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def clean(value: Any) -> str:
-    return "" if value is None else str(value).strip()
 
 
 def as_bool(value: Any) -> bool:
@@ -227,7 +216,7 @@ def review_context(unit: dict[str, Any], question_ids: list[str]) -> dict[str, A
         "seller_or_provider": clean(unit.get("seller_name") or unit.get("line_item_name")),
         "date": clean(unit.get("expense_date") or unit.get("issue_date")),
         "date_source": clean(unit.get("date_source")),
-        "amount": clean(unit.get("amount") or unit.get("invoice_amount")),
+        "amount": clean(value_utils.first_nonblank(unit.get("amount"), unit.get("invoice_amount"))),
         "category": clean(unit.get("source_category")),
         "final_template_column": clean(unit.get("final_template_column")),
         "suggested_client": clean(unit.get("client_name")),
@@ -243,7 +232,7 @@ def build_template(payload: dict[str, Any], allocation_path: Path, include_advis
     return {
         "schema_version": "allocation_answers_diagnostic.v1",
         "diagnostic_only": True,
-        "generated_at": datetime.now().replace(microsecond=0).isoformat(),
+        "generated_at": time_utils.iso_now(),
         "source_allocation_file": str(allocation_path),
         "inspection_instructions": [
             "This file is diagnostic only and is intentionally rejected by the updater.",
@@ -284,7 +273,7 @@ def main(argv: list[str] | None = None) -> int:
         print("No open or draft allocation units need inspection.")
     else:
         print("DIAGNOSTIC ONLY: do not fill or apply this file. Use allocation_decisions.v1 + Composer.")
-    return 0
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

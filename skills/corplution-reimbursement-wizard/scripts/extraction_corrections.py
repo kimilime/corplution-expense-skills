@@ -19,9 +19,9 @@ and its reason stay on the audit trail.
 from __future__ import annotations
 
 import json
-from datetime import datetime
 
 import integrity
+import time_utils
 from pathlib import Path
 from typing import Any
 
@@ -196,7 +196,7 @@ def apply_overlay(payload: dict[str, Any], overlay: dict[str, Any]) -> list[str]
                 else:
                     doc[key] = value
             doc["corrected_by"] = entry.get("corrected_by", "user")
-            doc["corrected_at"] = entry.get("corrected_at", datetime.now().replace(microsecond=0).isoformat())
+            doc["corrected_at"] = entry.get("corrected_at", time_utils.iso_now())
             if entry.get("reason"):
                 doc["correction_note"] = str(entry["reason"]).strip()
             if "needs_review" not in set_fields and set_fields.get("document_role") in ALLOWED_ROLES - {"unknown"}:
@@ -235,7 +235,7 @@ def apply_input_resolutions(payload: dict[str, Any], overlay: dict[str, Any]) ->
             item["status"] = action
             item["resolution"] = str(entry["reason"]).strip()
             item["resolved_by"] = entry.get("corrected_by", "user")
-            item["resolved_at"] = entry.get("corrected_at", datetime.now().replace(microsecond=0).isoformat())
+            item["resolved_at"] = entry.get("corrected_at", time_utils.iso_now())
             if action == "converted":
                 item["replacement_file"] = str(entry["replacement_file"]).strip()
             log.append(f"unsupported input {item.get('filename')}: {action} ({item['resolution']})")

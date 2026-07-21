@@ -23,6 +23,8 @@ import sys
 from pathlib import Path
 from typing import Any
 
+from exit_codes import ExitCode
+
 SCHEMA_VERSION = "place_definitions.v1"
 
 # Canonical place types (mirror the taxi place-type values in allocate_expenses.C).
@@ -310,7 +312,7 @@ def _main(argv: list[str] | None = None) -> int:
     if args.cmd == "add":
         if args.place_type not in PLACE_TYPES:
             print(f"ERROR: --type must be one of {'/'.join(sorted(PLACE_TYPES))}", file=sys.stderr)
-            return 2
+            return ExitCode.COMMAND_ERROR
         entry: dict[str, Any] = {"name": args.name, "place_type": args.place_type, "aliases": args.alias}
         if args.client_name:
             entry["client_name"] = args.client_name
@@ -319,27 +321,27 @@ def _main(argv: list[str] | None = None) -> int:
         book = PlaceBook.load()
         added = book.remember([entry])
         print(f"Added {added} entry(ies) to {place_definitions_path()}.")
-        return 0
+        return ExitCode.SUCCESS
 
     if args.cmd == "list":
         book = PlaceBook.load()
         if not book.entries:
             print("(no places remembered)")
-            return 0
+            return ExitCode.SUCCESS
         for entry in book.entries:
             aliases = "/".join(entry.get("aliases", []))
             extra = f"  [{aliases}]" if aliases else ""
             client = f"  client={entry['client_name']}" if entry.get("client_name") else ""
             print(f"{entry['place_type']:<4} {entry['name']}{extra}{client}")
-        return 0
+        return ExitCode.SUCCESS
 
     if args.cmd == "remove":
         book = PlaceBook.load()
         removed = book.forget(args.name, args.place_type or None)
         print(f"Removed {removed} entry(ies) from {place_definitions_path()}.")
-        return 0
+        return ExitCode.SUCCESS
 
-    return 0
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

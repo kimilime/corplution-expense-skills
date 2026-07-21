@@ -11,31 +11,15 @@ from __future__ import annotations
 import hashlib
 import json
 import os
-from datetime import datetime
+from io_utils import sha256_file
+from json_io import read_optional_json_object as load_json
+import time_utils
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
 
 SCHEMA_VERSION = "reimbursement_workflow_journal_event.v1"
 EVENTS = {"started", "completed", "failed", "blocked"}
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def load_json(path: Path) -> dict[str, Any] | None:
-    if not path.is_file():
-        return None
-    try:
-        value = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    return value if isinstance(value, dict) else None
 
 
 def process_artifact(path: Path, count_fields: dict[str, str]) -> dict[str, Any] | None:
@@ -155,7 +139,7 @@ def build_event(
         "event_id": str(uuid4()),
         "workflow_id": workflow_id(process_dir),
         "run_id": run_id,
-        "timestamp": datetime.now().astimezone().isoformat(timespec="seconds"),
+        "timestamp": time_utils.iso_now(),
         "stage": stage,
         "script": Path(script).name,
         "event": event,

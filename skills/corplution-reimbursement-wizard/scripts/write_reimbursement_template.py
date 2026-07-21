@@ -11,7 +11,7 @@ import re
 import sys
 from collections import OrderedDict, defaultdict
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
@@ -49,9 +49,16 @@ C = {
 # Policy numbers and year-coded values come from assets/policy.toml via
 # policy_config; edit that file (not this one) when company policy changes.
 from policy_config import load_policy
+import evidence_paths
+from exit_codes import ExitCode
 import integrity
+from io_utils import configure_utf8_stdio as configure_stdio
+from json_io import read_json_object as load_json
 import text_safety
+from text_utils import normalize_text as clean
 import subagent_protocol
+import time_utils
+import value_utils
 
 _POLICY = load_policy()
 BUSINESS_TRIP_MEAL_DAILY_CAP = _POLICY.business_trip_meal_daily_cap
@@ -195,10 +202,6 @@ def load_layout(path: Path) -> dict[str, Any]:
     return layout
 
 
-def load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
-
-
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
@@ -226,19 +229,6 @@ def workbook_text_issues(path: Path) -> list[str]:
     finally:
         workbook.close()
     return findings
-
-
-def clean(value: Any) -> str:
-    return re.sub(r"\s+", " ", "" if value is None else str(value)).strip()
-
-
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
 
 
 def normalized_client_name(unit: dict[str, Any]) -> str:
@@ -563,7 +553,7 @@ def normalized_note_base(unit: dict[str, Any]) -> str:
     return note
 
 
-def note_placeholder_errors(unit: dict[str, Any]) -> list[str]:
+def stage3_note_errors(unit: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if contains_place_type_placeholder(unit.get("final_note")):
         errors.append("taxi note still contains place-type placeholders")
@@ -585,7 +575,7 @@ def note_placeholder_errors(unit: dict[str, Any]) -> list[str]:
         if not ticket_note(unit):
             errors.append("rail/flight item requires route evidence for the final note template")
         elif contains_raw_ticket_evidence(unit.get("final_note")):
-            unit["final_note"] = ticket_note(unit)
+            errors.append("rail/flight final_note must use the finance template, not raw ticket evidence")
     return errors
 
 
@@ -620,6 +610,15 @@ def stage3_rule_errors(unit: dict[str, Any]) -> list[str]:
         if policy_error:
             errors.append(policy_error)
 
+    for field in ("amount", "invoice_amount", "reimbursable_amount"):
+        value = unit.get(field)
+        if value_utils.is_blank(value):
+            continue
+        try:
+            value_utils.parse_finite_decimal(value, field=field)
+        except ValueError as exc:
+            errors.append(str(exc))
+
     # A doc/template placeholder such as <ADMIN_CODE>/<BD_CODE>/CORP-<FY>-ADMIN must
     # never reach the workbook. Angle brackets never appear in a real fiscal-year
     # code, so treat any as an unresolved placeholder and block generation.
@@ -639,22 +638,15 @@ def stage3_rule_errors(unit: dict[str, Any]) -> list[str]:
     return errors
 
 
-def money(value: Any) -> str:
-    if value in (None, ""):
-        return "0.00"
-    try:
-        return f"{Decimal(str(value).replace(',', '')):.2f}"
-    except InvalidOperation:
-        match = re.search(r"-?\d+(?:\.\d+)?", str(value))
-        return f"{Decimal(match.group(0)):.2f}" if match else "0.00"
+money = value_utils.format_money
 
 
 def invoice_amount(unit: dict[str, Any]) -> str:
-    return money(unit.get("invoice_amount") or unit.get("amount"))
+    return money(value_utils.first_nonblank(unit.get("invoice_amount"), unit.get("amount")))
 
 
 def reimbursable_amount(unit: dict[str, Any]) -> str:
-    return money(unit.get("reimbursable_amount") or unit.get("amount"))
+    return money(value_utils.first_nonblank(unit.get("reimbursable_amount"), unit.get("amount")))
 
 
 def date_yyyymmdd(value: str) -> str:
@@ -968,7 +960,7 @@ def require_ready(allocation: dict[str, Any], allow_unconfirmed: bool) -> list[s
             errors.append(f"{unit.get('unit_id')} has a provisional date but is not an other expense.")
         for accounting_error in mobile_accounting_errors(unit):
             errors.append(f"{unit.get('unit_id')} accounting conflict: {accounting_error}.")
-        for note_error in note_placeholder_errors(unit):
+        for note_error in stage3_note_errors(unit):
             errors.append(f"{unit.get('unit_id')} note conflict: {note_error}.")
         for rule_error in stage3_rule_errors(unit):
             errors.append(f"{unit.get('unit_id')} stage-3 rule conflict: {rule_error}.")
@@ -2303,7 +2295,7 @@ def main(argv: list[str] | None = None) -> int:
             f"Expected: {allocation_path.parent.resolve()}",
             file=sys.stderr,
         )
-        return 2
+        return ExitCode.COMMAND_ERROR
     template_path = resolve_template_arg(args.template)
     if template_path and not template_path.exists():
         print(
@@ -2311,7 +2303,7 @@ def main(argv: list[str] | None = None) -> int:
             "Pass an existing --template path or omit --template to generate the workbook directly.",
             file=sys.stderr,
         )
-        return 2
+        return ExitCode.COMMAND_ERROR
     layout_path = resolve_layout_arg(args.layout)
     layout = None
     if not template_path or args.layout:
@@ -2319,10 +2311,13 @@ def main(argv: list[str] | None = None) -> int:
             layout = load_layout(layout_path)
         except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
             print(f"ERROR: Workbook layout could not be loaded from {layout_path}: {exc}", file=sys.stderr)
-            return 2
+            return ExitCode.COMMAND_ERROR
 
     allocation = load_json(allocation_path)
     integrity.require_valid(allocation, allocation_path)
+    for unit in allocation.get("allocation_units", []):
+        if unit.get("is_substitute_invoice") and unit.get("approval_file"):
+            evidence_paths.normalize_approval_file(unit, process_dir)
     errors = require_ready(allocation, args.allow_unconfirmed)
     expected_context_sha = str(allocation.get("source_project_context_sha256", "")).strip()
     recorded_context = str(allocation.get("source_project_context_file", "")).strip()
@@ -2438,7 +2433,7 @@ def main(argv: list[str] | None = None) -> int:
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
-        return 2
+        return ExitCode.COMMAND_ERROR
 
     units = included_units(allocation)
     proof_groups = assign_proof_numbers(units)
@@ -2454,7 +2449,7 @@ def main(argv: list[str] | None = None) -> int:
     )
     if row_text_issues:
         print("ERROR: Refusing to write a workbook with suspect encoding damage: " + "; ".join(row_text_issues), file=sys.stderr)
-        return 2
+        return ExitCode.COMMAND_ERROR
     meal_checks = meal_daily_cap_checks(rows)
     hotel_checks = hotel_cap_checks(rows)
     project_blocks, summary_rows = write_workbook(Path(args.output), rows, template_path, layout)
@@ -2463,13 +2458,13 @@ def main(argv: list[str] | None = None) -> int:
         print("ERROR: Workbook text scan found suspect encoding damage. The workbook is not a deliverable; "
               "fix the UTF-8 answers input and re-run Stage 3. Findings: "
               + "; ".join(saved_workbook_text_issues), file=sys.stderr)
-        return 2
+        return ExitCode.COMMAND_ERROR
     meal_check_status = aggregate_check_status(meal_checks)
     hotel_check_status = aggregate_check_status(hotel_checks)
 
     payload = {
         "schema_version": "final_expense_rows.v1",
-        "generated_at": datetime.now().replace(microsecond=0).isoformat(),
+        "generated_at": time_utils.iso_now(),
         "requester": args.requester,
         "source_allocation_file": str(allocation_path),
         "workbook_source": "template" if template_path else "generated",
@@ -2552,9 +2547,9 @@ def main(argv: list[str] | None = None) -> int:
         print("NEXT: relay the STAGE 3 REVIEW SUMMARY above to the user VERBATIM, resolve the blocking "
               "checks via the answers updater, then RE-RUN this script. Packaging will refuse until "
               "blocking checks are zero.")
-        return 3
+        return ExitCode.REVIEW_REQUIRED
     print("NEXT: run scripts/package_reimbursement_files.py to build the final submission package.")
-    return 0
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

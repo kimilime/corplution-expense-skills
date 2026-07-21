@@ -877,7 +877,7 @@ Write `process/expense-allocation.json`:
       "client_name": "",
       "client_charge_code": "",
       "admin_client_review_needed": false,
-      "expenses_nature": "out_of_town",
+      "expenses_nature": "出差",
       "expense_note": "",
       "final_note": "",
       "attendees": "",

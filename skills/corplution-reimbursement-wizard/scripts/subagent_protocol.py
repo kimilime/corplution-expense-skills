@@ -25,8 +25,14 @@ except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback
     import tomli as tomllib
 
 import integrity
+from exit_codes import ExitCode
+from io_utils import configure_utf8_stdio as configure_stdio, sha256_file
+import json_io
 import text_safety
 import allocation_generations
+from text_utils import strip_scalar as clean
+import time_utils
+import value_utils
 from apply_allocation_answers import ALLOWED_UNIT_FIELDS, validate_update
 
 
@@ -270,7 +276,12 @@ UNRESOLVED_INPUT_PACKET_FIELDS = (
 
 
 class ProtocolError(ValueError):
-    pass
+    INVALID_RESULT = "invalid_result"
+    STALE_TASK = "stale_task"
+
+    def __init__(self, message: str, *, code: str = INVALID_RESULT) -> None:
+        super().__init__(message)
+        self.code = code
 
 
 class HandoffTooLarge(ProtocolError):
@@ -294,44 +305,15 @@ class HandoffTooLarge(ProtocolError):
         )
 
 
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
-
-
-def clean(value: Any) -> str:
-    return "" if value is None else str(value).strip()
-
-
 def sha256_bytes(data: bytes) -> str:
     return hashlib.sha256(data).hexdigest()
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
-
-
-def canonical_sha(value: Any) -> str:
-    encoded = json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
-    return sha256_bytes(encoded.encode("utf-8"))
-
-
 def load_json(path: Path) -> dict[str, Any]:
     try:
-        value = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
-        raise ProtocolError(f"cannot read JSON {path}: {exc}") from exc
-    if not isinstance(value, dict):
-        raise ProtocolError(f"JSON root must be an object: {path}")
-    return value
+        return json_io.read_json_object(path)
+    except json_io.JsonReadError as exc:
+        raise ProtocolError(str(exc)) from exc
 
 
 def write_json(path: Path, payload: dict[str, Any]) -> None:
@@ -811,7 +793,7 @@ def _build_task(
         "allocation_engine_revision": clean(allocation.get("allocation_engine_revision")),
         "role_instructions_sha256": role_sha,
     }
-    task_id = canonical_sha(basis)
+    task_id = allocation_generations.canonical_sha(basis)
     snapshot = _compact_task_snapshot(role, allocation, extraction)
     task = {
         "schema_version": TASK_SCHEMA,
@@ -929,7 +911,10 @@ def _validate_binding(candidate: dict[str, Any], task: dict[str, Any]) -> None:
     }
     for field, value in expected.items():
         if clean(candidate.get(field)) != value:
-            raise ProtocolError(f"result {field} does not exactly match the current task")
+            raise ProtocolError(
+                f"result {field} does not exactly match the current task",
+                code=ProtocolError.STALE_TASK,
+            )
 
 
 def _validate_coverage(candidate: dict[str, Any], task: dict[str, Any]) -> None:
@@ -975,7 +960,10 @@ def _validate_ref_list(value: Any, known: set[str], label: str, *, allow_empty: 
         raise ProtocolError(f"{label} repeats a unit reference")
     unknown = [item for item in refs if item not in known]
     if unknown:
-        raise ProtocolError(f"{label} contains stale or unknown refs: {', '.join(unknown)}")
+        raise ProtocolError(
+            f"{label} contains stale or unknown refs: {', '.join(unknown)}",
+            code=ProtocolError.STALE_TASK,
+        )
     return refs
 
 
@@ -1031,8 +1019,12 @@ def _decimal_amount(value: Any) -> Decimal | None:
 
 
 def _unit_claim_exceeds_evidence(unit: dict[str, Any]) -> bool:
-    invoice = _decimal_amount(unit.get("invoice_amount") or unit.get("amount"))
-    claim = _decimal_amount(unit.get("reimbursable_amount") or unit.get("amount"))
+    invoice = _decimal_amount(
+        value_utils.first_nonblank(unit.get("invoice_amount"), unit.get("amount"))
+    )
+    claim = _decimal_amount(
+        value_utils.first_nonblank(unit.get("reimbursable_amount"), unit.get("amount"))
+    )
     return invoice is not None and claim is not None and claim > invoice
 
 
@@ -1384,7 +1376,7 @@ def accept_result(
     candidate = load_json(result_path)
     validate_result(candidate, task, allocation)
     accepted = dict(candidate)
-    accepted["accepted_at"] = datetime.now().isoformat(timespec="microseconds")
+    accepted["accepted_at"] = time_utils.iso_now(timespec="microseconds")
     accepted["accepted_by"] = "subagent_protocol.py"
     integrity.stamp(accepted, "subagent_protocol.py")
     paths = task_paths(process_dir, task)
@@ -1464,12 +1456,14 @@ def audit_state(
         candidate_paths.append(canonical_path)
     valid: dict[str, tuple[dict[str, Any], Path]] = {}
     errors: list[str] = []
+    error_codes: list[str] = []
     for candidate_path in candidate_paths:
         try:
             report = load_json(candidate_path)
             _validate_accepted_audit(report, task, current_allocation)
         except ProtocolError as exc:
             errors.append(f"{candidate_path.name}: {exc}")
+            error_codes.append(exc.code)
             continue
         fingerprint = clean((report.get("integrity") or {}).get("fingerprint"))
         valid[fingerprint] = (report, candidate_path)
@@ -1478,7 +1472,7 @@ def audit_state(
         archive_root = process_dir / "subagent-audit-generations" / role
         has_older_archive = archive_root.is_dir() and any(archive_root.glob("*/*.json"))
         if candidate_paths:
-            stale = any("current task" in error or "different allocation" in error for error in errors)
+            stale = ProtocolError.STALE_TASK in error_codes
             return {
                 **state,
                 "status": "stale" if stale else "invalid",
@@ -1623,7 +1617,7 @@ def main(argv: list[str] | None = None) -> int:
                 "workspace files. Use response_json_schema when the host supports structured output. Save its exact "
                 "JSON response outside process/, then run Chief accept-agent."
             )
-            return 0
+            return ExitCode.SUCCESS
         if args.command == "accept":
             accepted, paths = accept_result(
                 args.role,
@@ -1637,11 +1631,11 @@ def main(argv: list[str] | None = None) -> int:
             print(f"Outcome: {accepted.get('outcome')}")
             print(chat_review_summary(accepted))
             print("NEXT: run Chief status; a current blocking audit from either role prevents Stage 3.")
-            return 0
+            return ExitCode.SUCCESS
         allocation = load_json(Path(args.allocation))
         _full_fingerprint(allocation, "allocation")
         print(json.dumps(audit_state(args.role, Path(args.process_dir), allocation), ensure_ascii=False, indent=2))
-        return 0
+        return ExitCode.SUCCESS
     except HandoffTooLarge as degrade:
         # Over-cap is a designed fail-open, not a failure to fix. For prepare it degrades
         # cleanly (exit 0) so Chief keeps going straight to the deterministic Stage-3
@@ -1652,13 +1646,13 @@ def main(argv: list[str] | None = None) -> int:
                 "NEXT: skip this subagent audit and run Chief write; the deterministic Stage-3 "
                 "preflight is authoritative. Do not hand-assemble a packet or manually accept a result."
             )
-            return 0
+            return ExitCode.SUCCESS
         print(f"REFUSED: {degrade}", file=sys.stderr)
-        return 2
+        return ExitCode.COMMAND_ERROR
     except ProtocolError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         print("NEXT: regenerate the task from the current allocation and return JSON matching its generated template.", file=sys.stderr)
-        return 2
+        return ExitCode.COMMAND_ERROR
 
 
 if __name__ == "__main__":

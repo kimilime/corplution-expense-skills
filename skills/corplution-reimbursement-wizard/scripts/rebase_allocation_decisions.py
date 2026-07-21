@@ -16,8 +16,10 @@ from pathlib import Path
 from typing import Any
 
 import allocation_generations
+from exit_codes import ExitCode
 import integrity
 import text_safety
+import value_utils
 
 
 # Only applicant/agent judgments belong here. Evidence-side values such as
@@ -577,7 +579,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         print(
             f"- {entry['removal_ref']} [{state}] {entry.get('source_filename') or '?'} | "
-            f"{entry.get('amount') or '?'} | {entry.get('expense_date') or entry.get('source_category') or '?'} | "
+            f"{value_utils.display_value(entry.get('amount'), missing='?')} | "
+            f"{entry.get('expense_date') or entry.get('source_category') or '?'} | "
             f"上代状态 {entry.get('prior_status') or '?'}"
         )
     print("=== 报告结束 ===")
@@ -600,7 +603,7 @@ def main(argv: list[str] | None = None) -> int:
         )
     else:
         print("NEXT: no prior action was transferable; resolve the changed/new items with the user.")
-    return 0
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

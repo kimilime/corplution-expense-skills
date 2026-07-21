@@ -15,7 +15,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
-from datetime import datetime
+from exit_codes import ExitCode
+import time_utils
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,7 @@ def stamp(payload: dict[str, Any], stamped_by: str) -> None:
     payload[INTEGRITY_KEY] = {
         "fingerprint": _canonical_digest(payload),
         "stamped_by": stamped_by,
-        "stamped_at": datetime.now().replace(microsecond=0).isoformat(),
+        "stamped_at": time_utils.iso_now(),
     }
 
 
@@ -87,7 +88,7 @@ def require_valid(payload: dict[str, Any], path: Path, kind: str = "allocation")
     ok, reason = check(payload)
     if not ok:
         print(_recovery_message(path, reason, kind), file=sys.stderr)
-        raise SystemExit(4)
+        raise SystemExit(ExitCode.INTEGRITY_ERROR)
 
 
 def warn_if_invalid(payload: dict[str, Any], path: Path) -> None:

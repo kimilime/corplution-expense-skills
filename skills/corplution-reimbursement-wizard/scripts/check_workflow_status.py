@@ -11,7 +11,6 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 from pathlib import Path
@@ -20,35 +19,11 @@ from typing import Any
 import integrity
 import allocate_expenses
 import allocation_generations
+from exit_codes import ExitCode
+from io_utils import configure_utf8_stdio as configure_stdio, sha256_file
+from json_io import read_optional_json_object as load
 import subagent_protocol
-
-
-def configure_stdio() -> None:
-    """Status is often run from Windows terminals that cannot encode all markers."""
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
-
-
-def load(path: Path) -> dict[str, Any] | None:
-    if not path.exists():
-        return None
-    try:
-        value = json.loads(path.read_text(encoding="utf-8-sig"))
-    except Exception:
-        return None
-    return value if isinstance(value, dict) else None
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+import value_utils
 
 
 def is_hidden_package_artifact(path: Path, root: Path) -> bool:
@@ -788,7 +763,7 @@ def inspect_workflow(
                 },
                 missing=[
                     f"{item.get('removal_ref')}: {item.get('source_filename') or '?'} | "
-                    f"{item.get('amount') or '?'} | "
+                    f"{value_utils.display_value(item.get('amount'), missing='?')} | "
                     f"{item.get('expense_date') or item.get('source_category') or '?'}"
                     for item in rebase_removed_open
                 ],
@@ -1298,7 +1273,9 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(state, ensure_ascii=False, indent=2))
     else:
         print(render_status(state))
-    return 2 if state.get("integrity_blocked") else 0
+    # This is a read-only query: a successfully reported blocked state is not a
+    # CLI execution failure. Consumers inspect next.kind/integrity_blocked.
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

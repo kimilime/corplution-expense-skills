@@ -6,8 +6,8 @@ from __future__ import annotations
 import argparse
 
 import extraction_corrections as xc
+from exit_codes import ExitCode
 import integrity
-import hashlib
 import json
 import re
 import shutil
@@ -17,6 +17,11 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+
+from io_utils import configure_utf8_stdio as configure_stdio, sha256_file
+import text_utils
+import time_utils
+import value_utils
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".heic"}
@@ -105,36 +110,14 @@ class ExtractedText:
     issues: list[dict[str, str]]
 
 
-def clean(value: Any) -> str:
-    text = "" if value is None else str(value)
-    text = text.replace("\u3000", " ").replace("\r", "\n")
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
+clean = text_utils.normalize_text
 
 
 def compact(value: str) -> str:
     return re.sub(r"\s+", "", value or "")
 
 
-def money(value: Any) -> str:
-    if value is None:
-        return ""
-    text = str(value).replace(",", "").replace("\uffe5", "").replace("\u00a5", "").strip()
-    match = re.search(r"-?\d+(?:\.\d+)?", text)
-    if not match:
-        return ""
-    try:
-        return f"{Decimal(match.group(0)):.2f}"
-    except InvalidOperation:
-        return ""
+money = value_utils.extract_evidence_amount
 
 
 def date_from_chinese(value: str) -> str:
@@ -149,14 +132,6 @@ def date_from_dash(value: str) -> str:
     if not match:
         return ""
     return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
-
-
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def iter_input_files(paths: list[Path]) -> tuple[list[Path], list[Path]]:
@@ -1299,7 +1274,7 @@ def build_payload(input_files: list[Path], skipped_files: list[Path]) -> dict[st
     batch["unresolved_input_count"] = len(skipped_files)
     return {
         "schema_version": "invoice_extraction.v1",
-        "generated_at": datetime.now().replace(microsecond=0).isoformat(),
+        "generated_at": time_utils.iso_now(),
         "batch": batch,
         "documents": documents,
         "unresolved_input_files": [unsupported_input_record(path) for path in skipped_files],
@@ -1319,7 +1294,7 @@ def main(argv: list[str] | None = None) -> int:
     files, skipped = iter_input_files(input_paths)
     if not files and not skipped:
         print("No supported PDF or image files found.", file=sys.stderr)
-        return 2
+        return ExitCode.COMMAND_ERROR
 
     payload = build_payload(files, skipped)
     output_dir = Path(args.output)
@@ -1375,7 +1350,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote {json_path}")
     print_input_reconciliation(payload, files, skipped)
     print_extraction_review_list(payload)
-    return 0
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

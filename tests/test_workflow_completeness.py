@@ -7,6 +7,7 @@ import sys
 import tempfile
 import unittest
 from contextlib import redirect_stderr
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
 from unittest.mock import patch
@@ -21,8 +22,12 @@ import check_workflow_status as workflow_status  # noqa: E402
 import chief_orchestrator as chief  # noqa: E402
 import extract_invoices as extractor  # noqa: E402
 import extraction_corrections as extraction_updates  # noqa: E402
+from exit_codes import ExitCode  # noqa: E402
 import integrity  # noqa: E402
+import json_io  # noqa: E402
 import package_reimbursement_files as packager  # noqa: E402
+import time_utils  # noqa: E402
+import value_utils  # noqa: E402
 import write_reimbursement_template as writer  # noqa: E402
 
 
@@ -279,6 +284,103 @@ class ExpenseHintCompletenessTests(unittest.TestCase):
 
 
 class CrossStageRegressionTests(unittest.TestCase):
+    def test_exit_code_contract_is_named_and_stable(self) -> None:
+        self.assertEqual(
+            [0, 1, 2, 3, 4, 130],
+            [
+                ExitCode.SUCCESS,
+                ExitCode.OPERATIONAL_ERROR,
+                ExitCode.COMMAND_ERROR,
+                ExitCode.REVIEW_REQUIRED,
+                ExitCode.INTEGRITY_ERROR,
+                ExitCode.INTERRUPTED,
+            ],
+        )
+
+    def test_skill_routes_detailed_rules_to_reference(self) -> None:
+        skill_root = ROOT / "skills" / "corplution-reimbursement-wizard"
+        skill_text = (skill_root / "SKILL.md").read_text(encoding="utf-8-sig")
+        rules_text = (skill_root / "references" / "workflow-core-rules.md").read_text(
+            encoding="utf-8-sig"
+        )
+
+        self.assertLessEqual(len(skill_text.splitlines()), 220)
+        self.assertIn("references/workflow-core-rules.md", skill_text)
+        self.assertIn("## Extraction Decision Tree", rules_text)
+        self.assertIn("## Validation Expectations", rules_text)
+
+    def test_required_and_optional_json_readers_have_explicit_contracts(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            path = Path(temp) / "broken.json"
+            path.write_text("{broken", encoding="utf-8")
+
+            with self.assertRaises(json_io.JsonReadError):
+                json_io.read_json_object(path)
+            self.assertIsNone(json_io.read_optional_json_object(path))
+
+    def test_persisted_timestamps_are_timezone_aware(self) -> None:
+        payload: dict = {}
+        integrity.stamp(payload, "test")
+        stamped_at = datetime.fromisoformat(payload["integrity"]["stamped_at"])
+        self.assertIsNotNone(stamped_at.utcoffset())
+        self.assertIsNotNone(datetime.fromisoformat(time_utils.iso_now()).utcoffset())
+
+    def test_display_value_preserves_numeric_zero(self) -> None:
+        self.assertEqual("0", value_utils.display_value(0, missing="?"))
+
+    def test_invalid_journey_position_has_contextual_validation_error(self) -> None:
+        with self.assertRaisesRegex(ValueError, "journey_chain_position must be an integer"):
+            updater.current_rail_chain_route([{
+                "unit_id": "UNIT-001",
+                "journey_chain_position": "not-a-number",
+                "route": "上海-南京",
+            }])
+
+    def test_stage3_note_validation_is_pure(self) -> None:
+        unit = {
+            "status": "confirmed",
+            "source_category": "travel",
+            "document_subtype": "railway_e_ticket",
+            "route": "上海-南京",
+            "final_note": "G123 上海->南京 二等座",
+        }
+        original_note = unit["final_note"]
+
+        errors = writer.stage3_note_errors(unit)
+
+        self.assertEqual(original_note, unit["final_note"])
+        self.assertTrue(any("finance template" in error for error in errors))
+
+    def test_numeric_zero_invoice_amount_does_not_fall_back_to_amount(self) -> None:
+        self.assertEqual("0.00", writer.invoice_amount({
+            "invoice_amount": 0,
+            "amount": "88.00",
+        }))
+
+    def test_stage3_rejects_non_numeric_amount_instead_of_writing_zero(self) -> None:
+        unit = {
+            "status": "confirmed",
+            "source_category": "other",
+            "final_template_column": "other",
+            "amount": "not-a-number",
+            "invoice_amount": "not-a-number",
+            "expense_date": "2026-07-01",
+            "client_name": "Test Client",
+            "client_charge_code": "CORP-TEST",
+            "final_note": "Test expense",
+        }
+
+        errors = writer.stage3_rule_errors(unit)
+        self.assertTrue(any("amount must be a finite numeric value" in error for error in errors))
+        self.assertTrue(any("invoice_amount must be a finite numeric value" in error for error in errors))
+
+    def test_packaging_rejects_invalid_row_proof_number(self) -> None:
+        with self.assertRaisesRegex(ValueError, "invalid proof_no"):
+            packager.rows_by_proof({"rows": [{"proof_no": "not-a-number"}]})
+
+        with self.assertRaisesRegex(ValueError, "invalid proof_no"):
+            packager.proof_no_name("not-a-number")
+
     def test_packaging_refuses_legacy_final_rows_without_hint_ledger(self) -> None:
         with tempfile.TemporaryDirectory() as temp:
             root = Path(temp)

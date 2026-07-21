@@ -569,6 +569,32 @@ class WorkflowStateTests(unittest.TestCase):
             lineage["allocation"]["fingerprint"],
         )
 
+    def test_blocked_query_commands_report_state_with_success_exit_code(self) -> None:
+        (self.fixture.process / "invoice-extraction.json").write_text("{broken", encoding="utf-8")
+        chief = SCRIPTS / "chief_orchestrator.py"
+        common = [
+            sys.executable,
+            str(chief),
+            "--process-dir", str(self.fixture.process),
+            "--output-root", str(self.fixture.output),
+        ]
+
+        for command in ("status", "next", "lineage"):
+            with self.subTest(command=command):
+                result = subprocess.run(
+                    [*common, command, "--json"],
+                    capture_output=True,
+                    text=True,
+                    encoding="utf-8",
+                    errors="replace",
+                )
+                self.assertEqual(0, result.returncode, result.stderr)
+                payload = json.loads(result.stdout)
+                if command == "status":
+                    self.assertEqual("blocked", payload["next"]["kind"])
+                elif command == "next":
+                    self.assertEqual("blocked", payload["kind"])
+
 
 class JournalTests(unittest.TestCase):
     def setUp(self) -> None:

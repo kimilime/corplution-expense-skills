@@ -21,6 +21,9 @@ from typing import Any
 from uuid import uuid4
 
 import check_workflow_status
+from exit_codes import ExitCode
+from io_utils import configure_utf8_stdio as configure_stdio
+from json_io import read_optional_json_object as load_json
 import workflow_journal
 
 SCRIPT_DIR = Path(__file__).resolve().parent
@@ -43,15 +46,6 @@ RUN_METADATA = {
 
 class OrchestratorError(ValueError):
     pass
-
-
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
 
 
 def add_run_parsers(run_parser: argparse.ArgumentParser) -> None:
@@ -145,14 +139,6 @@ def build_parser() -> argparse.ArgumentParser:
     run = commands.add_parser("run", help="Dispatch one canonical workflow operation.")
     add_run_parsers(run)
     return parser
-
-
-def load_json(path: Path) -> dict[str, Any] | None:
-    try:
-        value = json.loads(path.read_text(encoding="utf-8-sig"))
-    except (OSError, UnicodeError, json.JSONDecodeError):
-        return None
-    return value if isinstance(value, dict) else None
 
 
 def canonical_paths(args: argparse.Namespace) -> dict[str, Path]:
@@ -366,10 +352,10 @@ def run_child(
         result = subprocess.run(command, env=child_env)
         exit_code = normalize_child_exit_code(int(result.returncode))
     except KeyboardInterrupt:
-        exit_code = 130
+        exit_code = ExitCode.INTERRUPTED
     except OSError as exc:
         print(f"ERROR: could not launch {script_name}: {exc}", file=sys.stderr)
-        exit_code = 2
+        exit_code = ExitCode.COMMAND_ERROR
     duration_ms = int((time.monotonic() - started) * 1000)
     after = safe_snapshot(process_dir, output_root)
     print_journal_warning(workflow_journal.record_event(
@@ -634,7 +620,7 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         print(f"NEXT: execute the bundled Chief directly:\n{format_command(direct)}", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(ExitCode.COMMAND_ERROR)
     parser = build_parser()
     args = parser.parse_args(argv)
 
@@ -648,7 +634,10 @@ def main(argv: list[str] | None = None) -> int:
             print(check_workflow_status.render_status(state))
             print("")
             print(render_next(step))
-        return 2 if state.get("integrity_blocked") else 0
+        # Query execution succeeded even when the reported workflow state is
+        # blocked. Automation must inspect state.next.kind instead of confusing
+        # a business-state report with a command/validation failure.
+        return ExitCode.SUCCESS
 
     if args.command == "next":
         state, step = inspect(args)
@@ -656,7 +645,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(step, ensure_ascii=False, indent=2))
         else:
             print(render_next(step))
-        return 2 if step.get("kind") == "blocked" else 0
+        return ExitCode.SUCCESS
 
     if args.command == "lineage":
         state, _step = inspect(args)
@@ -665,7 +654,7 @@ def main(argv: list[str] | None = None) -> int:
             print(json.dumps(report, ensure_ascii=False, indent=2))
         else:
             print(render_lineage(report))
-        return 2 if state.get("integrity_blocked") else 0
+        return ExitCode.SUCCESS
 
     try:
         stage, script_name, child = build_child_command(args)
@@ -683,14 +672,14 @@ def main(argv: list[str] | None = None) -> int:
             stage=rejected_stage,
             script=rejected_script,
             event="blocked",
-            exit_code=2,
+            exit_code=ExitCode.COMMAND_ERROR,
             duration_ms=0,
             input_artifacts=before,
             output_artifacts=before,
         ))
         state, step = inspect(args)
         print(render_next(step))
-        return 2
+        return ExitCode.COMMAND_ERROR
 
     exit_code = run_child(
         stage=stage,

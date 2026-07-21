@@ -21,9 +21,15 @@ from policy_config import load_policy, policy_path
 import place_config
 from place_config import PlaceBook
 import allocation_generations
+from exit_codes import ExitCode
 import hint_refs
 import integrity
+from io_utils import configure_utf8_stdio as configure_stdio
+from json_io import read_json_object as load_json
+import text_utils
+import time_utils
 import unit_refs
+import value_utils
 
 _POLICY = load_policy()
 _PLACE_BOOK: PlaceBook | None = None
@@ -85,26 +91,12 @@ EXPENSE_ORDER = {
 }
 
 
-def load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
-
-
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def clean(value: Any) -> str:
-    return re.sub(r"\s+", " ", "" if value is None else str(value)).strip()
-
-
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
+clean = text_utils.normalize_text
 
 
 def is_admin_code(value: Any) -> bool:
@@ -139,7 +131,7 @@ def mobile_accounting_errors(unit: dict[str, Any]) -> list[str]:
     return errors
 
 
-def note_placeholder_errors(unit: dict[str, Any]) -> list[str]:
+def allocation_note_errors(unit: dict[str, Any]) -> list[str]:
     note = clean(unit.get("final_note"))
     errors: list[str] = []
     if "\u51fa\u53d1\u5730\u7c7b\u578b" in note or "\u76ee\u7684\u5730\u7c7b\u578b" in note:
@@ -172,14 +164,7 @@ def normalize_admin_client(unit: dict[str, Any]) -> None:
         unit["admin_client_review_needed"] = False
 
 
-def money(value: Any) -> str:
-    if value in (None, ""):
-        return ""
-    try:
-        return f"{Decimal(str(value).replace(',', '')):.2f}"
-    except InvalidOperation:
-        match = re.search(r"-?\d+(?:\.\d+)?", str(value))
-        return f"{Decimal(match.group(0)):.2f}" if match else ""
+money = value_utils.format_optional_amount
 
 
 def parse_date(value: str) -> date | None:
@@ -624,7 +609,13 @@ def print_document_reconciliation(extraction: dict[str, Any], units: list[dict[s
     docs = extraction.get("documents", [])
     _, schedule_to_invoice = ride_schedule_links(extraction)
     linked_invoices = set(schedule_to_invoice.values())
-    unit_doc_ids = {u.get("source_doc_id") for u in units if u.get("source_doc_id")}
+    unit_doc_ids = {
+        doc_id
+        for unit in units
+        if (doc_id := value_utils.first_nonblank(
+            unit.get("source_document_id"), unit.get("source_doc_id")
+        ))
+    }
     excluded = [d for d in docs if d.get("excluded_by_user")]
     supporting = [d for d in docs if not d.get("excluded_by_user")
                   and d.get("document_role") == "supporting_document"]
@@ -896,8 +887,8 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
         amount = clean((doc.get("invoice") or {}).get("total_amount"))
         unit = {
             "unit_id": f"UNIT-{unit_idx:03d}",
-            "unit_no": unit_idx,
-            "source_doc_id": doc_id,
+            "user_no": unit_idx,
+            "source_document_id": doc_id,
             "source_filename": filename,
             "source_category": "unknown",
             "amount": amount,
@@ -1711,7 +1702,7 @@ def decimal_amount(value: Any) -> Decimal | None:
 def cross_field_hint_key(hint: dict[str, Any]) -> tuple[str, str, str, str, str] | None:
     category = clean(hint.get("source_category") or hint.get("category"))
     date_value = date_hint_value(hint)
-    amount = money(hint.get("amount") or hint.get("recorded_amount"))
+    amount = money(value_utils.first_nonblank(hint.get("amount"), hint.get("recorded_amount")))
     unit_no = clean(hint.get("unit_no") or hint.get("user_no"))
     invoice_no = clean(hint.get("invoice_no"))
     if unit_no or invoice_no:
@@ -1886,7 +1877,9 @@ def unit_hint_text(unit: dict[str, Any]) -> str:
 
 
 def amount_hint_score(hint: dict[str, Any], unit: dict[str, Any]) -> tuple[int, str]:
-    hint_amount = decimal_amount(hint.get("amount") or hint.get("recorded_amount"))
+    hint_amount = decimal_amount(
+        value_utils.first_nonblank(hint.get("amount"), hint.get("recorded_amount"))
+    )
     if hint_amount is None:
         return 0, ""
     unit_amount = decimal_amount(unit.get("amount"))
@@ -1990,7 +1983,7 @@ def hint_summary(hint: dict[str, Any]) -> str:
     merchants = merchant_terms(hint)
     if merchants:
         parts.append("/".join(merchants[:2]))
-    amount = money(hint.get("amount") or hint.get("recorded_amount"))
+    amount = money(value_utils.first_nonblank(hint.get("amount"), hint.get("recorded_amount")))
     if amount:
         parts.append(f"RMB {amount}")
     attendees = list_text(hint.get("attendees"))
@@ -2635,7 +2628,11 @@ def rail_chain_groups(units: list[dict[str, Any]]) -> dict[str, list[dict[str, A
         if chain_id:
             groups.setdefault(chain_id, []).append(unit)
     for chain_units in groups.values():
-        chain_units.sort(key=lambda unit: int(unit.get("journey_chain_position") or 0))
+        chain_units.sort(key=lambda unit: value_utils.parse_integer(
+            unit.get("journey_chain_position"),
+            field="journey_chain_position",
+            minimum=1,
+        ))
     return groups
 
 
@@ -2737,7 +2734,8 @@ def add_expense_hint_reconciliation_questions(
             if candidates:
                 candidate_text = "；".join(
                     f"第{candidate.get('user_no')}项 {candidate.get('source_filename') or '-'} "
-                    f"{candidate.get('seller_name') or ''} RMB {candidate.get('amount') or '?'} "
+                    f"{candidate.get('seller_name') or ''} RMB "
+                    f"{value_utils.display_value(candidate.get('amount'), missing='?')} "
                     f"(score {candidate.get('score')}: {'; '.join(candidate.get('reasons') or [])})"
                     for candidate in candidates
                 )
@@ -2819,7 +2817,7 @@ def build_questions(
                     "这是硬性防呆规则，用于防止未匹配交通费被错误丢进通讯费/Admin。",
                 )
             )
-        placeholder_errors = note_placeholder_errors(unit)
+        placeholder_errors = allocation_note_errors(unit)
         if placeholder_errors:
             prompts.append(
                 (
@@ -3082,8 +3080,9 @@ def build_markdown(payload: dict[str, Any]) -> str:
         lines.append(
             f"| {unit.get('user_no') or unit_user_no(unit)} | {unit['unit_id']} | {unit.get('source_filename','')} | "
             f"{unit.get('source_document_id','')} {unit.get('source_item_id') or ''} | "
-            f"{unit.get('expense_date','')} | {city_route} | {unit.get('invoice_amount') or unit.get('amount','')} | "
-            f"{unit.get('reimbursable_amount') or unit.get('amount','')} | {unit.get('source_category','')} | "
+            f"{unit.get('expense_date','')} | {city_route} | "
+            f"{clean(value_utils.first_nonblank(unit.get('invoice_amount'), unit.get('amount')))} | "
+            f"{clean(value_utils.first_nonblank(unit.get('reimbursable_amount'), unit.get('amount')))} | {unit.get('source_category','')} | "
             f"{unit.get('client_name','')} | {unit.get('client_charge_code','')} | {unit.get('final_template_column','')} | "
             f"{unit.get('confidence','')} | {unit.get('status','')} |"
         )
@@ -3176,7 +3175,7 @@ def main(argv: list[str] | None = None) -> int:
         print("NEXT: ask the user whether each file should be excluded or converted to a readable PDF/image, "
               "record that decision with apply_extraction_corrections.py (input_resolutions), then re-run "
               "extract_invoices.py before allocation.", file=sys.stderr)
-        return 2
+        return ExitCode.COMMAND_ERROR
     pending_documents = [
         document for document in extraction.get("documents", [])
         if not document.get("excluded_by_user")
@@ -3206,7 +3205,7 @@ def main(argv: list[str] | None = None) -> int:
             "that does not resolve the extraction evidence ledger.",
             file=sys.stderr,
         )
-        return 2
+        return ExitCode.COMMAND_ERROR
     context_path = Path(args.context) if args.context else None
     try:
         contexts, raw_context, context_questions = load_context(context_path)
@@ -3221,7 +3220,7 @@ def main(argv: list[str] | None = None) -> int:
             "to write JSON and do not bypass this check with a launcher or patch script.",
             file=sys.stderr,
         )
-        return 2
+        return ExitCode.COMMAND_ERROR
     print(f"PROJECT CONTEXT VALIDATED: {len(contexts)} canonical context window(s).")
     units, link_questions = create_units(extraction, contexts)
     print_document_reconciliation(extraction, units)
@@ -3230,13 +3229,13 @@ def main(argv: list[str] | None = None) -> int:
         apply_matches(units, contexts, hint_reconciliation=hint_reconciliation)
     except ValueError as exc:
         print(f"ERROR: allocation matching/identity generation failed: {exc}", file=sys.stderr)
-        return 2
+        return ExitCode.COMMAND_ERROR
     questions = build_questions(units, context_questions + link_questions, hint_reconciliation)
 
     payload = {
         "schema_version": "expense_allocation.v1",
         "allocation_engine_revision": allocation_generations.ALLOCATION_ENGINE_REVISION,
-        "generated_at": datetime.now().replace(microsecond=0).isoformat(),
+        "generated_at": time_utils.iso_now(),
         "source_extraction_file": str(extraction_path),
         "source_extraction_fingerprint": extraction["integrity"]["fingerprint"],
         "source_project_context_file": str(context_path.resolve()) if context_path else "",
@@ -3257,7 +3256,7 @@ def main(argv: list[str] | None = None) -> int:
         unit_refs.assign_unit_refs(extraction, payload.get("allocation_units", []))
     except ValueError as exc:
         print(f"ERROR: allocation evidence identity generation failed: {exc}", file=sys.stderr)
-        return 2
+        return ExitCode.COMMAND_ERROR
     allocation_out = output / "expense-allocation.json"
     try:
         archived = allocation_generations.archive_current_generation(allocation_out)
@@ -3281,7 +3280,7 @@ def main(argv: list[str] | None = None) -> int:
     add_trip_window_advisories(payload)
     print_open_questions(payload)
     print_advisory_questions(payload)
-    return 0
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

@@ -24,6 +24,8 @@ from typing import Any
 from uuid import uuid4
 
 import integrity
+from exit_codes import ExitCode
+from io_utils import configure_utf8_stdio as configure_stdio
 import text_safety
 import allocation_generations
 from apply_allocation_answers import (
@@ -104,15 +106,6 @@ FIELD_ALIASES = {
     "destination_type": "destination_place_type",
     "reimbursable": "reimbursable_amount",
 }
-
-
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
 
 
 def decisions_template_path() -> Path:
@@ -734,7 +727,7 @@ def main(argv: list[str] | None = None) -> int:
     except (ValueError, json.JSONDecodeError) as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         print_recovery(decisions_path)
-        return 2
+        return ExitCode.COMMAND_ERROR
 
     merged: dict[int, dict[str, Any]] = {}
     errors: list[str] = []
@@ -793,7 +786,7 @@ def main(argv: list[str] | None = None) -> int:
             print(f"ERROR: {error}", file=sys.stderr)
         print(f"\nNothing written ({len(errors)} problem(s) above).", file=sys.stderr)
         print_recovery(decisions_path)
-        return 2
+        return ExitCode.COMMAND_ERROR
 
     output_path = Path(args.output)
     output_path.parent.mkdir(parents=True, exist_ok=True)
@@ -841,7 +834,7 @@ def main(argv: list[str] | None = None) -> int:
         "NEXT: python scripts/apply_allocation_answers.py "
         f"--allocation {allocation_path} --answers {output_path}"
     )
-    return 0
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

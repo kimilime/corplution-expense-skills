@@ -8,6 +8,10 @@ import hashlib
 import json
 import integrity
 import subagent_protocol
+import evidence_paths
+from exit_codes import ExitCode
+from io_utils import configure_utf8_stdio as configure_stdio, sha256_file
+from json_io import read_json_object as load_json
 import re
 import shutil
 import sys
@@ -16,6 +20,21 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any
 from uuid import uuid4
+
+import time_utils
+
+
+class PackageValidationError(ValueError):
+    """Final-row/proof metadata is malformed and packaging must stop."""
+
+
+def proof_number(value: Any, *, context: str) -> int:
+    if isinstance(value, bool):
+        raise PackageValidationError(f"{context} has invalid proof_no: {value!r}")
+    text = str(value).strip()
+    if not text.isdigit() or int(text) <= 0:
+        raise PackageValidationError(f"{context} has invalid proof_no: {value!r}")
+    return int(text)
 
 
 C = {
@@ -51,21 +70,8 @@ class PackagePromotionError(RuntimeError):
     pass
 
 
-def load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
-
-
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
 
 
 def safe_name(value: str) -> str:
@@ -75,10 +81,7 @@ def safe_name(value: str) -> str:
 
 
 def proof_no_name(value: Any) -> str:
-    try:
-        return f"{int(value):03d}"
-    except Exception:
-        return safe_name(str(value))
+    return f"{proof_number(value, context='package filename'):03d}"
 
 
 def doc_map(extraction: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -97,14 +100,6 @@ def is_special_invoice(doc: dict[str, Any]) -> bool:
 def copy_file(source: Path, target: Path) -> None:
     target.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(source, target)
-
-
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
 
 
 def invoice_filename(group: dict[str, Any], doc: dict[str, Any]) -> str:
@@ -146,11 +141,8 @@ def package_paths(root: Path) -> tuple[Path, Path, Path]:
 
 def rows_by_proof(final_rows: dict[str, Any]) -> dict[int, list[dict[str, Any]]]:
     out: dict[int, list[dict[str, Any]]] = {}
-    for row in final_rows.get("rows", []):
-        try:
-            no = int(row.get("proof_no"))
-        except Exception:
-            continue
+    for index, row in enumerate(final_rows.get("rows", []), start=1):
+        no = proof_number(row.get("proof_no"), context=f"final rows row {index}")
         out.setdefault(no, []).append(row)
     return out
 
@@ -168,7 +160,7 @@ def build_package(
     if not allocation_path.exists():
         print(f"ERROR: {allocation_path} not found next to final rows; cannot verify provenance. "
               "Run packaging with final rows inside the process directory.", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(ExitCode.COMMAND_ERROR)
     allocation = load_json(allocation_path)
     integrity.require_valid(allocation, allocation_path)
     expected_context_sha = str(allocation.get("source_project_context_sha256", "")).strip()
@@ -183,19 +175,19 @@ def build_package(
                 "project-context.json, rerun Stage 2 and Composer, then regenerate Stage 3.",
                 file=sys.stderr,
             )
-            raise SystemExit(2)
+            raise SystemExit(ExitCode.COMMAND_ERROR)
         try:
             actual_context_sha = hashlib.sha256(context_path.read_bytes()).hexdigest()
         except OSError as exc:
             print(f"ERROR: project context cannot be read for provenance validation: {exc}", file=sys.stderr)
-            raise SystemExit(2)
+            raise SystemExit(ExitCode.COMMAND_ERROR)
         if actual_context_sha != expected_context_sha:
             print(
                 "ERROR: project context changed after allocation. Rerun Stage 2, recompose/apply answers, "
                 "regenerate Stage 3, then package.",
                 file=sys.stderr,
             )
-            raise SystemExit(2)
+            raise SystemExit(ExitCode.COMMAND_ERROR)
     current_fp = allocation.get("integrity", {}).get("fingerprint", "")
     rows_fp = str(final_rows.get("source_allocation_fingerprint", ""))
     if rows_fp != current_fp:
@@ -203,7 +195,7 @@ def build_package(
               f"({rows_fp[:8] or '<missing>'}... vs current {current_fp[:8]}...). The allocation was "
               "modified after stage 3 ran — the workbook is stale. NEXT: re-run "
               "write_reimbursement_template.py, then package again.", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(ExitCode.COMMAND_ERROR)
     audit_roles = (("mirror_warden", "Otako - Mirror Warden"), ("gate_challenger", "Kaede - Gate Challenger"))
     audit_states = {
         _role: subagent_protocol.audit_state(_role, final_rows_path.parent, allocation, allocation_path, extraction_path)
@@ -218,7 +210,7 @@ def build_package(
             "NEXT: resolve them through Composer/Updater, obtain a fresh audit, rerun Stage 3, then package.",
             file=sys.stderr,
         )
-        raise SystemExit(2)
+        raise SystemExit(ExitCode.COMMAND_ERROR)
     if all(_st.get("current") for _st in audit_states.values()):
         recorded_review = final_rows.get("subagent_audit", {})
         if not isinstance(recorded_review, dict):
@@ -233,19 +225,19 @@ def build_package(
                 "NEXT: rerun Stage 3 so final rows consume the current audits, then package.",
                 file=sys.stderr,
             )
-            raise SystemExit(2)
+            raise SystemExit(ExitCode.COMMAND_ERROR)
     if final_rows.get("generated_with_allow_unconfirmed"):
         print("ERROR: this workbook was generated with --allow-unconfirmed (a PREVIEW past open "
               "gates) and must not be packaged as the deliverable. NEXT: resolve remaining "
               "questions/confirmations, re-run stage 3 WITHOUT --allow-unconfirmed, then package.",
               file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(ExitCode.COMMAND_ERROR)
     open_qs = int(final_rows.get("open_allocation_questions", 0) or 0)
     if open_qs:
         print(f"ERROR: allocation had {open_qs} open question(s) when this workbook was generated. "
               "NEXT: relay the questions to the user, resolve them, re-run stage 3, then package.",
               file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(ExitCode.COMMAND_ERROR)
     if "expense_hint_reconciliation" not in final_rows:
         print(
             "ERROR: final rows do not contain the user expense-record reconciliation ledger. "
@@ -253,7 +245,7 @@ def build_package(
             "or explicitly resolved. NEXT: rerun Stage 2 if needed, then rerun Stage 3 and package again.",
             file=sys.stderr,
         )
-        raise SystemExit(2)
+        raise SystemExit(ExitCode.COMMAND_ERROR)
     allocation_hint_records = allocation.get("expense_hint_reconciliation", [])
     final_hint_records = final_rows.get("expense_hint_reconciliation", [])
     if final_hint_records != allocation_hint_records:
@@ -262,7 +254,7 @@ def build_package(
             "NEXT: rerun Stage 3, then package again.",
             file=sys.stderr,
         )
-        raise SystemExit(2)
+        raise SystemExit(ExitCode.COMMAND_ERROR)
     unresolved_hint_records = [
         record for record in allocation_hint_records
         if record.get("resolution_status") not in {"not_required", "resolved"}
@@ -276,17 +268,17 @@ def build_package(
             "questions, resolve them through Composer/updater, rerun Stage 3, then package.",
             file=sys.stderr,
         )
-        raise SystemExit(2)
+        raise SystemExit(ExitCode.COMMAND_ERROR)
     expected_sha = str(final_rows.get("workbook_sha256", ""))
     if not expected_sha:
         print("ERROR: final rows carry no workbook_sha256 — they were generated by an older "
               "stage 3 or forged. Verification cannot be skipped. NEXT: re-run "
               "write_reimbursement_template.py, then package.", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(ExitCode.COMMAND_ERROR)
     if not workbook_path.exists():
         print(f"ERROR: --workbook {workbook_path} does not exist. NEXT: pass the workbook from the "
               "latest stage 3 run (path recorded in final-expense-rows.json).", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(ExitCode.COMMAND_ERROR)
     actual_sha = hashlib.sha256(workbook_path.read_bytes()).hexdigest()
     if actual_sha != expected_sha:
         print(f"ERROR: --workbook {workbook_path} is NOT the workbook stage 3 generated for these "
@@ -294,13 +286,13 @@ def build_package(
               "packaging a stale or wrong Excel file. NEXT: pass the exact file from the latest "
               "stage 3 run (see final-expense-rows.json 'workbook' path), or re-run stage 3.",
               file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(ExitCode.COMMAND_ERROR)
     blocking = int(final_rows.get("blocking_policy_checks", 0) or 0)
     if blocking:
         print(f"ERROR: stage 3 left {blocking} blocking policy check(s) (meal/hotel caps) unresolved. "
               "NEXT: relay the stage 3 review summary to the user, resolve via the answers updater, "
               "re-run stage 3, then package.", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(ExitCode.COMMAND_ERROR)
     extraction = load_json(extraction_path)
     integrity.require_valid(extraction, extraction_path, kind="extraction")
     extraction_fp = (extraction.get("integrity") or {}).get("fingerprint", "")
@@ -309,7 +301,7 @@ def build_package(
         print("ERROR: allocation does not match the current extraction generation. Re-run "
               "allocate_expenses.py, recompose decisions, and reapply confirmed answers "
               "before writing Excel and packaging.", file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(ExitCode.COMMAND_ERROR)
     unresolved_inputs = [
         item for item in extraction.get("unresolved_input_files", [])
         if item.get("status", "open") == "open"
@@ -319,7 +311,7 @@ def build_package(
               + ", ".join(str(item.get("filename", "?")) for item in unresolved_inputs) + ". "
               "Resolve them through apply_extraction_corrections.py, then rerun the downstream stages.",
               file=sys.stderr)
-        raise SystemExit(2)
+        raise SystemExit(ExitCode.COMMAND_ERROR)
     docs = doc_map(extraction)
     requester = safe_name(final_rows.get("requester", "Requester"))
     package_date = package_date or datetime.now().strftime("%Y%m%d")
@@ -331,7 +323,7 @@ def build_package(
 
     manifest: dict[str, Any] = {
         "schema_version": "reimbursement_package.v1",
-        "generated_at": datetime.now().replace(microsecond=0).isoformat(),
+        "generated_at": time_utils.iso_now(),
         "requester": requester,
         "package_date": package_date,
         "package_root": str(root),
@@ -374,8 +366,10 @@ def build_package(
             "type": support_type,
         })
 
-    for group in final_rows.get("proof_groups", []):
-        proof_no = group.get("proof_no")
+    for group_index, group in enumerate(final_rows.get("proof_groups", []), start=1):
+        proof_no = proof_number(
+            group.get("proof_no"), context=f"proof group {group_index}"
+        )
         invoice_doc = None
         for doc_id in group.get("source_document_ids", []):
             doc = docs.get(doc_id)
@@ -437,10 +431,12 @@ def build_package(
                 continue
             add_support_file(proof_no, source, label)
 
-        for row in rows_lookup.get(int(proof_no), []):
+        for row in rows_lookup.get(proof_no, []):
             approval_file = row.get("approval_file") or ""
             if row.get("is_substitute_invoice") and approval_file:
-                source = Path(approval_file)
+                source = Path(evidence_paths.canonical_evidence_path(
+                    approval_file, final_rows_path.parent
+                ))
                 if source.exists():
                     add_support_file(proof_no, source, C["substitute_approval"])
                 else:
@@ -638,7 +634,12 @@ def main(argv: list[str] | None = None) -> int:
             except PackagePromotionError as cleanup_exc:
                 print(f"WARNING: {cleanup_exc}", file=sys.stderr)
         print(f"ERROR: {exc}", file=sys.stderr)
-        return 2
+        return ExitCode.COMMAND_ERROR
+    except PackageValidationError as exc:
+        if staging_root.exists():
+            shutil.rmtree(staging_root)
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return ExitCode.COMMAND_ERROR
     except BaseException:
         if staging_root.exists():
             shutil.rmtree(staging_root)
@@ -654,9 +655,9 @@ def main(argv: list[str] | None = None) -> int:
             "Resolve the issues above, then re-run packaging.",
             file=sys.stderr,
         )
-        return 3
+        return ExitCode.REVIEW_REQUIRED
     print("WORKFLOW COMPLETE — relay the package summary above to the user.")
-    return 0
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

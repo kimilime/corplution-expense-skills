@@ -67,20 +67,10 @@ from pathlib import Path
 from typing import Any
 
 import extraction_corrections as xc
+from exit_codes import ExitCode
 import integrity
-
-
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
-
-
-def load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
+from io_utils import configure_utf8_stdio as configure_stdio
+from json_io import read_json_object as load_json
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -101,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     input_resolutions = incoming.get("input_resolutions", [])
     if not entries and not input_resolutions:
         print("ERROR: corrections file has neither 'corrections' nor 'input_resolutions' entries.", file=sys.stderr)
-        return 2
+        return ExitCode.COMMAND_ERROR
 
     all_errors: list[str] = []
     for idx, entry in enumerate(entries, start=1):
@@ -116,7 +106,7 @@ def main(argv: list[str] | None = None) -> int:
         print("", file=sys.stderr)
         print("See the format example in this script's docstring. Use sha256 alone only when unique;", file=sys.stderr)
         print("for exact copies combine the shared sha256 with the intended exact source_file.", file=sys.stderr)
-        return 2
+        return ExitCode.COMMAND_ERROR
 
     log = xc.apply_overlay(payload, {"corrections": entries})
     log.extend(xc.apply_input_resolutions(payload, {"input_resolutions": input_resolutions}))
@@ -128,11 +118,11 @@ def main(argv: list[str] | None = None) -> int:
         print(f"ABORTED: {len(hard_errors)} correction(s) could not be applied safely — nothing was "
               "written (extraction unchanged, overlay unchanged). Fix the match keys; for exact "
               "copies combine sha256 with the intended exact source_file, then re-run.", file=sys.stderr)
-        return 2
+        return ExitCode.COMMAND_ERROR
 
     if args.dry_run:
         print("Dry run: nothing written.")
-        return 0
+        return ExitCode.SUCCESS
 
     # Persist entries into the durable overlay so extractor re-runs replay them.
     overlay = xc.load_overlay(process_dir)
@@ -148,7 +138,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Overlay saved: {xc.overlay_path(process_dir)} (replayed automatically on extractor re-runs)")
     print("Next: re-run scripts/allocate_expenses.py, then RECOMPOSE decisions with compose_answers.py —")
     print("item bindings may have shifted; old answers files must not be replayed.")
-    return 0
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

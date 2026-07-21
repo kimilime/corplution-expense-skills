@@ -10,6 +10,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from exit_codes import ExitCode
+from io_utils import configure_utf8_stdio as configure_stdio
+
 
 PYTHON_IMPORTS = {
     "openpyxl": "openpyxl",
@@ -28,15 +31,6 @@ SYSTEM_TOOLS = {
     "tesseract": "Required only for OCR on image/scan-only invoices.",
     "pdftoppm": "Poppler tool used by pdf2image for OCR on scan-only PDFs.",
 }
-
-
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(encoding="utf-8", errors="replace")
-            except Exception:
-                pass
 
 
 def requirements_path() -> Path:
@@ -80,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     requirements = requirements_path()
     if not requirements.exists():
         print(f"ERROR: requirements.txt not found: {requirements}", file=sys.stderr)
-        return 2
+        return ExitCode.COMMAND_ERROR
 
     missing_packages = missing_python_packages()
     if missing_packages:
@@ -92,10 +86,10 @@ def main(argv: list[str] | None = None) -> int:
             missing_packages = missing_python_packages()
             if missing_packages:
                 print("ERROR: Packages still missing after install: " + ", ".join(missing_packages), file=sys.stderr)
-                return 1
+                return ExitCode.OPERATIONAL_ERROR
         else:
             print(f"Run: {sys.executable} -m pip install -r {requirements}")
-            return 1
+            return ExitCode.OPERATIONAL_ERROR
     else:
         print("Python dependencies OK.")
 
@@ -104,11 +98,11 @@ def main(argv: list[str] | None = None) -> int:
         for tool in missing_tools:
             print(f"WARNING: {tool} not found. {SYSTEM_TOOLS[tool]}")
         if args.strict_ocr:
-            return 1
+            return ExitCode.OPERATIONAL_ERROR
         print("OCR can still fall back to manual_review when system OCR tools are unavailable.")
     else:
         print("OCR system tools OK.")
-    return 0
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":
