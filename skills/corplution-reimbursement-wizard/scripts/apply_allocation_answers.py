@@ -30,6 +30,13 @@ from json_io import read_json_object as load_json
 import text_safety
 from text_utils import strip_scalar as clean
 import time_utils
+from travel_ticket_utils import (
+    contains_raw_ticket_evidence,
+    is_flight_ticket,
+    is_rail_ticket,
+    route_from_text,
+    ticket_note,
+)
 import value_utils
 
 _POLICY = load_policy()
@@ -258,105 +265,6 @@ def contains_place_type_placeholder(note: Any) -> bool:
 def contains_hotel_placeholder(note: Any) -> bool:
     text = clean(note)
     return any(token in text for token in ["X晚", "入住日", "离店日"])
-
-
-def strip_route_place(value: Any) -> str:
-    text = clean(value)
-    text = re.sub(r"^[A-Z]{0,3}\d{1,5}\s*[,，]?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^(高铁|动车|火车|铁路|飞机|航班|机票)\s*", "", text)
-    text = re.sub(r"\s*(二等座|一等座|商务座|硬座|软座|硬卧|软卧|经济舱|公务舱|头等舱).*$", "", text)
-    return text.strip(" ,，;；。()（）")
-
-
-def route_from_text(value: Any) -> str:
-    text = clean(value)
-    if not text:
-        return ""
-    match = re.search(r"（([^（）]+)）", text)
-    if match:
-        text = match.group(1)
-    for piece in re.split(r"[,，;；]", text):
-        match = re.search(r"(.+?)\s*(?:->|—|~|至|到|-)\s*(.+)", piece)
-        if match:
-            origin = strip_route_place(match.group(1))
-            destination = strip_route_place(match.group(2))
-            if origin and destination:
-                return f"{origin}-{destination}"
-    match = re.search(r"(.+?)\s*(?:->|—|~|至|到|-)\s*(.+)", text)
-    if match:
-        origin = strip_route_place(match.group(1))
-        destination = strip_route_place(match.group(2))
-        if origin and destination:
-            return f"{origin}-{destination}"
-    return ""
-
-
-def is_refund_fee(unit: dict[str, Any]) -> bool:
-    if unit.get("is_refund_fee") is True or clean(unit.get("refund_fee_amount")):
-        return True
-    text = clean(" ".join([
-        unit.get("final_note", ""),
-        unit.get("source_note", ""),
-        unit.get("expense_note", ""),
-        unit.get("raw_remarks", ""),
-        unit.get("line_item_name", ""),
-        unit.get("seller_name", ""),
-    ]))
-    return any(keyword in text for keyword in ["退票费", "退票", "退款", "refund", "Refund", "cancellation"])
-
-
-def is_rail_ticket(unit: dict[str, Any]) -> bool:
-    subtype = clean(unit.get("document_subtype"))
-    if subtype == "railway_e_ticket":
-        return True
-    source_category = clean(unit.get("source_category"))
-    if source_category and source_category not in {"travel", "rail"}:
-        return False
-    text = clean(" ".join([unit.get("source_note", ""), unit.get("expense_note", ""), unit.get("final_note", "")]))
-    return bool(re.match(r"^[GCDKZT]\d{1,5}\b", text, flags=re.IGNORECASE))
-
-
-def is_flight_ticket(unit: dict[str, Any]) -> bool:
-    source_category = clean(unit.get("source_category"))
-    if source_category and source_category not in {"travel", "flight"}:
-        return False
-    text = clean(" ".join([
-        unit.get("document_subtype", ""),
-        unit.get("source_note", ""),
-        unit.get("expense_note", ""),
-        unit.get("final_note", ""),
-        unit.get("raw_remarks", ""),
-    ])).lower()
-    return any(keyword in text for keyword in ["飞机", "机票", "航班", "flight"])
-
-
-def ticket_note(unit: dict[str, Any]) -> str:
-    if clean(unit.get("origin")):
-        return ""
-    route = (
-        route_from_text(unit.get("route"))
-        or route_from_text(unit.get("source_note"))
-        or route_from_text(unit.get("expense_note"))
-        or route_from_text(unit.get("final_note"))
-    )
-    if not route:
-        return ""
-    if is_rail_ticket(unit):
-        prefix = "高铁退票费" if is_refund_fee(unit) else "高铁"
-    elif is_flight_ticket(unit):
-        prefix = "飞机退票费" if is_refund_fee(unit) else "飞机"
-    else:
-        return ""
-    return f"{prefix}（{route}）"
-
-
-def contains_raw_ticket_evidence(note: Any) -> bool:
-    text = clean(note)
-    return bool(
-        "->" in text
-        or re.search(r"\b[GCDKZT]\d{1,5}\b", text, flags=re.IGNORECASE)
-        or any(keyword in text for keyword in ["二等座", "一等座", "商务座", "经济舱", "公务舱", "头等舱"])
-    )
 
 
 def refresh_ticket_note(unit: dict[str, Any], update: dict[str, Any]) -> None:
@@ -1284,6 +1192,98 @@ def current_rail_chain_route(chain_units: list[dict[str, Any]]) -> str:
     return " -> ".join([first_origin, *destinations])
 
 
+def clear_rail_chain_metadata(unit: dict[str, Any]) -> None:
+    unit.update({
+        "journey_chain_id": "",
+        "journey_chain_route": "",
+        "journey_chain_position": "",
+        "journey_chain_length": "",
+        "journey_chain_unit_ids": [],
+        "journey_chain_confidence": "",
+        "journey_chain_assignment_rule": "",
+        "journey_chain_match_reason": "",
+        "journey_chain_project_context_id": "",
+        "journey_chain_needs_confirmation": False,
+    })
+
+
+def split_rail_chain_on_user_assignments(chain_id: str, chain_units: list[dict[str, Any]]) -> bool:
+    """Split a chain when an updater decision assigns adjacent legs to different projects."""
+    try:
+        ordered = sorted(
+            chain_units,
+            key=lambda unit: value_utils.parse_integer(
+                unit.get("journey_chain_position"),
+                field="journey_chain_position",
+                minimum=1,
+            ),
+        )
+    except ValueError:
+        return False
+
+    assignments = [
+        (
+            clean(unit.get("project_context_id")),
+            clean(unit.get("client_name")),
+            clean(unit.get("client_charge_code")),
+        )
+        for unit in ordered
+    ]
+    if not all(client and code for _, client, code in assignments):
+        return False
+
+    def same_project(
+        left: tuple[str, str, str], right: tuple[str, str, str]
+    ) -> bool:
+        left_context, left_client, left_code = left
+        right_context, right_client, right_code = right
+        return (
+            left_client == right_client
+            and left_code == right_code
+            and (not left_context or not right_context or left_context == right_context)
+        )
+
+    segments: list[list[dict[str, Any]]] = [[ordered[0]]]
+    for unit, assignment, previous_assignment in zip(ordered[1:], assignments[1:], assignments):
+        if not same_project(assignment, previous_assignment):
+            segments.append([])
+        segments[-1].append(unit)
+    if len(segments) == 1:
+        return False
+
+    segment_routes = [current_rail_chain_route(segment) for segment in segments]
+    for unit in ordered:
+        clear_rail_chain_metadata(unit)
+        unit["status"] = "confirmed"
+        unit["confidence"] = "high"
+        unit["auto_project_match"] = "user_confirmed_project_stop"
+        unit["match_reason"] = f"User-declared project boundary split prior rail chain {chain_id}."
+
+    for segment_index, (segment, route) in enumerate(zip(segments, segment_routes), start=1):
+        if len(segment) < 2:
+            continue
+        segment_id = f"{chain_id}-S{segment_index}"
+        unit_ids = [clean(unit.get("unit_id")) for unit in segment]
+        project_context_id = clean(segment[0].get("project_context_id"))
+        for position, unit in enumerate(segment, start=1):
+            unit.update({
+                "journey_chain_id": segment_id,
+                "journey_chain_route": route,
+                "journey_chain_position": position,
+                "journey_chain_length": len(segment),
+                "journey_chain_unit_ids": unit_ids,
+                "journey_chain_confidence": "high",
+                "journey_chain_assignment_rule": "rail_transfer_chain_user_confirmed",
+                "journey_chain_match_reason": (
+                    f"User-declared project boundary split prior rail chain {chain_id}."
+                ),
+                "journey_chain_project_context_id": project_context_id,
+                "journey_chain_needs_confirmation": False,
+                "auto_project_match": "rail_transfer_chain_user_confirmed",
+            })
+    return True
+
+
 def refresh_rail_chain_assignments(payload: dict[str, Any], touched_units: set[str]) -> None:
     groups: dict[str, list[dict[str, Any]]] = {}
     for unit in payload.get("allocation_units", []):
@@ -1305,18 +1305,9 @@ def refresh_rail_chain_assignments(payload: dict[str, Any], touched_units: set[s
         ]
         if len(active_units) < 2:
             for unit in chain_units:
-                unit.update({
-                    "journey_chain_id": "",
-                    "journey_chain_route": "",
-                    "journey_chain_position": "",
-                    "journey_chain_length": "",
-                    "journey_chain_unit_ids": [],
-                    "journey_chain_confidence": "",
-                    "journey_chain_assignment_rule": "",
-                    "journey_chain_match_reason": "",
-                    "journey_chain_project_context_id": "",
-                    "journey_chain_needs_confirmation": False,
-                })
+                clear_rail_chain_metadata(unit)
+            continue
+        if len(active_units) == len(chain_units) and split_rail_chain_on_user_assignments(chain_id, chain_units):
             continue
         assignments = {
             (

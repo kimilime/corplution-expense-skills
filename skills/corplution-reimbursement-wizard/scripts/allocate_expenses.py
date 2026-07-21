@@ -28,6 +28,7 @@ from io_utils import configure_utf8_stdio as configure_stdio
 from json_io import read_json_object as load_json
 import text_utils
 import time_utils
+import travel_ticket_utils
 import unit_refs
 import value_utils
 
@@ -42,8 +43,8 @@ def get_place_book() -> PlaceBook:
         _PLACE_BOOK = PlaceBook.load()
     return _PLACE_BOOK
 
-RAIL_CHAIN_MAX_DEPARTURE_GAP_HOURS = 18
-RAIL_CHAIN_HIGH_CONFIDENCE_HOURS = 12
+RAIL_CHAIN_MAX_DEPARTURE_GAP_HOURS = 6
+RAIL_CHAIN_HIGH_CONFIDENCE_HOURS = 3
 
 
 C = {
@@ -548,35 +549,23 @@ def classify_place_type(
 
 
 def route_from_note(note: str) -> str:
-    match = re.search(r"([^,，]+?)\s*->\s*([^,，]+)", note or "")
-    return f"{clean(match.group(1))}-{clean(match.group(2))}" if match else ""
+    return travel_ticket_utils.route_from_text(note)
 
 
 def is_refund_fee(unit: dict[str, Any]) -> bool:
-    if unit.get("is_refund_fee") is True or clean(unit.get("refund_fee_amount")):
-        return True
-    text = clean(" ".join([
-        unit.get("source_note", ""),
-        unit.get("expense_note", ""),
-        unit.get("raw_remarks", ""),
-        unit.get("line_item_name", ""),
-        unit.get("seller_name", ""),
-    ]))
-    return any(keyword in text for keyword in ["退票费", "退票", "退款", "refund", "Refund", "cancellation"])
+    return travel_ticket_utils.is_refund_fee(unit)
 
 
 def normal_note(unit: dict[str, Any]) -> str:
     category = unit.get("source_category", "")
-    subtype = unit.get("document_subtype", "")
     source = clean(unit.get("source_note"))
-    rail_ticket_evidence = subtype == "railway_e_ticket" or (
-        category in {"travel", "rail"}
-        and bool(re.match(r"^[GCDKZT]\d{1,5}\b", source, flags=re.IGNORECASE))
-    )
-    if rail_ticket_evidence:
-        route = route_from_note(source) or clean(unit.get("route"))
-        note_type = C["rail_refund"] if is_refund_fee(unit) else C["rail"]
-        return f"{note_type}\uff08{route}\uff09" if route else note_type
+    normalized_ticket_note = travel_ticket_utils.ticket_note(unit)
+    if normalized_ticket_note:
+        return normalized_ticket_note
+    if travel_ticket_utils.is_rail_ticket(unit):
+        return C["rail_refund"] if is_refund_fee(unit) else C["rail"]
+    if travel_ticket_utils.is_flight_ticket(unit):
+        return C["flight_refund"] if is_refund_fee(unit) else C["flight"]
     if category == "hotel":
         nights = unit.get("hotel_nights") or "X"
         checkin = unit.get("check_in_date") or "\u5165\u4f4f\u65e5"
@@ -1235,9 +1224,21 @@ def rail_temporal_link(first: dict[str, Any], second: dict[str, Any]) -> tuple[b
         confidence = "high" if gap_hours <= RAIL_CHAIN_HIGH_CONFIDENCE_HOURS else "medium"
         return True, confidence
 
-    if date_gap == 0:
-        return True, "medium"
     return False, ""
+
+
+def rail_user_declared_context(unit: dict[str, Any]) -> str:
+    if clean(unit.get("auto_project_match")) == "user_context_expense_hint":
+        return clean(unit.get("project_context_id"))
+    if unit.get("corrected_by_user") and clean(unit.get("status")) in {"confirmed", "fixed"}:
+        return clean(unit.get("project_context_id"))
+    return ""
+
+
+def rail_link_conflicts_with_user_declaration(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    first_context = rail_user_declared_context(first)
+    second_context = rail_user_declared_context(second)
+    return bool(first_context and second_context and first_context != second_context)
 
 
 def rail_leg_sort_key(unit: dict[str, Any]) -> tuple[str, str, int]:
@@ -1273,6 +1274,11 @@ def build_rail_journey_chains(units: list[dict[str, Any]]) -> list[dict[str, Any
             # Build refund chains and travelled chains independently so their
             # identical stations/times cannot create branching ambiguity.
             if is_refund_fee(first) != is_refund_fee(second):
+                continue
+            # Explicit per-leg applicant assignments are authoritative. Two
+            # adjacent tickets declared for different projects represent a
+            # project stop, not a transfer chain.
+            if rail_link_conflicts_with_user_declaration(first, second):
                 continue
             second_origin, _ = rail_leg_endpoints(second)
             if not rail_stations_connect(first_destination, second_origin):
@@ -1354,17 +1360,25 @@ def rail_context_date_matches(chain_units: list[dict[str, Any]], ctx: dict[str, 
     )
 
 
-def unique_rail_station_context(
+def rail_station_contexts(
     station: str,
     chain_units: list[dict[str, Any]],
     contexts: list[dict[str, Any]],
-) -> dict[str, Any] | None:
-    candidates = [
+) -> list[dict[str, Any]]:
+    return [
         ctx for ctx in non_admin_contexts(contexts)
         if not is_local_context(ctx)
         and rail_context_date_matches(chain_units, ctx)
         and context_city_in_text(ctx, station)
     ]
+
+
+def unique_rail_station_context(
+    station: str,
+    chain_units: list[dict[str, Any]],
+    contexts: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    candidates = rail_station_contexts(station, chain_units, contexts)
     context_ids = {clean(ctx.get("context_id")) for ctx in candidates}
     return candidates[0] if len(context_ids) == 1 else None
 
@@ -1391,6 +1405,25 @@ def rail_chain_context(
     origin, _ = rail_leg_endpoints(chain_units[0])
     _, destination = rail_leg_endpoints(chain_units[-1])
     destination_ctx = unique_rail_station_context(destination, chain_units, contexts)
+    destination_context_id = clean(destination_ctx.get("context_id")) if destination_ctx else ""
+    intermediate_contexts: dict[str, dict[str, Any]] = {}
+    for unit in chain_units[:-1]:
+        _, intermediate_station = rail_leg_endpoints(unit)
+        for ctx in rail_station_contexts(intermediate_station, chain_units, contexts):
+            context_id = clean(ctx.get("context_id"))
+            if context_id and context_id != destination_context_id:
+                intermediate_contexts[context_id] = ctx
+    if intermediate_contexts:
+        labels = ", ".join(
+            f"{context_id} ({clean(ctx.get('city')) or clean(ctx.get('client_name'))})"
+            for context_id, ctx in sorted(intermediate_contexts.items())
+        )
+        return (
+            None,
+            "rail_transfer_chain_intermediate_project_review",
+            "A connected rail route passes through an intermediate city with an active "
+            f"project context: {labels}. Confirm transfer versus an actual project stop.",
+        )
     if destination_ctx:
         return (
             destination_ctx,

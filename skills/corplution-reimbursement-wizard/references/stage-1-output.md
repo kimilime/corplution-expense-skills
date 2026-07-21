@@ -143,6 +143,8 @@ These structured fields support Stage 2 transfer-chain detection. Keep the reada
 
 For a railway refund invoice, the amount printed beside `退票费` is the amount being reimbursed. Write it to both `classification.railway_leg.refund_fee_amount` and `invoice.total_amount`. Railway PDF text layers may emit the visually adjacent row as `￥63.50` followed by `退票费:` on the next extracted line; support both label-before-amount and amount-before-label orders. A blank or unresolved label is not `0`: leave the amount blank, keep `needs_review=true`, and ask the applicant to verify it.
 
+Ordinary/special VAT invoices may still be flight evidence. Preserve line items such as `国内航空`, `国际航空`, `航空运输`, or `航空旅客运输`, plus seller and remark evidence, so Stage 2 can recognize the flight without a dedicated document subtype. Airline name is evidence, not the final reimbursement Note.
+
 Keep `invoice.issue_date` as the formal invoice date. Do not copy it into `classification.expense_date` for ordinary invoices, meal invoices, taxi summary invoices, hotel invoices without stay dates, or `other`/`unknown` invoices. Stage 2 will ask the applicant for the actual date when it is not reliable.
 
 Didi/Gaode trip reports additionally need:

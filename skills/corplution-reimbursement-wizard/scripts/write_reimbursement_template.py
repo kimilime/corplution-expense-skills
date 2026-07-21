@@ -58,6 +58,13 @@ import text_safety
 from text_utils import normalize_text as clean
 import subagent_protocol
 import time_utils
+from travel_ticket_utils import (
+    contains_raw_ticket_evidence,
+    is_flight_ticket,
+    is_rail_ticket,
+    route_from_text,
+    ticket_note,
+)
 import value_utils
 
 _POLICY = load_policy()
@@ -323,105 +330,6 @@ def contains_place_type_placeholder(note: Any) -> bool:
 def contains_hotel_placeholder(note: Any) -> bool:
     text = clean(note)
     return any(token in text for token in ["X晚", "入住日", "离店日"])
-
-
-def strip_route_place(value: Any) -> str:
-    text = clean(value)
-    text = re.sub(r"^[A-Z]{0,3}\d{1,5}\s*[,，]?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^(高铁|动车|火车|铁路|飞机|航班|机票)\s*", "", text)
-    text = re.sub(r"\s*(二等座|一等座|商务座|硬座|软座|硬卧|软卧|经济舱|公务舱|头等舱).*$", "", text)
-    return text.strip(" ,，;；。()（）")
-
-
-def route_from_text(value: Any) -> str:
-    text = clean(value)
-    if not text:
-        return ""
-    match = re.search(r"（([^（）]+)）", text)
-    if match:
-        text = match.group(1)
-    for piece in re.split(r"[,，;；]", text):
-        match = re.search(r"(.+?)\s*(?:->|—|~|至|到|-)\s*(.+)", piece)
-        if match:
-            origin = strip_route_place(match.group(1))
-            destination = strip_route_place(match.group(2))
-            if origin and destination:
-                return f"{origin}-{destination}"
-    match = re.search(r"(.+?)\s*(?:->|—|~|至|到|-)\s*(.+)", text)
-    if match:
-        origin = strip_route_place(match.group(1))
-        destination = strip_route_place(match.group(2))
-        if origin and destination:
-            return f"{origin}-{destination}"
-    return ""
-
-
-def is_refund_fee(unit: dict[str, Any]) -> bool:
-    if unit.get("is_refund_fee") is True or clean(unit.get("refund_fee_amount")):
-        return True
-    text = clean(" ".join([
-        unit.get("final_note", ""),
-        unit.get("source_note", ""),
-        unit.get("expense_note", ""),
-        unit.get("raw_remarks", ""),
-        unit.get("line_item_name", ""),
-        unit.get("seller_name", ""),
-    ]))
-    return any(keyword in text for keyword in ["退票费", "退票", "退款", "refund", "Refund", "cancellation"])
-
-
-def is_rail_ticket(unit: dict[str, Any]) -> bool:
-    subtype = clean(unit.get("document_subtype"))
-    if subtype == "railway_e_ticket":
-        return True
-    source_category = clean(unit.get("source_category"))
-    if source_category and source_category not in {"travel", "rail"}:
-        return False
-    text = clean(" ".join([unit.get("source_note", ""), unit.get("expense_note", ""), unit.get("final_note", "")]))
-    return bool(re.match(r"^[GCDKZT]\d{1,5}\b", text, flags=re.IGNORECASE))
-
-
-def is_flight_ticket(unit: dict[str, Any]) -> bool:
-    source_category = clean(unit.get("source_category"))
-    if source_category and source_category not in {"travel", "flight"}:
-        return False
-    text = clean(" ".join([
-        unit.get("document_subtype", ""),
-        unit.get("source_note", ""),
-        unit.get("expense_note", ""),
-        unit.get("final_note", ""),
-        unit.get("raw_remarks", ""),
-    ])).lower()
-    return any(keyword in text for keyword in ["飞机", "机票", "航班", "flight"])
-
-
-def ticket_note(unit: dict[str, Any]) -> str:
-    if clean(unit.get("origin")):
-        return ""
-    route = (
-        route_from_text(unit.get("route"))
-        or route_from_text(unit.get("source_note"))
-        or route_from_text(unit.get("expense_note"))
-        or route_from_text(unit.get("final_note"))
-    )
-    if not route:
-        return ""
-    if is_rail_ticket(unit):
-        prefix = "高铁退票费" if is_refund_fee(unit) else "高铁"
-    elif is_flight_ticket(unit):
-        prefix = "飞机退票费" if is_refund_fee(unit) else "飞机"
-    else:
-        return ""
-    return f"{prefix}（{route}）"
-
-
-def contains_raw_ticket_evidence(note: Any) -> bool:
-    text = clean(note)
-    return bool(
-        "->" in text
-        or re.search(r"\b[GCDKZT]\d{1,5}\b", text, flags=re.IGNORECASE)
-        or any(keyword in text for keyword in ["二等座", "一等座", "商务座", "经济舱", "公务舱", "头等舱"])
-    )
 
 
 def taxi_template_note(unit: dict[str, Any]) -> str:

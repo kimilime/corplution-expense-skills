@@ -19,7 +19,7 @@ import integrity
 
 # Increment this only when allocation/rebase semantics change. Policy-only
 # changes are already guarded by source_policy_sha256.
-ALLOCATION_ENGINE_REVISION = "expense-allocation-engine.v2"
+ALLOCATION_ENGINE_REVISION = "expense-allocation-engine.v4"
 FINAL_UNIT_STATUSES = {"confirmed", "fixed", "dropped", "excluded", "non_reimbursable"}
 MAX_LINEAGE_DEPTH = 100
 LINEAGE_INTEGRITY_PREFIX = "lineage integrity failure:"

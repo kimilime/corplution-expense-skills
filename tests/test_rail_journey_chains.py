@@ -156,18 +156,47 @@ class RailwayExtractionTests(unittest.TestCase):
         self.assertEqual("高铁退票费（郑州东-滁州）", units[0]["final_note"])
 
 
+class FlightTicketNormalizationTests(unittest.TestCase):
+    def test_airline_vat_invoice_uses_line_item_and_unicode_arrow_route(self) -> None:
+        unit = {
+            "source_category": "travel",
+            "document_subtype": "vat_special_invoice",
+            "seller_name": "中国东方航空股份有限公司",
+            "line_item_name": "*交通运输服务*国内航空",
+            "source_note": "6.24 太原→上海虹桥 东航 1300(自订)",
+            "expense_note": "6.24 太原→上海虹桥 东航 1300(自订)",
+            "final_note": "6.24 太原→上海虹桥 东航 1300(自订)",
+            "route": "",
+        }
+
+        self.assertTrue(updater.is_flight_ticket(unit))
+        self.assertEqual("太原-上海虹桥", updater.route_from_text(unit["source_note"]))
+        self.assertEqual("飞机（太原-上海虹桥）", allocator.normal_note(unit))
+        self.assertEqual("飞机（太原-上海虹桥）", updater.ticket_note(unit))
+        self.assertEqual("飞机（太原-上海虹桥）", writer.ticket_note(unit))
+        self.assertEqual("flight", writer.proof_type(unit))
+
+    def test_airport_merchant_name_does_not_turn_a_meal_into_a_flight(self) -> None:
+        unit = {
+            "source_category": "meal",
+            "seller_name": "中图餐饮郑州航空港区有限公司",
+            "line_item_name": "*生产生活服务*餐饮服务",
+        }
+        self.assertFalse(updater.is_flight_ticket(unit))
+
+
 class RailJourneyChainTests(unittest.TestCase):
     def setUp(self) -> None:
         self.zhoukou = project("CTX-ZK", "周口", "周口项目", "CORP-ZK")
         self.zhengzhou = project("CTX-ZZ", "郑州", "千味央厨", "CORP-QW")
         self.taiyuan = project("CTX-TY", "太原", "山西信托", "CORP-SX")
 
-    def test_outbound_transfer_uses_terminal_project_not_intermediate_city(self) -> None:
+    def test_outbound_transfer_uses_terminal_project_when_intermediate_has_no_project(self) -> None:
         units = [
             rail_unit(1, "上海虹桥", "周口东", "08:00"),
-            rail_unit(2, "周口", "郑州东", "13:00"),
+            rail_unit(2, "周口", "郑州东", "10:00"),
         ]
-        allocator.apply_matches(units, [self.zhoukou, self.zhengzhou])
+        allocator.apply_matches(units, [self.zhengzhou])
 
         self.assertEqual({"RAIL-CHAIN-001"}, {unit["journey_chain_id"] for unit in units})
         self.assertEqual({"CTX-ZZ"}, {unit["project_context_id"] for unit in units})
@@ -177,10 +206,29 @@ class RailJourneyChainTests(unittest.TestCase):
         self.assertEqual("高铁（上海虹桥-周口东）", units[0]["final_note"])
         self.assertEqual("高铁（周口-郑州东）", units[1]["final_note"])
 
+    def test_intermediate_city_project_requires_transfer_or_stop_review(self) -> None:
+        units = [
+            rail_unit(1, "上海虹桥", "周口东", "08:00"),
+            rail_unit(2, "周口", "郑州东", "10:00"),
+        ]
+        allocator.apply_matches(units, [self.zhoukou, self.zhengzhou])
+        questions = allocator.build_questions(units, [])
+
+        self.assertEqual({"RAIL-CHAIN-001"}, {unit["journey_chain_id"] for unit in units})
+        self.assertEqual({""}, {unit["project_context_id"] for unit in units})
+        self.assertTrue(all(unit["journey_chain_needs_confirmation"] for unit in units))
+        self.assertEqual(
+            {"rail_transfer_chain_intermediate_project_review"},
+            {unit["journey_chain_assignment_rule"] for unit in units},
+        )
+        open_questions = [question for question in questions if question.get("status") == "open"]
+        self.assertEqual(1, len(open_questions))
+        self.assertIn("实际停留/项目活动", open_questions[0]["question"])
+
     def test_return_transfer_uses_project_just_completed(self) -> None:
         units = [
             rail_unit(1, "郑州东", "周口东", "08:00"),
-            rail_unit(2, "周口东", "上海虹桥", "13:00"),
+            rail_unit(2, "周口东", "上海虹桥", "10:00"),
         ]
         allocator.apply_matches(units, [self.zhengzhou])
 
@@ -214,7 +262,7 @@ class RailJourneyChainTests(unittest.TestCase):
     def test_project_to_project_transfer_uses_project_being_traveled_to(self) -> None:
         units = [
             rail_unit(1, "太原南", "周口东", "07:00"),
-            rail_unit(2, "周口东", "郑州东", "13:00"),
+            rail_unit(2, "周口东", "郑州东", "09:00"),
         ]
         allocator.apply_matches(units, [self.taiyuan, self.zhengzhou])
 
@@ -223,10 +271,10 @@ class RailJourneyChainTests(unittest.TestCase):
     def test_three_connected_segments_share_one_chain_and_project(self) -> None:
         units = [
             rail_unit(1, "上海虹桥", "南京南", "06:00"),
-            rail_unit(2, "南京南", "周口东", "09:00"),
-            rail_unit(3, "周口东", "郑州东", "15:00"),
+            rail_unit(2, "南京南", "周口东", "08:00"),
+            rail_unit(3, "周口东", "郑州东", "10:00"),
         ]
-        allocator.apply_matches(units, [self.zhoukou, self.zhengzhou])
+        allocator.apply_matches(units, [self.zhengzhou])
         self.assertEqual({"RAIL-CHAIN-001"}, {unit["journey_chain_id"] for unit in units})
         self.assertEqual({3}, {unit["journey_chain_length"] for unit in units})
         self.assertEqual({"CTX-ZZ"}, {unit["project_context_id"] for unit in units})
@@ -246,24 +294,55 @@ class RailJourneyChainTests(unittest.TestCase):
     def test_branching_transfer_candidates_do_not_create_partial_chain(self) -> None:
         units = [
             rail_unit(1, "上海虹桥", "周口东", "08:00"),
-            rail_unit(2, "周口东", "郑州东", "13:00"),
-            rail_unit(3, "周口东", "漯河西", "14:00"),
+            rail_unit(2, "周口东", "郑州东", "10:00"),
+            rail_unit(3, "周口东", "漯河西", "10:30"),
         ]
         self.assertEqual([], allocator.build_rail_journey_chains(units))
 
-    def test_missing_times_can_still_form_same_day_medium_confidence_chain(self) -> None:
+    def test_missing_times_do_not_auto_form_a_chain(self) -> None:
         units = [
             rail_unit(1, "上海虹桥", "周口东", ""),
             rail_unit(2, "周口东", "郑州东", ""),
         ]
         chains = allocator.build_rail_journey_chains(units)
-        self.assertEqual(1, len(chains))
-        self.assertEqual("medium", chains[0]["confidence"])
+        self.assertEqual([], chains)
+
+    def test_departure_gap_over_six_hours_does_not_auto_form_a_chain(self) -> None:
+        within_window = [
+            rail_unit(1, "上海虹桥", "周口东", "08:00"),
+            rail_unit(2, "周口东", "郑州东", "14:00"),
+        ]
+        over_window = [
+            rail_unit(3, "上海虹桥", "周口东", "08:00"),
+            rail_unit(4, "周口东", "郑州东", "14:01"),
+        ]
+        self.assertEqual(1, len(allocator.build_rail_journey_chains(within_window)))
+        self.assertEqual([], allocator.build_rail_journey_chains(over_window))
+
+    def test_conflicting_user_hint_assignments_prevent_chain_creation(self) -> None:
+        units = [
+            rail_unit(1, "上海虹桥", "郑州东", "08:00"),
+            rail_unit(2, "郑州东", "北京西", "10:00"),
+        ]
+        beijing = project("CTX-BJ", "北京", "北京项目", "CORP-BJ")
+        for unit, ctx in zip(units, [self.zhengzhou, beijing]):
+            unit.update({
+                "project_context_id": ctx["context_id"],
+                "client_name": ctx["client_name"],
+                "client_charge_code": ctx["client_charge_code"],
+                "auto_project_match": "user_context_expense_hint",
+                "status": "confirmed",
+            })
+
+        allocator.apply_matches(units, [self.zhengzhou, beijing])
+
+        self.assertEqual({""}, {unit.get("journey_chain_id", "") for unit in units})
+        self.assertEqual(["CTX-ZZ", "CTX-BJ"], [unit["project_context_id"] for unit in units])
 
     def test_old_extraction_note_without_structured_leg_fields_still_forms_chain(self) -> None:
         units = [
             rail_unit(1, "上海虹桥", "周口东", "08:00"),
-            rail_unit(2, "周口东", "郑州东", "13:00"),
+            rail_unit(2, "周口东", "郑州东", "10:00"),
         ]
         for unit in units:
             for field in [
@@ -281,7 +360,7 @@ class RailJourneyChainTests(unittest.TestCase):
     def test_resolved_chain_is_advisory_not_a_blocking_per_leg_question(self) -> None:
         units = [
             rail_unit(1, "上海虹桥", "周口东", "08:00"),
-            rail_unit(2, "周口东", "郑州东", "13:00"),
+            rail_unit(2, "周口东", "郑州东", "10:00"),
         ]
         allocator.apply_matches(units, [self.zhengzhou])
         questions = allocator.build_questions(units, [])
@@ -297,7 +376,7 @@ class RailJourneyChainTests(unittest.TestCase):
     def test_unresolved_chain_asks_once_for_whole_journey(self) -> None:
         units = [
             rail_unit(1, "上海虹桥", "周口东", "08:00"),
-            rail_unit(2, "周口东", "漯河西", "13:00"),
+            rail_unit(2, "周口东", "漯河西", "10:00"),
         ]
         allocator.apply_matches(units, [self.zhengzhou, self.taiyuan])
         questions = allocator.build_questions(units, [])
@@ -310,9 +389,9 @@ class RailJourneyChainTests(unittest.TestCase):
     def test_stage3_accepts_one_chain_assignment_and_rejects_split_assignment(self) -> None:
         units = [
             rail_unit(1, "上海虹桥", "周口东", "08:00"),
-            rail_unit(2, "周口东", "郑州东", "13:00"),
+            rail_unit(2, "周口东", "郑州东", "10:00"),
         ]
-        contexts = [self.zhoukou, self.zhengzhou]
+        contexts = [self.zhengzhou]
         allocator.apply_matches(units, contexts)
         allocation = {"project_contexts": contexts, "questions": [], "allocation_units": units}
 
@@ -327,10 +406,32 @@ class RailJourneyChainTests(unittest.TestCase):
         errors = writer.require_ready(allocation, allow_unconfirmed=False)
         self.assertTrue(any("different project assignments" in error for error in errors))
 
+    def test_updater_splits_chain_when_user_declares_different_projects(self) -> None:
+        units = [
+            rail_unit(1, "上海虹桥", "郑州东", "08:00"),
+            rail_unit(2, "郑州东", "北京西", "10:00"),
+        ]
+        beijing = project("CTX-BJ", "北京", "北京项目", "CORP-BJ")
+        allocator.apply_matches(units, [beijing])
+        self.assertEqual({"RAIL-CHAIN-001"}, {unit["journey_chain_id"] for unit in units})
+
+        units[0].update({
+            "project_context_id": "CTX-ZZ",
+            "client_name": "千味央厨",
+            "client_charge_code": "CORP-QW",
+        })
+        updater.refresh_rail_chain_assignments(
+            {"allocation_units": units}, {"UNIT-001"}
+        )
+
+        self.assertEqual({""}, {unit.get("journey_chain_id", "") for unit in units})
+        self.assertEqual(["CTX-ZZ", "CTX-BJ"], [unit["project_context_id"] for unit in units])
+        self.assertEqual([], writer.rail_chain_ready_errors(units))
+
     def test_stage3_rejects_stale_chain_after_route_correction_breaks_connection(self) -> None:
         units = [
             rail_unit(1, "上海虹桥", "周口东", "08:00"),
-            rail_unit(2, "周口东", "郑州东", "13:00"),
+            rail_unit(2, "周口东", "郑州东", "10:00"),
         ]
         allocator.apply_matches(units, [self.zhengzhou])
         units[1]["route"] = "开封北-郑州东"
@@ -340,8 +441,8 @@ class RailJourneyChainTests(unittest.TestCase):
     def test_stage3_rejects_truncated_three_leg_chain_after_drop(self) -> None:
         units = [
             rail_unit(1, "上海虹桥", "南京南", "06:00"),
-            rail_unit(2, "南京南", "周口东", "09:00"),
-            rail_unit(3, "周口东", "郑州东", "15:00"),
+            rail_unit(2, "南京南", "周口东", "08:00"),
+            rail_unit(3, "周口东", "郑州东", "10:00"),
         ]
         allocator.apply_matches(units, [self.zhengzhou])
         units[2]["status"] = "dropped"
@@ -354,7 +455,7 @@ class RailJourneyChainTests(unittest.TestCase):
     def test_updater_closes_chain_gate_only_after_all_legs_share_assignment(self) -> None:
         units = [
             rail_unit(1, "上海虹桥", "周口东", "08:00"),
-            rail_unit(2, "周口东", "漯河西", "13:00"),
+            rail_unit(2, "周口东", "漯河西", "10:00"),
         ]
         allocator.apply_matches(units, [self.zhengzhou, self.taiyuan])
         payload = {"allocation_units": units}
@@ -383,7 +484,7 @@ class RailJourneyChainTests(unittest.TestCase):
     def test_dropping_one_of_two_legs_clears_obsolete_chain_metadata(self) -> None:
         units = [
             rail_unit(1, "上海虹桥", "周口东", "08:00"),
-            rail_unit(2, "周口东", "郑州东", "13:00"),
+            rail_unit(2, "周口东", "郑州东", "10:00"),
         ]
         allocator.apply_matches(units, [self.zhengzhou])
         units[1]["status"] = "dropped"
