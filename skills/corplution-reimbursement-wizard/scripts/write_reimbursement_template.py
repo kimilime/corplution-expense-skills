@@ -7,6 +7,7 @@ import argparse
 import hashlib
 import copy
 import json
+import os
 import re
 import sys
 from collections import OrderedDict, defaultdict
@@ -14,6 +15,7 @@ from datetime import date, datetime, timedelta
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -212,6 +214,137 @@ def load_layout(path: Path) -> dict[str, Any]:
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+class Stage3PromotionError(RuntimeError):
+    """A fully staged Stage-3 artifact set could not be promoted safely."""
+
+    def __init__(self, message: str, *, previous_artifacts_preserved: bool) -> None:
+        super().__init__(message)
+        self.previous_artifacts_preserved = previous_artifacts_preserved
+
+
+def stage3_temporary_path(target: Path, token: str) -> Path:
+    """Return a hidden sibling staging path while preserving the real suffix."""
+    return target.with_name(f".{target.stem}.stage3-{token}{target.suffix}")
+
+
+def cleanup_paths(paths: list[Path]) -> None:
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            # Cleanup failure must not hide the original staging/promotion error.
+            pass
+
+
+def promote_stage3_artifacts(artifacts: list[tuple[Path, Path]]) -> None:
+    """Promote one staged Stage-3 generation, restoring the old set on failure.
+
+    Each staged file lives beside its target, so every individual ``os.replace``
+    is atomic. The backup/rollback layer keeps the workbook, JSON, and Markdown
+    on the same generation when one of the multi-file replacements fails.
+    """
+    if not artifacts:
+        raise ValueError("Stage 3 promotion requires at least one artifact")
+    missing = [str(staged) for staged, _target in artifacts if not staged.is_file()]
+    if missing:
+        raise Stage3PromotionError(
+            "Stage 3 promotion refused because staged artifacts are missing: "
+            + ", ".join(missing),
+            previous_artifacts_preserved=True,
+        )
+
+    token = uuid4().hex
+    backups: list[tuple[Path, Path]] = []
+    promoted: list[Path] = []
+    try:
+        for _staged, target in artifacts:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                continue
+            backup = target.with_name(f".{target.name}.stage3-previous-{token}")
+            os.replace(target, backup)
+            backups.append((target, backup))
+
+        for staged, target in artifacts:
+            os.replace(staged, target)
+            promoted.append(target)
+    except BaseException as exc:
+        rollback_errors: list[str] = []
+        for target in reversed(promoted):
+            try:
+                target.unlink(missing_ok=True)
+            except OSError as rollback_exc:
+                rollback_errors.append(f"remove new {target}: {rollback_exc}")
+        for target, backup in reversed(backups):
+            try:
+                if backup.exists():
+                    os.replace(backup, target)
+            except OSError as rollback_exc:
+                rollback_errors.append(f"restore {target} from {backup}: {rollback_exc}")
+        cleanup_paths([staged for staged, _target in artifacts])
+        if rollback_errors:
+            raise Stage3PromotionError(
+                "Stage 3 artifact promotion failed and rollback was incomplete; "
+                "preserved backup paths are named .stage3-previous-*. "
+                + "; ".join(rollback_errors),
+                previous_artifacts_preserved=False,
+            ) from exc
+        if isinstance(exc, Exception):
+            raise Stage3PromotionError(
+                f"Stage 3 artifact promotion failed; previous artifacts were restored: {exc}",
+                previous_artifacts_preserved=True,
+            ) from exc
+        raise
+    else:
+        cleanup_paths([backup for _target, backup in backups])
+
+
+def print_stage3_result(
+    status: str,
+    *,
+    exit_code: int | ExitCode,
+    allocation_fingerprint: str = "",
+    blocking_errors: int = 0,
+    blocking_policy_checks: int = 0,
+    artifacts_written: bool,
+    previous_artifacts_preserved: bool,
+    package_allowed: bool,
+) -> None:
+    """Emit one compact, machine-readable terminal result for Stage 3."""
+    print("")
+    print(f"STAGE3_RESULT: {status}")
+    print(f"exit_code={int(exit_code)}")
+    print(f"allocation_generation={allocation_fingerprint[:8] or '<unknown>'}")
+    print(f"blocking_errors={blocking_errors}")
+    print(f"blocking_policy_checks={blocking_policy_checks}")
+    print(f"artifacts_written={'true' if artifacts_written else 'false'}")
+    print(
+        "previous_artifacts_preserved="
+        + ("true" if previous_artifacts_preserved else "false")
+    )
+    print(f"package_allowed={'true' if package_allowed else 'false'}")
+    if not package_allowed:
+        print("DO NOT RUN PACKAGE")
+
+
+def stage3_blocked_result(
+    *,
+    allocation_fingerprint: str = "",
+    blocking_errors: int = 1,
+    previous_artifacts_preserved: bool = True,
+) -> int:
+    print_stage3_result(
+        "blocked",
+        exit_code=ExitCode.COMMAND_ERROR,
+        allocation_fingerprint=allocation_fingerprint,
+        blocking_errors=blocking_errors,
+        artifacts_written=False,
+        previous_artifacts_preserved=previous_artifacts_preserved,
+        package_allowed=False,
+    )
+    return ExitCode.COMMAND_ERROR
 
 
 def workbook_text_issues(path: Path) -> list[str]:
@@ -2203,7 +2336,7 @@ def main(argv: list[str] | None = None) -> int:
             f"Expected: {allocation_path.parent.resolve()}",
             file=sys.stderr,
         )
-        return ExitCode.COMMAND_ERROR
+        return stage3_blocked_result()
     template_path = resolve_template_arg(args.template)
     if template_path and not template_path.exists():
         print(
@@ -2211,7 +2344,7 @@ def main(argv: list[str] | None = None) -> int:
             "Pass an existing --template path or omit --template to generate the workbook directly.",
             file=sys.stderr,
         )
-        return ExitCode.COMMAND_ERROR
+        return stage3_blocked_result()
     layout_path = resolve_layout_arg(args.layout)
     layout = None
     if not template_path or args.layout:
@@ -2219,10 +2352,11 @@ def main(argv: list[str] | None = None) -> int:
             layout = load_layout(layout_path)
         except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
             print(f"ERROR: Workbook layout could not be loaded from {layout_path}: {exc}", file=sys.stderr)
-            return ExitCode.COMMAND_ERROR
+            return stage3_blocked_result()
 
     allocation = load_json(allocation_path)
     integrity.require_valid(allocation, allocation_path)
+    allocation_fingerprint = str((allocation.get("integrity") or {}).get("fingerprint", ""))
     for unit in allocation.get("allocation_units", []):
         if unit.get("is_substitute_invoice") and unit.get("approval_file"):
             evidence_paths.normalize_approval_file(unit, process_dir)
@@ -2341,7 +2475,10 @@ def main(argv: list[str] | None = None) -> int:
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
-        return ExitCode.COMMAND_ERROR
+        return stage3_blocked_result(
+            allocation_fingerprint=allocation_fingerprint,
+            blocking_errors=len(errors),
+        )
 
     units = included_units(allocation)
     proof_groups = assign_proof_numbers(units)
@@ -2357,16 +2494,45 @@ def main(argv: list[str] | None = None) -> int:
     )
     if row_text_issues:
         print("ERROR: Refusing to write a workbook with suspect encoding damage: " + "; ".join(row_text_issues), file=sys.stderr)
-        return ExitCode.COMMAND_ERROR
+        return stage3_blocked_result(
+            allocation_fingerprint=allocation_fingerprint,
+            blocking_errors=len(row_text_issues),
+        )
     meal_checks = meal_daily_cap_checks(rows)
     hotel_checks = hotel_cap_checks(rows)
-    project_blocks, summary_rows = write_workbook(Path(args.output), rows, template_path, layout)
-    saved_workbook_text_issues = workbook_text_issues(Path(args.output))
+    workbook_path = Path(args.output)
+    final_rows_path = process_dir / "final-expense-rows.json"
+    final_rows_markdown_path = process_dir / "final-expense-rows.md"
+    staging_token = uuid4().hex
+    staged_workbook_path = stage3_temporary_path(workbook_path, staging_token)
+    staged_final_rows_path = stage3_temporary_path(final_rows_path, staging_token)
+    staged_markdown_path = stage3_temporary_path(final_rows_markdown_path, staging_token)
+    staged_paths = [staged_workbook_path, staged_final_rows_path, staged_markdown_path]
+    cleanup_paths(staged_paths)
+    try:
+        project_blocks, summary_rows = write_workbook(
+            staged_workbook_path,
+            rows,
+            template_path,
+            layout,
+        )
+        saved_workbook_text_issues = workbook_text_issues(staged_workbook_path)
+    except Exception as exc:
+        cleanup_paths(staged_paths)
+        print(f"ERROR: Stage 3 workbook staging failed: {exc}", file=sys.stderr)
+        return stage3_blocked_result(
+            allocation_fingerprint=allocation_fingerprint,
+            blocking_errors=1,
+        )
     if saved_workbook_text_issues:
+        cleanup_paths(staged_paths)
         print("ERROR: Workbook text scan found suspect encoding damage. The workbook is not a deliverable; "
               "fix the UTF-8 answers input and re-run Stage 3. Findings: "
               + "; ".join(saved_workbook_text_issues), file=sys.stderr)
-        return ExitCode.COMMAND_ERROR
+        return stage3_blocked_result(
+            allocation_fingerprint=allocation_fingerprint,
+            blocking_errors=len(saved_workbook_text_issues),
+        )
     meal_check_status = aggregate_check_status(meal_checks)
     hotel_check_status = aggregate_check_status(hotel_checks)
 
@@ -2439,14 +2605,45 @@ def main(argv: list[str] | None = None) -> int:
     payload["open_allocation_questions"] = len([
         q for q in allocation.get("questions", []) if q.get("status", "open") == "open"
     ])
-    workbook_path = Path(args.output)
-    payload["workbook_sha256"] = hashlib.sha256(workbook_path.read_bytes()).hexdigest()
+    payload["workbook_sha256"] = hashlib.sha256(staged_workbook_path.read_bytes()).hexdigest()
     integrity.stamp(payload, "write_reimbursement_template.py")
-    write_json(process_dir / "final-expense-rows.json", payload)
-    (process_dir / "final-expense-rows.md").write_text(build_markdown(payload, Path(args.output)), encoding="utf-8")
+    try:
+        write_json(staged_final_rows_path, payload)
+        staged_markdown_path.write_text(
+            build_markdown(payload, workbook_path),
+            encoding="utf-8",
+        )
+        staged_payload = load_json(staged_final_rows_path)
+        staged_ok, staged_reason = integrity.check(staged_payload)
+        if not staged_ok:
+            raise ValueError(f"staged final rows failed integrity validation: {staged_reason}")
+        if staged_payload.get("workbook_sha256") != hashlib.sha256(staged_workbook_path.read_bytes()).hexdigest():
+            raise ValueError("staged final rows workbook hash changed before promotion")
+        promote_stage3_artifacts([
+            (staged_workbook_path, workbook_path),
+            (staged_final_rows_path, final_rows_path),
+            (staged_markdown_path, final_rows_markdown_path),
+        ])
+    except Stage3PromotionError as exc:
+        cleanup_paths(staged_paths)
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return stage3_blocked_result(
+            allocation_fingerprint=allocation_fingerprint,
+            blocking_errors=1,
+            previous_artifacts_preserved=exc.previous_artifacts_preserved,
+        )
+    except Exception as exc:
+        cleanup_paths(staged_paths)
+        print(f"ERROR: Stage 3 artifact staging failed: {exc}", file=sys.stderr)
+        return stage3_blocked_result(
+            allocation_fingerprint=allocation_fingerprint,
+            blocking_errors=1,
+        )
+    finally:
+        cleanup_paths(staged_paths)
     print(f"Wrote {args.output}")
-    print(f"Wrote {process_dir / 'final-expense-rows.json'}")
-    print(f"Wrote {process_dir / 'final-expense-rows.md'}")
+    print(f"Wrote {final_rows_path}")
+    print(f"Wrote {final_rows_markdown_path}")
     print_meal_cap_check(meal_checks)
     print_hotel_cap_check(hotel_checks)
     print_stage3_review_summary(payload)
@@ -2455,8 +2652,25 @@ def main(argv: list[str] | None = None) -> int:
         print("NEXT: relay the STAGE 3 REVIEW SUMMARY above to the user VERBATIM, resolve the blocking "
               "checks via the answers updater, then RE-RUN this script. Packaging will refuse until "
               "blocking checks are zero.")
+        print_stage3_result(
+            "review_required",
+            exit_code=ExitCode.REVIEW_REQUIRED,
+            allocation_fingerprint=allocation_fingerprint,
+            blocking_policy_checks=payload["blocking_policy_checks"],
+            artifacts_written=True,
+            previous_artifacts_preserved=False,
+            package_allowed=False,
+        )
         return ExitCode.REVIEW_REQUIRED
     print("NEXT: run scripts/package_reimbursement_files.py to build the final submission package.")
+    print_stage3_result(
+        "ok",
+        exit_code=ExitCode.SUCCESS,
+        allocation_fingerprint=allocation_fingerprint,
+        artifacts_written=True,
+        previous_artifacts_preserved=False,
+        package_allowed=True,
+    )
     return ExitCode.SUCCESS
 
 

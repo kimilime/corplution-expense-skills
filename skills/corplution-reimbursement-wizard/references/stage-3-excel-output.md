@@ -4,6 +4,8 @@ Use this reference after stage 2 has produced `process/expense-allocation.json`.
 
 Before writing the workbook, `scripts/write_reimbursement_template.py` runs `STAGE 3 PREFLIGHT CHECK TO SHOW IN CHAT`. This is the hard connection-point validation between allocation and the initial reimbursement table. If it exits with code `2`, no workbook was written; fix the listed allocation issues first, such as open questions, unconfirmed units, invalid categories/columns, missing dates/client/code/amount, admin/mobile conflicts, raw rail/flight evidence in final notes, or missing taxi place types.
 
+Every run ends with one explicit `STAGE3_RESULT` block. Treat only `status=ok`, exit code `0`, and `package_allowed=true` as package-ready. `status=blocked` means no new Stage-3 artifact generation was committed and any prior workbook/final rows were preserved. `status=review_required` means the workbook and final rows were committed for applicant review, but policy confirmations remain and Stage 4 must not run.
+
 ## Inputs
 
 Required:
@@ -415,6 +417,29 @@ Create or update:
 - final reimbursement workbook `.xlsx`
 - `process/final-expense-rows.md`
 - `process/final-expense-rows.json`
+
+The workbook, final-rows JSON, and final-rows Markdown are one artifact generation. Write all three to hidden sibling staging paths first, keep the temporary workbook's `.xlsx` suffix, scan and validate the staged files, then promote them together. If staging or promotion fails, remove temporary files and restore the previous three-file generation; never delete a prior valid `final-expense-rows.json` merely because the current write attempt is blocked. The JSON records the SHA-256 of the workbook from the same promoted set.
+
+Result meanings:
+
+```text
+STAGE3_RESULT: blocked
+artifacts_written=false
+previous_artifacts_preserved=true
+package_allowed=false
+```
+
+```text
+STAGE3_RESULT: review_required
+artifacts_written=true
+package_allowed=false
+```
+
+```text
+STAGE3_RESULT: ok
+artifacts_written=true
+package_allowed=true
+```
 
 `final-expense-rows.json` should include:
 

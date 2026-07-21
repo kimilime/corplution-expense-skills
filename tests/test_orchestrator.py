@@ -7,6 +7,8 @@ import subprocess
 import sys
 import tempfile
 import unittest
+from contextlib import redirect_stdout
+from io import StringIO
 from pathlib import Path
 
 ROOT = Path(__file__).resolve().parents[1]
@@ -629,6 +631,25 @@ class JournalTests(unittest.TestCase):
     def test_exit_code_normalization_preserves_codes_and_maps_signals(self) -> None:
         self.assertEqual(7, chief_orchestrator.normalize_child_exit_code(7))
         self.assertEqual(143, chief_orchestrator.normalize_child_exit_code(-15))
+
+    def test_chief_write_banner_warns_without_replacing_the_next_step(self) -> None:
+        failed = StringIO()
+        with redirect_stdout(failed):
+            chief_orchestrator.print_write_outcome_banner(2)
+        self.assertIn("CHIEF WRITE FAILED", failed.getvalue())
+        self.assertIn("DO NOT RUN PACKAGE", failed.getvalue())
+        self.assertIn("authoritative CHIEF NEXT", failed.getvalue())
+
+        review = StringIO()
+        with redirect_stdout(review):
+            chief_orchestrator.print_write_outcome_banner(3)
+        self.assertIn("CHIEF WRITE REVIEW REQUIRED", review.getvalue())
+        self.assertIn("authoritative CHIEF NEXT", review.getvalue())
+
+        success = StringIO()
+        with redirect_stdout(success):
+            chief_orchestrator.print_write_outcome_banner(0)
+        self.assertEqual("", success.getvalue())
 
     def test_snapshot_contains_counts_and_hashes_but_not_source_names(self) -> None:
         fixture = WorkflowFixture(self.root)

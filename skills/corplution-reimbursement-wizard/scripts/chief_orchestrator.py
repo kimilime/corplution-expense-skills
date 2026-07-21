@@ -322,6 +322,24 @@ def normalize_child_exit_code(returncode: int) -> int:
     return 128 + abs(returncode) if returncode < 0 else returncode
 
 
+def print_write_outcome_banner(exit_code: int) -> None:
+    """Make a non-packageable Stage-3 result impossible to miss."""
+    if exit_code == ExitCode.SUCCESS:
+        return
+    print("")
+    if exit_code == ExitCode.REVIEW_REQUIRED:
+        print(
+            "CHIEF WRITE REVIEW REQUIRED: Stage 3 wrote review artifacts, but policy "
+            "confirmations remain. DO NOT RUN PACKAGE."
+        )
+    else:
+        print(
+            f"CHIEF WRITE FAILED (exit {exit_code}): Stage 3 did not produce a new "
+            "package-ready generation. DO NOT RUN PACKAGE."
+        )
+    print("CHIEF will still inspect the workflow and print the authoritative CHIEF NEXT action.")
+
+
 def run_child(
     *,
     stage: str,
@@ -689,6 +707,8 @@ def main(argv: list[str] | None = None) -> int:
         output_root=args.output_root,
         journal=journal_path(args),
     )
+    if args.run_stage == "write":
+        print_write_outcome_banner(exit_code)
     try:
         _state, step = inspect(args)
         print("")

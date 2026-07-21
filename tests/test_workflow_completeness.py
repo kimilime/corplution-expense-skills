@@ -6,7 +6,7 @@ import subprocess
 import sys
 import tempfile
 import unittest
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from datetime import datetime
 from io import StringIO
 from pathlib import Path
@@ -284,6 +284,53 @@ class ExpenseHintCompletenessTests(unittest.TestCase):
 
 
 class CrossStageRegressionTests(unittest.TestCase):
+    def ready_stage3_fixture(self, root: Path) -> tuple[Path, Path]:
+        process = root / "process"
+        process.mkdir()
+        extraction = {
+            "schema_version": "invoice_extraction.v1",
+            "documents": [],
+            "unresolved_input_files": [],
+        }
+        integrity.stamp(extraction, "test")
+        (process / "invoice-extraction.json").write_text(
+            json.dumps(extraction),
+            encoding="utf-8",
+        )
+        allocation = {
+            "schema_version": "expense_allocation.v1",
+            "source_extraction_fingerprint": extraction["integrity"]["fingerprint"],
+            "source_policy_sha256": "",
+            "source_project_context_sha256": "",
+            "project_contexts": [],
+            "expense_hint_reconciliation": [],
+            "questions": [],
+            "allocation_units": [{
+                "unit_id": "UNIT-001",
+                "user_no": 1,
+                "source_document_id": "DOC-001",
+                "source_category": "other",
+                "status": "confirmed",
+                "client_name": "测试客户",
+                "client_charge_code": "CORP-TEST",
+                "final_template_column": "other",
+                "amount": "10.00",
+                "invoice_amount": "10.00",
+                "expense_date": "2026-07-01",
+                "expenses_nature": "本地",
+                "final_note": "测试费用",
+                "source_filename": "test.pdf",
+                "issues": [],
+            }],
+        }
+        integrity.stamp(allocation, "test")
+        allocation_path = process / "expense-allocation.json"
+        allocation_path.write_text(
+            json.dumps(allocation, ensure_ascii=False),
+            encoding="utf-8",
+        )
+        return process, allocation_path
+
     def test_exit_code_contract_is_named_and_stable(self) -> None:
         self.assertEqual(
             [0, 1, 2, 3, 4, 130],
@@ -712,6 +759,170 @@ class CrossStageRegressionTests(unittest.TestCase):
 
             self.assertEqual(2, attempts["count"])
             self.assertTrue((target / "file.txt").is_file())
+
+    def test_stage3_temporary_workbook_keeps_xlsx_suffix_and_parent(self) -> None:
+        target = Path("output") / "reimbursement.xlsx"
+        staged = writer.stage3_temporary_path(target, "abc123")
+
+        self.assertEqual(target.parent, staged.parent)
+        self.assertEqual(".xlsx", staged.suffix)
+        self.assertIn("stage3-abc123", staged.name)
+
+    def test_stage3_artifact_promotion_replaces_the_generation_as_one_set(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            targets = [
+                root / "reimbursement.xlsx",
+                root / "process" / "final-expense-rows.json",
+                root / "process" / "final-expense-rows.md",
+            ]
+            staged = [writer.stage3_temporary_path(path, "success") for path in targets]
+            for index, path in enumerate(targets):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"old-{index}", encoding="utf-8")
+            for index, path in enumerate(staged):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"new-{index}", encoding="utf-8")
+
+            writer.promote_stage3_artifacts(list(zip(staged, targets)))
+
+            self.assertEqual(
+                ["new-0", "new-1", "new-2"],
+                [path.read_text(encoding="utf-8") for path in targets],
+            )
+            self.assertTrue(all(not path.exists() for path in staged))
+            self.assertEqual([], list(root.rglob("*.stage3-previous-*")))
+
+    def test_stage3_artifact_promotion_rolls_back_all_targets_on_failure(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            targets = [
+                root / "reimbursement.xlsx",
+                root / "process" / "final-expense-rows.json",
+                root / "process" / "final-expense-rows.md",
+            ]
+            staged = [writer.stage3_temporary_path(path, "failure") for path in targets]
+            for index, path in enumerate(targets):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"old-{index}", encoding="utf-8")
+            for index, path in enumerate(staged):
+                path.parent.mkdir(parents=True, exist_ok=True)
+                path.write_text(f"new-{index}", encoding="utf-8")
+
+            real_replace = writer.os.replace
+            failed = {"value": False}
+
+            def fail_second_promotion(source: str | Path, destination: str | Path) -> None:
+                if (
+                    Path(source) == staged[1]
+                    and Path(destination) == targets[1]
+                    and not failed["value"]
+                ):
+                    failed["value"] = True
+                    raise PermissionError("simulated final-rows lock")
+                real_replace(source, destination)
+
+            with patch.object(writer.os, "replace", side_effect=fail_second_promotion):
+                with self.assertRaises(writer.Stage3PromotionError) as raised:
+                    writer.promote_stage3_artifacts(list(zip(staged, targets)))
+
+            self.assertTrue(raised.exception.previous_artifacts_preserved)
+            self.assertEqual(
+                ["old-0", "old-1", "old-2"],
+                [path.read_text(encoding="utf-8") for path in targets],
+            )
+            self.assertTrue(all(not path.exists() for path in staged))
+
+    def test_stage3_result_marker_distinguishes_blocked_review_and_ok(self) -> None:
+        cases = [
+            ("blocked", ExitCode.COMMAND_ERROR, False, False),
+            ("review_required", ExitCode.REVIEW_REQUIRED, True, False),
+            ("ok", ExitCode.SUCCESS, True, True),
+        ]
+        for status, exit_code, artifacts_written, package_allowed in cases:
+            with self.subTest(status=status):
+                output = StringIO()
+                with redirect_stdout(output):
+                    writer.print_stage3_result(
+                        status,
+                        exit_code=exit_code,
+                        allocation_fingerprint="a" * 64,
+                        blocking_errors=1 if status == "blocked" else 0,
+                        blocking_policy_checks=1 if status == "review_required" else 0,
+                        artifacts_written=artifacts_written,
+                        previous_artifacts_preserved=status == "blocked",
+                        package_allowed=package_allowed,
+                    )
+                text = output.getvalue()
+                self.assertIn(f"STAGE3_RESULT: {status}", text)
+                self.assertIn(f"exit_code={int(exit_code)}", text)
+                self.assertIn(
+                    f"package_allowed={'true' if package_allowed else 'false'}",
+                    text,
+                )
+                self.assertEqual(not package_allowed, "DO NOT RUN PACKAGE" in text)
+
+    def test_stage3_post_write_scan_failure_preserves_previous_generation(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            process, allocation_path = self.ready_stage3_fixture(root)
+            workbook = root / "reimbursement.xlsx"
+            final_rows = process / "final-expense-rows.json"
+            final_markdown = process / "final-expense-rows.md"
+            workbook.write_bytes(b"previous workbook")
+            final_rows.write_text("previous final rows", encoding="utf-8")
+            final_markdown.write_text("previous markdown", encoding="utf-8")
+
+            output = StringIO()
+            with patch.object(writer, "workbook_text_issues", return_value=["simulated scan failure"]):
+                with redirect_stdout(output):
+                    rc = writer.main([
+                        "--allocation", str(allocation_path),
+                        "--output", str(workbook),
+                        "--requester", "Test",
+                        "--process-dir", str(process),
+                    ])
+
+            self.assertEqual(ExitCode.COMMAND_ERROR, rc)
+            self.assertEqual(b"previous workbook", workbook.read_bytes())
+            self.assertEqual("previous final rows", final_rows.read_text(encoding="utf-8"))
+            self.assertEqual("previous markdown", final_markdown.read_text(encoding="utf-8"))
+            self.assertIn("STAGE3_RESULT: blocked", output.getvalue())
+            self.assertIn("previous_artifacts_preserved=true", output.getvalue())
+            self.assertEqual([], list(root.rglob("*.stage3-*")))
+
+    def test_stage3_success_promotes_matching_workbook_and_final_rows(self) -> None:
+        with tempfile.TemporaryDirectory() as temp:
+            root = Path(temp)
+            process, allocation_path = self.ready_stage3_fixture(root)
+            workbook = root / "reimbursement.xlsx"
+            output = StringIO()
+
+            with redirect_stdout(output):
+                rc = writer.main([
+                    "--allocation", str(allocation_path),
+                    "--output", str(workbook),
+                    "--requester", "Test",
+                    "--process-dir", str(process),
+                ])
+
+            final_rows = json.loads(
+                (process / "final-expense-rows.json").read_text(encoding="utf-8")
+            )
+            allocation = json.loads(allocation_path.read_text(encoding="utf-8"))
+            self.assertEqual(ExitCode.SUCCESS, rc)
+            self.assertTrue(workbook.is_file())
+            self.assertEqual(
+                hashlib.sha256(workbook.read_bytes()).hexdigest(),
+                final_rows["workbook_sha256"],
+            )
+            self.assertEqual(
+                allocation["integrity"]["fingerprint"],
+                final_rows["source_allocation_fingerprint"],
+            )
+            self.assertIn("STAGE3_RESULT: ok", output.getvalue())
+            self.assertIn("package_allowed=true", output.getvalue())
+            self.assertEqual([], list(root.rglob("*.stage3-*")))
 
 
 if __name__ == "__main__":

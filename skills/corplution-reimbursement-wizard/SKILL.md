@@ -171,6 +171,8 @@ python scripts/chief_orchestrator.py run write --output <filled.xlsx> --requeste
 
 Stage 3 verifies that allocation still belongs to the current extraction generation and that no unsupported input remains unresolved. A mismatch requires a fresh Stage 2 run, not a manual repair.
 
+Stage 3 promotes the workbook plus `final-expense-rows.json/md` as one validated artifact generation and preserves the prior generation when a new write is blocked or promotion fails. Read the terminal `STAGE3_RESULT`: only `ok` with exit code `0` and `package_allowed=true` may proceed to Stage 4. `review_required` has current review artifacts but remains non-packageable; `blocked` wrote no new generation. Chief preserves the writer's exit code, prints an unmistakable `DO NOT RUN PACKAGE` banner for nonzero results, and still prints the authoritative `CHIEF NEXT` recovery action.
+
 7. For final packaging, read `references/stage-4-package.md`, then copy and rename source files using the final proof numbers.
 
 ```bash
