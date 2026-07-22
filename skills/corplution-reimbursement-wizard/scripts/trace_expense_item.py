@@ -6,32 +6,19 @@ from __future__ import annotations
 import argparse
 import json
 import integrity
-import sys
 from pathlib import Path
 from typing import Any
 
-
-def load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
-
+from io_utils import configure_utf8_stdio as configure_stdio
+from json_io import read_json_object as load_json
+from text_utils import strip_scalar as clean
+import value_utils
+from exit_codes import ExitCode
 
 def load_allocation(path: Path) -> dict[str, Any]:
     payload = load_json(path)
     integrity.warn_if_invalid(payload, path)
     return payload
-
-
-def clean(value: Any) -> str:
-    return "" if value is None else str(value).strip()
-
-
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(errors="replace")
-            except Exception:
-                pass
 
 
 def unit_no(unit: dict[str, Any]) -> str:
@@ -131,6 +118,11 @@ def trace_payload(allocation: dict[str, Any], extraction: dict[str, Any], item: 
             "origin": unit.get("origin", ""),
             "destination": unit.get("destination", ""),
             "source_note": unit.get("source_note", ""),
+            "journey_chain_id": unit.get("journey_chain_id", ""),
+            "journey_chain_route": unit.get("journey_chain_route", ""),
+            "journey_chain_position": unit.get("journey_chain_position", ""),
+            "journey_chain_length": unit.get("journey_chain_length", ""),
+            "journey_chain_unit_ids": unit.get("journey_chain_unit_ids", []),
             "client_name": unit.get("client_name", ""),
             "client_charge_code": unit.get("client_charge_code", ""),
             "status": unit.get("status", ""),
@@ -144,13 +136,22 @@ def trace_payload(allocation: dict[str, Any], extraction: dict[str, Any], item: 
 def print_text(payload: dict[str, Any]) -> None:
     unit = payload["current_unit"]
     print(f"第{payload['item_no']}项")
-    print(f"当前识别: 日期 {unit.get('expense_date') or '-'}, 金额 {unit.get('amount') or '-'}, 分类 {unit.get('source_category') or '-'} -> {unit.get('final_template_column') or '-'}")
+    print(
+        f"当前识别: 日期 {unit.get('expense_date') or '-'}, "
+        f"金额 {value_utils.display_value(unit.get('amount'), missing='-')}, "
+        f"分类 {unit.get('source_category') or '-'} -> {unit.get('final_template_column') or '-'}"
+    )
     if unit.get("seller_name") or unit.get("invoice_no"):
         print(f"发票信息: 发票号 {unit.get('invoice_no') or '-'}, 开具方/服务方 {unit.get('seller_name') or '-'}")
     if unit.get("origin") or unit.get("destination"):
         print(f"行程信息: {unit.get('origin') or '-'} -> {unit.get('destination') or '-'}, 城市 {unit.get('city') or '-'}")
     if unit.get("source_note"):
         print(f"识别备注: {unit.get('source_note')}")
+    if unit.get("journey_chain_id"):
+        print(
+            f"换乘链: {unit.get('journey_chain_id')}，第{unit.get('journey_chain_position')}/"
+            f"{unit.get('journey_chain_length')}段，整条路线 {unit.get('journey_chain_route') or '-'}"
+        )
     print("")
     print("来源文件:")
     for doc in payload["source_documents"]:
@@ -199,7 +200,7 @@ def main(argv: list[str] | None = None) -> int:
         print(json.dumps(payload, ensure_ascii=False, indent=2))
     else:
         print_text(payload)
-    return 0
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

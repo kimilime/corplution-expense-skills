@@ -18,7 +18,7 @@ Use this skill for the Corplution reimbursement workflow:
 
 Do not write the reimbursement Excel workbook until stage 2 has no blocking open questions. Preserve uncertain results in the review queue or allocation question queue.
 
-Company policy numbers (meal/hotel caps, first-tier cities) and year-coded charge codes live in `assets/policy.toml`; when policy or fiscal year changes, edit that one file. Process JSONs are integrity-stamped: `invoice-extraction.json` may only be changed via `apply_extraction_corrections.py`, `expense-allocation.json` only via the answers template + `apply_allocation_answers.py`, and `final-expense-rows.json` only by re-running Stage 3. Any other edit makes the next script exit with code `4` and print recovery steps — follow them instead of patching further.
+Company policy numbers (meal/hotel caps, first-tier cities) live in `assets/policy.toml`; when policy changes, edit that one file. The year-coded BD/ADMIN charge codes default from `policy.toml` but are overridden by the agent/user-writable `assets/special-code-definitions.json`; at a new fiscal year run `python scripts/special_codes.py set-year 2027` (or `set --admin CORP-2027-ADMIN --bd CORP-2027-BD`) and every stage reads the new codes. That file defines only the code strings — it never changes allocation behavior (telecom still auto-maps to ADMIN; other ADMIN matters still require the applicant to name them). Process JSONs are integrity-stamped: `invoice-extraction.json` may only be changed via `apply_extraction_corrections.py`, `expense-allocation.json` only via Composer-generated answers + `apply_allocation_answers.py`, and `final-expense-rows.json` only by re-running Stage 3. Any other edit makes the next script exit with code `4` and print recovery steps — follow them instead of patching further.
 
 Every input file is reimbursement evidence until the user explicitly says to drop it. Never skip or ignore a file because it cannot be read automatically — an unidentified file may be an invoice that needs OCR or visual reading, a partner approval screenshot, or a payment proof (paper receipt, Alipay/WeChat screenshot). Unidentified files become blocking questions; ask the user what each one is, and record an explicit exclusion (with the user's reason) for anything dropped.
 
@@ -30,237 +30,165 @@ If the user already provided files or context, acknowledge what is present, ask 
 
 ## Quick Start
 
+Resolve `SKILL_ROOT` as the directory containing this `SKILL.md`. Command examples below are relative to `SKILL_ROOT`. When the task working directory is elsewhere, invoke the exact absolute path `<SKILL_ROOT>/scripts/chief_orchestrator.py`. Never create `run_chief.py`, modify `sys.path`, import `chief_orchestrator`, copy it into the task, or call `chief_orchestrator.main()`; Chief rejects wrapper launchers and prints the correct direct command.
+
 1. In a new environment, check bundled script dependencies before running workflow scripts. The skill-local dependency file is `requirements.txt`.
 
 ```bash
-python scripts/check_dependencies.py
+python scripts/chief_orchestrator.py run dependencies
 ```
 
 If Python packages are missing, install them from the skill-local requirements file:
 
 ```bash
-python scripts/check_dependencies.py --install
+python scripts/chief_orchestrator.py run dependencies --install
 ```
 
-Every stage script prints a `NEXT:` line on completion telling you the required next action — always follow it. At any point, and ALWAYS when the user asks about progress or status, run `python scripts/check_workflow_status.py` and relay its output; it reports per-stage completion, unresolved items, and stale artifacts (e.g., a workbook generated before later allocation edits — packaging refuses stale workbooks and unresolved cap checks).
+Use the bundled `scripts/chief_orchestrator.py` as the default workflow entry. It fills canonical process paths, dispatches the existing scripts without duplicating their business logic, preserves the child exit code, and prints one authoritative `CHIEF NEXT` result after every run. Direct script calls remain supported for developer debugging only; they are not journaled and are not a workaround for a failed Chief command.
+
+The centralized command-exit contract is documented in `references/exit-codes.md`. In particular, `status`, `next`, and `lineage` return `0` when the query itself succeeds even if the reported workflow state is blocked; automation must inspect the reported `kind` or `integrity_blocked` field.
+
+```bash
+python scripts/chief_orchestrator.py status
+python scripts/chief_orchestrator.py next
+python scripts/chief_orchestrator.py next --json
+```
+
+At any point, and ALWAYS when the user asks about progress or status, run the Chief `status` command and relay its output. `next` returns exactly one of `command`, `needs_user`, `blocked`, or `complete`; it emits executable `argv` only when all required parameters are known. Never turn a `needs_user` result into a guessed command. The legacy `python scripts/check_workflow_status.py` command uses the same shared state engine and remains compatible.
+
+If a workflow command fails or the recovery path is unclear, read `references/troubleshooting.md`, run Chief `status`, and follow the one current `CHIEF NEXT` action. Do not improvise a helper, patch a process JSON, or bypass a failed stage.
+
+Runs dispatched by Chief append privacy-minimized events to `process/workflow-journal.jsonl`. The journal records stage/script, timestamps, exit code, duration, artifact hashes, and counts only; it must not contain raw invoice text, applicant answers, client details, full command arguments, or source paths. It is observational rather than an integrity authority, never enters the final package, and a journal-write failure must not replace the underlying script's exit code.
 
 Missing OCR system tools such as Tesseract or Poppler do not block text-layer PDFs or Excel/package stages. If OCR is unavailable, stage 1 must mark scan-only inputs as `manual_review` instead of inventing fields.
 
 If the user mainly provides scanned PDFs or images and expects OCR, run the stricter check and explain any missing system tool in chat:
 
 ```bash
-python scripts/check_dependencies.py --strict-ocr
+python scripts/chief_orchestrator.py run dependencies --strict-ocr
 ```
 
 2. For invoice extraction, read `references/stage-1-output.md` before changing the schema, classification rules, or process-file format.
-3. Run the bundled extractor when the user provides PDFs or images. Pass the whole upload folder (or every provided file) in one call — never pre-filter by which files look readable:
+3. Run the bundled extractor when the user provides PDFs or images. Pass the whole upload/evidence folder (or every provided file) in one call — never pre-filter by which files look readable. Do not pass a task root that contains `process`, `output`, or the workflow journal; Chief rejects that overlap so generated artifacts cannot be mistaken for newly supplied evidence.
 
 ```bash
-python scripts/extract_invoices.py --output process <input-file-or-folder> [...]
+python scripts/chief_orchestrator.py run extract <input-file-or-folder> [...]
 ```
 
-4. The extractor prints an `INPUT RECONCILIATION` block followed by an extraction review list, and writes the same review to `process/invoice-extraction.md` in UTF-8. Copy or summarize it directly in chat before moving to allocation, so the user can confirm recognized files by item number and source filename. Unsupported files such as OFD/eml are persisted in `unresolved_input_files` with a SHA-256 and block later stages until the user explicitly excludes them (with a reason) or provides a readable replacement through `input_resolutions` in `scripts/apply_extraction_corrections.py`. If terminal output is garbled or truncated, read the UTF-8 Markdown process file instead of writing a one-off extraction helper script. Correct any `needs_review` items through that same script — read the file visually if you can and record what you saw; otherwise ask the user what it is using the template the extractor prints. Never hand-edit `invoice-extraction.json`; corrections and input resolutions persist in `process/extraction-corrections.json` and replay automatically on every re-run. Do not ask the user to open `process/invoice-extraction.md/json`.
-5. For project allocation, read `references/stage-2-allocation.md`, then parse the user's natural-language project context and match it against `process/invoice-extraction.json`. Convert the user's natural-language project note into a temporary `project-context.json` yourself whenever enough information is present; do not ask the user to write JSON. Ask the user only for missing business facts such as date range, city, client name, or Client Charge Code.
+4. The extractor prints an `INPUT RECONCILIATION` block followed by an extraction review list, and writes the same review to `process/invoice-extraction.md` in UTF-8. Copy or summarize it directly in chat before moving to allocation, so the user can confirm recognized files by item number and source filename. Unsupported files such as OFD/eml are persisted in `unresolved_input_files` with a SHA-256 and block later stages until the user explicitly excludes them (with a reason) or provides a readable replacement through `input_resolutions`. Exact-file and invoice-number duplicates also remain Stage 1 review items: keep one source and record the user's exclusion against the duplicate through `correct-extraction`; dropping a later allocation unit does not resolve the evidence ledger. A shared SHA-256 identifies duplicate content, not one physical copy: to exclude one copy, match the shared `sha256` together with that copy's exact `source_file`. SHA-only exclusions that match multiple files are rejected, and Chief blocks any duplicate group that does not retain exactly one active copy. Apply a prepared corrections/resolutions file with `python scripts/chief_orchestrator.py run correct-extraction --corrections <corrections.json>`. If terminal output is garbled or truncated, read the UTF-8 Markdown process file instead of writing a one-off extraction helper script. Read a file visually when possible and record what you saw; otherwise ask the user using the extractor's question template. Never hand-edit `invoice-extraction.json`; corrections persist in `process/extraction-corrections.json` and replay automatically on every re-run. Do not ask the user to open `process/invoice-extraction.md/json`.
+5. For project allocation, read `references/stage-2-allocation.md`, then parse the user's natural-language project context and match it against `process/invoice-extraction.json`. Convert the user's notes yourself into the exact `project_context.v1` root structure in `assets/project-context-template.json`; do not guess keys such as `projects`, `charge_code`, or `notes`, and do not ask the user to write JSON. Create one context object per distinct project/travel date window, even when several windows share the same Client and Code. Ask the user only for missing business facts such as date range, city, client name, or Client Charge Code.
 
 ```bash
-python scripts/allocate_expenses.py --extraction process/invoice-extraction.json --context project-context.json --output process
+python scripts/chief_orchestrator.py run allocate --context project-context.json
 ```
 
-Allocation refuses to run while unsupported inputs remain open, and records the exact extraction fingerprint it used. If extraction is rerun later, regenerate allocation and its answers template rather than reusing the old allocation.
+Every review-list line starts with a `[N@ref]` token: N is the display number (valid only within this generation) and ref is the item's short evidence identity; the allocation also stores the full SHA-256 identity and rejects missing or duplicate identities. Decisions files must reference items by the full token and declare `for_allocation_fingerprint` (the 8-char generation code printed by allocate); Composer refuses stale generations and mismatched refs before touching any data. Every official allocation write archives the prior stamped generation under `process/allocation-generations/` and records a lineage pointer, so repeated allocate/apply runs cannot overwrite the last decided state. When invoices are added or removed later, follow `CHIEF NEXT`: if effective project contexts, policy, and `allocation_engine_revision` are unchanged, Chief first runs rebase, then Composer/updater. Composer and updater reject ordinary answers while a transferable lineage generation is pending; even a zero-carry rebase must pass once through Composer/updater to record lineage clearance. Rebase carries official user-set unit fields and explicit `R@ref` record resolutions whose evidence identities remain valid. Within a multi-unit hint match, links already dropped/excluded in the prior generation are pruned; if none remain, the old resolution is not carried and the record returns for confirmation. Every old allocation item that disappears from the new generation is also written to the stamped `removed_evidence` ledger. A prior `drop/exclude/non_reimbursable` item closes automatically; every other disappearance is shown in chat as `M@ref + original filename + amount + date/category` and blocks Composer until the applicant confirms `intentional_removal`, identifies exact current replacement `N@ref` item(s), or asks to restore the evidence. Fill the generated `process/rebase-removal-resolutions.json` internally from the user's natural language and rerun Chief `rebase --resolutions ...`; never hand-edit the stamped rebase packet. A `restore_required` answer remains blocked until the source evidence is restored and Stages 1/2/rebase are rerun. Changed/new evidence also returns to the user. If any business basis changed, review the regenerated allocation from scratch. Never reuse an old decisions file by editing its fingerprint or manually select an older generation when Chief has discovered the lineage source.
 
-The allocation script prints an applicant review list, then a ready-to-send 转发块 containing all blocking questions in Chinese. Relay the 转发块 VERBATIM as your next chat message — do not summarize, shorten, or end your turn without sending it — then wait for the user's answers. If terminal output is garbled, read the Markdown process file instead of creating temporary print/extraction scripts.
+Allocation validates the project-context schema before creating any units, refuses to run while unsupported inputs or any Stage 1 review-required/unknown document remains open, and records hashes for both extraction and project context. If either input changes later, regenerate allocation and recompose answers rather than reusing the old allocation or answers file. A schema failure means rewrite the same context file from the bundled template; never bypass it with a launcher or patch script.
 
-Before translating the user's natural-language answers into JSON, generate a current-task answers template. Fill the generated canonical `unit_updates` entries; do not invent another schema such as `answers[].allocations`.
+Treat every concrete expense line supplied by the applicant as an expected-record item. Put a meal record in `meal_hints` or another record in `expense_hints`, never duplicate the same record in both arrays; Stage 2 nevertheless deduplicates legacy cross-array copies by context/category/date/amount and compatible merchant evidence. It writes `expense_hint_reconciliation` for every distinct record. Records without unique extracted matches are grouped by expense type in chat and labeled with generation-safe `R1@ref` tokens. Translate every full R@ref answer into `expense_hint_resolutions` using one canonical action: `matched_existing`, `covered_by_invoice`, `not_reimbursed`, or `pending_invoice`. The first three close that record when valid; `pending_invoice` records the applicant's intention but remains blocking until evidence is supplied or the applicant changes it to `not_reimbursed`. Never close these questions through free-text `question_updates`. Dropping a linked unit reopens the record.
+
+The allocation script prints an applicant review list, then a ready-to-send 转发块 containing all blocking questions in Chinese. Relay the allocator's 转发块 VERBATIM — do not summarize or shorten it — then wait for the user's answers. The Mirror Warden and Gate Challenger audits run later, immediately before Stage 3 (see Preferred Subagent Checkpoints), not at this point. If terminal output is garbled, read the Markdown process file instead of creating temporary print/extraction scripts.
+
+When the user answers allocation questions, use the bundled Composer to turn those decisions into the current allocation's canonical `unit_updates` and `expense_hint_resolutions`; do not invent another schema such as `answers[].allocations`. Composer resolves the actual `user_no` values printed in chat, supports unit/question/context/hint-resolution updates plus confirm/drop/exclude actions, binds the live allocation fingerprint, dry-runs the updater, and publishes `process/allocation-answers.json` only after validation succeeds. Then run the updater and repeat until no blocking questions remain. After ANY extraction or allocation re-run, treat every old `DOC-xxx`, `UNIT-xxx`, displayed item number, and bare/old `R1@ref` reference as expired. Rebind explicit user-confirmed facts to the new review list using the source descriptors in `references/troubleshooting.md`; never replay number-only memory or an old decisions file.
+
+### Preferred Subagent Checkpoints
+
+Immediately before Stage 3, run two independent read-only audits over the confirmed allocation. Both are the default execution order before the canonical next action printed by Chief; skip only when no genuinely fresh isolated Agent capability exists or the user explicitly opts out (workflow complexity or prior errors are not reasons to skip). The deterministic Stage 3 preflight remains the fail-open fallback. Subagents are read-only reasoning passes: never give them filesystem paths or mutation tools, and never let them write process JSON.
+
+On Claude Code, the fresh isolated Agent IS the built-in Agent/Task tool: spawn a general-purpose subagent and pass the packet plus result template inline in its prompt (there is no attachment channel — paste the complete JSON into the prompt). That is the concrete handoff. Do not treat "fresh subagent" as unavailable merely because there is no resource-attachment mechanism.
+
+**Otako, the Mirror Warden** — precision-first factual reconciliation of the confirmed allocation against claimed evidence (attribution, journey coherence, dates/routes, over-claiming, true duplicate economic expenses, and genuinely unresolved material). Otako does not invent document requirements for unclaimed contextual travel or question ordinary trip behavior.
 
 ```bash
-python scripts/build_allocation_answers_template.py --allocation process/expense-allocation.json --output process/allocation-answers.template.json
+python scripts/chief_orchestrator.py run prepare-agent --role mirror_warden
 ```
 
-When the user answers allocation questions, compile the confirmed decisions into `process/allocation-answers.json`, run the bundled updater, and repeat until no blocking questions remain. Do not create ad hoc patch scripts to mutate `expense-allocation.json`; the updater refreshes notes, closes questions, preserves change history, and runs accounting checks. After ANY allocation re-run, regenerate allocation answers because unit ids may have shifted and replaying old answers would write data onto the wrong units.
+Read the generated compact task packet and result template yourself, then hand both to a fresh Agent/Task-tool subagent with no prior conversation context by pasting their complete JSON into its initial prompt. Never tell the subagent to find or read a workspace file. When the host supports structured output, pass the packet's `response_json_schema`; otherwise require the exact result-template shape. The packet embeds `references/otako-mirror-warden.md`. Save the exact JSON response outside `process/`, then validate it:
+
+```bash
+python scripts/chief_orchestrator.py run accept-agent \
+    --role mirror_warden --result <utf8-result.json>
+```
+
+**Kaede, the Gate Challenger** — narrow policy gate for explicit treatment rules, required approvals, plainly non-reimbursable expenses, Admin semantics, and substitute-invoice compliance. Kaede never optimizes the claim amount, recomputes daily caps, treats unrelated categories as duplicates, or reviews Stage 3/4 presentation/package artifacts before they exist.
+
+```bash
+python scripts/chief_orchestrator.py run prepare-agent --role gate_challenger
+python scripts/chief_orchestrator.py run accept-agent \
+    --role gate_challenger --result <utf8-result.json>
+```
+
+The packets embed `references/otako-mirror-warden.md` and `references/kaede-gate-challenger.md`. Both can be prepared or accepted only after Stage 2 is fully ready. Each result's `coverage[].status` only permits `completed` or `not_applicable`; `pass`/`advisory`/`block`/`unavailable` belong only in `outcome`, and every finding must use a role-specific code and severity allowed by the generated contract. A current validated `block` result from EITHER role prevents Stage 3 and packaging until the cited items are resolved through Composer/Updater and a fresh audit is run. Every accepted audit is written first to an immutable per-role archive under `process/subagent-audit-generations/<role>/`; deleting or corrupting the convenience sidecar cannot clear an accepted blocker. `pass`, `advisory`, and explicit `unavailable` results are recorded in final rows. Only the absence of any accepted current-task audit (missing/stale/invalid with no valid current archive) fails open to the deterministic preflight; never synthesize a pass. The integrity stamp proves only that the accepted result was not subsequently edited, not that the model was truly independent.
+
+After `accept-agent`, relay the generated `SUBAGENT REVIEW SUMMARY TO SHOW IN CHAT` block verbatim. Only its `需要处理（阻断）` section may become applicant questions. Its `供参考（无需回复）` section is never a decision list: do not ask the applicant to choose, do not alter allocation automatically, and continue the standard workflow. Deterministic Stage 3/4 results override conflicting subagent arithmetic, placeholder, column, or package opinions.
+
+When the applicant resolves a blocker by supplying a durable fact rather than changing an amount/project — for example, `该航班由公司携程商旅统一采购，不由个人报销或开票` — persist that fact through Composer/Updater in the relevant `project_contexts[].user_notes` or item `expense_note`, then run a fresh audit. Do not leave a fact needed by a fresh subagent only in conversation history.
+
+If the host cannot start a fresh isolated subagent, skip these checkpoints and continue the deterministic workflow. Do not imitate independence by asking the same context-laden agent to rubber-stamp its own work.
 
 ### Batch Answers
 
-For batch confirmations, use the bundled composer instead of writing a helper script. It resolves current unit numbers, writes the live allocation fingerprint, validates field aliases and text safety, dry-runs the updater, and publishes `allocation-answers.json` only after that dry-run passes.
+For every confirmation or correction batch, use Composer. It resolves current item numbers, writes the live allocation fingerprint, validates field aliases and text safety, dry-runs the updater, and publishes `allocation-answers.json` only after that dry-run passes.
 
 ```bash
-# Use --set only for compact values without whitespace or shell-sensitive characters.
-python scripts/compose_answers.py --allocation process/expense-allocation.json \
-    --set "3,5,7-12: status=confirmed client=山西信托 city=太原 note=出差餐费"
+# Use --set for one or two scalar fields; direct UTF-8 Chinese and value spaces are supported.
+python scripts/chief_orchestrator.py run compose \
+    --set "3@a1b2c3d4: note=出差酒店（2晚，2026-06-01-2026-06-03） status=confirmed"
 
-# Use a UTF-8 decisions file for any space, quote, path, long note, or uncertain console encoding.
-python scripts/compose_answers.py --allocation process/expense-allocation.json \
+# Use the canonical UTF-8 decisions file for complex values or larger batches.
+python scripts/chief_orchestrator.py run compose \
     --decisions process/batch-decisions.json
 ```
 
-The composer writes no process JSON. It produces answers only; `apply_allocation_answers.py` remains the sole Stage 2 writer. Use a one-off helper only when the composer cannot express the required update. Keep any such helper in the session working directory, never inside this skill's folder, and follow `references/batch-answer-helpers.md`.
+Create `process/batch-decisions.json` from `assets/allocation-decisions-template.json`. Keep `schema_version: allocation_decisions.v1` and only these root actions: `decisions`, `expense_hint_resolutions`, `question_updates`, `project_contexts`, `confirm_units`, `drop_units`, and `exclude_units`. Composer compiles all of them; there is no helper-script exception. Use the field quick reference in `references/stage-2-allocation.md` instead of guessing names.
+
+If Composer exits nonzero, read its updater error, correct the same UTF-8 decisions file, and rerun Composer. Never switch to `build_allocation_answers_template.py`, generate `fill_answers.py`, create `patch_allocation.py`/`fix_*.py`, edit `expense-allocation.json`, or modify a bundled script. The template builder is developer-only diagnostic output and is structurally rejected by the updater.
 
 ```bash
-python scripts/apply_allocation_answers.py --allocation process/expense-allocation.json --answers process/allocation-answers.json --dry-run
+python scripts/chief_orchestrator.py run apply
 ```
 
-```bash
-python scripts/apply_allocation_answers.py --allocation process/expense-allocation.json --answers process/allocation-answers.json
-```
+Composer already ran the official updater in `--dry-run` mode before publishing the answers file. Apply only the file Composer published.
 
-### Batch-Answer Helper Encoding Rule
+### Decisions Encoding Rule
 
-Before writing any helper that generates `allocation-answers.json`, read `references/batch-answer-helpers.md`. A helper starts from the CURRENT generated template, preserves its root object/fingerprint and existing `unit_updates`, and writes only the answers file. It never mutates a process JSON. Read/write explicit UTF-8 files (`utf-8-sig` template input, UTF-8 JSON output); do not inject Chinese through PowerShell inline Python, `-Command`, or a console pipeline. Use a UTF-8 helper file with UTF-8 source data, or Unicode escapes for constrained inline values. Always run the official updater with `--dry-run` first. The updater rejects consecutive `??` markers, replacement characters, and common mojibake, while Stage 3 repeats the check on final-visible fields and workbook cells. A single ASCII `?` in legitimate English free text is allowed.
+Write the decisions JSON directly as UTF-8 with the agent's file-editing tool. Do not inject Chinese through PowerShell inline Python, `-Command`, shell interpolation, or a console pipeline. Chief launches every child with Python UTF-8 mode and `PYTHONIOENCODING=utf-8`; direct entry scripts also configure UTF-8, so the agent should not need to prepend environment variables to normal commands. If a terminal merely displays a UTF-8 file incorrectly, read it through a UTF-8-capable file tool instead of rewriting correct data from the garbled display. Composer and the updater reject consecutive `??` markers, replacement characters, and common mojibake; Stage 3 repeats the check on final-visible fields and workbook cells. A single ASCII `?` in legitimate English free text remains allowed.
+
+For generation visibility, `python scripts/chief_orchestrator.py lineage` prints the full current extraction/allocation fingerprints, the deterministic rebase source selected by Chief, and whether an existing rebase packet is current, stale, or invalid. `CHIEF NEXT` also prints the short allocation generation. Rebase source selection is always the nearest same-basis ancestor containing official user decisions; do not hand-pick a snapshot.
 
 If the user says a recognized item is wrong, first trace that user-facing item number back to its source files, then ask for or apply the corrected fields.
 
 ```bash
-python scripts/trace_expense_item.py --allocation process/expense-allocation.json --extraction process/invoice-extraction.json --item 9
+python scripts/chief_orchestrator.py run trace --item 9
 ```
 
 6. For Excel output, read `references/stage-3-excel-output.md`, ask the user for requester if missing, and write rows from `process/expense-allocation.json`. By default, the workbook is generated directly by script using `assets/reimbursement-workbook-layout.toml` for static workbook layout and Python code for business logic, formulas, sorting, and project blocks. The legacy template remains bundled at `assets/reimbursement-template.xlsx`; pass `--template bundled` or a custom `.xlsx` path only when a template-based fallback is explicitly needed.
 
 ```bash
-python scripts/write_reimbursement_template.py --allocation process/expense-allocation.json --output <filled.xlsx> --requester <name> --process-dir process
+python scripts/chief_orchestrator.py run write --output <filled.xlsx> --requester <name>
 ```
 
 Stage 3 verifies that allocation still belongs to the current extraction generation and that no unsupported input remains unresolved. A mismatch requires a fresh Stage 2 run, not a manual repair.
 
+Stage 3 promotes the workbook plus `final-expense-rows.json/md` as one validated artifact generation and preserves the prior generation when a new write is blocked or promotion fails. Read the terminal `STAGE3_RESULT`: only `ok` with exit code `0` and `package_allowed=true` may proceed to Stage 4. `review_required` has current review artifacts but remains non-packageable; `blocked` wrote no new generation. Chief preserves the writer's exit code, prints an unmistakable `DO NOT RUN PACKAGE` banner for nonzero results, and still prints the authoritative `CHIEF NEXT` recovery action.
+
 7. For final packaging, read `references/stage-4-package.md`, then copy and rename source files using the final proof numbers.
 
 ```bash
-python scripts/package_reimbursement_files.py --final-rows process/final-expense-rows.json --extraction process/invoice-extraction.json --workbook <filled.xlsx> --output-root output
+python scripts/chief_orchestrator.py run package
 ```
 
-After packaging, copy or summarize the final package summary in chat: package folder, workbook name, invoice/support-document counts, and any unresolved package issues.
+After a successful package run, read `references/close-message.md` and relay the generated `CLOSE MESSAGE TO SHOW IN CHAT` block verbatim. It is sourced from the stamped package manifest and includes the package/workbook locations, evidence counts, amount adjustments and policy advisories, excluded or not-reimbursed items with reasons, and per-project totals. Never replace it with a generic completion sentence or reconstruct totals from conversation memory.
 
 If packaging exits with code `3`, it created a review package with blocking missing-file or approval issues. Do not call it complete or submit it; show the issues in chat, resolve them, then re-run Stage 4.
 
-## Extraction Decision Tree
+## Routed Business Rules
 
-1. Prefer PDF text/table extraction for selectable electronic invoices and Didi/Gaode trip reports.
-2. If the agent has image understanding, read rendered pages/images directly — the keyword classifier has low recall on photos, so an agent with vision is the better classifier for images; record findings via `apply_extraction_corrections.py`. Agents without vision rely on OCR text plus asking the user; never guess fields from filenames.
-3. Use OCR only when the PDF has no usable text layer or the input is an image.
-4. If no local OCR engine is available and the agent cannot read the file visually, mark `extraction_method: manual_review`, set `ocr_required: true`, and resolve by asking the user (the extractor prints a ready-to-send Chinese question template listing the affected files) — never invent fields, and never drop the file.
-5. Use hybrid extraction when text exists but key fields are missing, garbled, or contradicted by the visual page.
+Detailed extraction, classification, allocation, Excel, packaging, and final-validation rules live in `references/workflow-core-rules.md`. Read only the sections relevant to the current stage, plus `Validation Expectations` before declaring the reimbursement workflow complete.
 
-## Classification Priorities
-
-Classify document role before expense type:
-
-1. Didi/Gaode trip report or trip table -> `supporting_schedule/didi_trip_report` or `supporting_schedule/gaode_trip_report`; parse one support item per ride.
-2. Tax invoice markers such as invoice number, issue date, buyer/seller blocks, and total amount -> `invoice`.
-3. Railway e-ticket invoice -> `invoice/railway_e_ticket`.
-4. Non-invoice expense evidence -> `supporting_document`.
-5. Anything unclear -> `unknown` with `needs_review: true`.
-
-Important: identify Didi/Gaode trip reports before scanning for hotel or airport keywords. A trip destination may contain a hotel name, but the document is still a trip report.
-
-## First-Pass Categories
-
-Use only conservative first-pass categories:
-
-- `hotel`: lodging or hotel accommodation invoices.
-- `travel`: railway, air, out-of-town Didi/Gaode rides, or other travel expenses.
-- `taxi`: Shanghai/local Didi/Gaode rides or taxi invoices.
-- `meal`: meal invoices before later trip-context overrides.
-- `mobile`: telecom or mobile service invoices.
-- `other`: valid invoices that do not fit the above.
-- `unknown`: insufficient evidence; require review.
-
-Didi/Gaode tax invoices are summary invoices. Link them to trip reports by total amount, but generate downstream rows from the trip report items when a matching trip report exists.
-
-## Notes For Downstream Work
-
-Stage 1 can build provisional `expense_note` from useful operational evidence:
-
-- Railway: train number, route, travel date/time, seat/cabin.
-- Didi/Gaode: city, origin, destination.
-- Hotel: seller or hotel name, city if inferable, quantity or nights.
-- Meal: seller/restaurant and meal service.
-- Mobile: phone number and billing period.
-
-Stage 2 must normalize final notes using `references/stage-2-allocation.md`. Keep source remarks in `raw_remarks`; do not replace them with generated notes.
-
-## Stage 2 Allocation Rules
-
-Read `references/stage-2-allocation.md` before allocating expenses. Keep these core rules in mind:
-
-- Treat project identity as `client_name + city + date_range + charge_code + user_description`; do not treat charge code alone as unique because many pending projects may share `CORP-2026-BD`.
-- Use LLM judgment for first-pass matching, but ask the user about low-confidence or conflicting items.
-- Treat `invoice.issue_date` as evidence, not a default occurrence date. Reliable occurrence dates are: printed flight/rail travel date, printed hotel check-in/check-out dates, Didi/Gaode ride datetime from a trip report, and mobile month-end from the billing period or invoice month. For pure `other` expenses, you may temporarily use `invoice.issue_date` as `expense_date`, but mark it provisional and show a non-blocking advisory for user review.
-- Exclude `CORP-2026-ADMIN` contexts from hotel/meal/taxi/travel automatic city/date scoring. Admin is not a Shanghai project and must not win fallback matching.
-- Match hotels first by hotel city plus stay dates; when stay dates or project dates are missing, use city uniqueness only for project pre-allocation, and still ask for missing nights/check-in/check-out needed for hotel caps.
-- Match meals by explicit user-provided meal notes when available. Parse notes such as `6.1 德克士 61.8` into meal hints, then match by combined amount/date/merchant evidence instead of any single strict field. Otherwise treat invoice dates as unreliable and auto-assign only when a non-Shanghai invoice city has exactly one project in the period. Show inferred meals as advisory so the user can batch-correct dates/attendees/amounts.
-- For meal amount columns and `Expense Nature`, apply form over substance: Shanghai invoice/restaurant city -> `meal`/local, non-Shanghai invoice/restaurant city -> `travel`/business trip, regardless of which project the meal is allocated to. This changes only the visible amount column: the unit keeps `source_category: meal` (the writer script assigns the column automatically, and the daily meal cap check only sees category=meal — the updater refuses meal->travel category changes unless marked as a manual extraction correction).
-- Match taxi and Didi/Gaode ride items by the project journey they support: city/date for ordinary rides, airport/station transfer to the upcoming destination project, and project-to-project station/airport transfers to the project being traveled to.
-- Treat Shanghai/local projects conservatively. A local project such as KEEWAY must not receive Shanghai taxi/travel items merely because city and date match. Auto-assign a Shanghai local project only when the ride endpoint, route note, user note, or explicit project keyword names that local client/project; otherwise station/airport transfers inherit the adjacent out-of-town travel project or remain a blocking question.
-- For taxi/Didi/Gaode amount columns, use form over substance by ride city: Shanghai rides stay in `taxi` even when allocated to an out-of-town project; non-Shanghai rides go to `travel`.
-- Match railway and flight travel by route destination and travel date with a reasonable +/- 1 day project buffer.
-- When travel connects two project cities, assign it to the destination/project being traveled to, not the origin project. Never override this merely because the origin station city matches a previous project.
-- Do not pre-match `other` or `unknown` by invoice city. Ask the user; invoice issuer city can be misleading for SaaS, online meetings, associations, and other services.
-- Allocate mobile expenses to `CORP-2026-ADMIN` with `client_name = 通讯费`, not `Admin`; fill Date as that month's last day.
-- Never use `CORP-2026-ADMIN`, `通讯费`, or the mobile amount column as a fallback for unmatched taxi/travel/meal/hotel expenses. Unmatched transport remains a blocking question unless a transfer/travel rule matches it to a project.
-- For other `CORP-2026-ADMIN` expenses, use a specific matter name as `client_name` when known, such as `年会`, `半年会`, `客户会`, or `行业协会会议`; if missing, use `项目、调研以外的其他费用` and show a non-blocking chat prompt so the applicant can refine it.
-- Ask about `other` and `unknown` expenses by default. For `other`, project/note/accounting treatment may still be blocking, but the date can temporarily use the invoice date with an advisory. For `unknown`, ask for the actual date unless the user reclassifies it as pure `other`.
-- Ask follow-up questions directly in the current conversation. Use `process/expense-allocation.md/json` as internal process files only; do not tell the user to inspect those files. Group repetitive uncertainties by expense type, such as one meal batch question listing all meal item numbers, files, invoice numbers, dates, amounts, and suggested projects.
-- If the user gives meal details in natural language, including "with X", "和X一起", "同事X", or dining counterparties, capture them into `attendees` even when the daily meal cap is not exceeded. Do not rely on the cap check as the only attendee collection point.
-- Before asking follow-up questions, show a compact applicant review list in chat with item number, source filename, seller/provider, date, amount, category, suggested project, and status.
-- Combine all uncertainties for the same item into one question block, then batch same-type items into one grouped question whenever practical. For example, ask meal details once for items 1/3/5/7 instead of repeating the same question four times.
-- Use simple user-facing item numbers in conversation, such as item 1 or item 2, instead of internal IDs like `DOC-001` or `UNIT-001`. Keep internal IDs only in process JSON/Markdown for traceability.
-- When a user challenges an item, run `scripts/trace_expense_item.py` and identify the source filename, invoice number, seller, amount, date, and trip details before applying corrections.
-- Track substitute invoices separately, ask the user for the partner approval screenshot, append the substitute marker to the final note, and carry the substitute flag to the Excel stage.
-- After receiving user answers, generate `allocation-answers.template.json` with `scripts/build_allocation_answers_template.py`, fill it into `allocation-answers.json`, and use `scripts/apply_allocation_answers.py` to update `expense-allocation.json` instead of manually rewriting allocation files. This preserves question status, substitute approval links, and change history.
-- Never create temporary patch scripts for bulk allocation edits. Convert batch natural-language answers into the generated canonical `unit_updates` template and run the updater even when the JSON is long.
-- Generate final reimbursement notes with the required Chinese templates from the stage-2 reference, including confirmed taxi origin/destination place types. Never write literal placeholders such as `出发地类型` or `目的地类型` into `final_note`; ask the user when either endpoint type is unclear.
-- Mark rail/flight cancellation or refund evidence in the final note as `高铁退票费（出发地-目的地）` or `飞机退票费（出发地-目的地）` instead of the ordinary travel note.
-
-## Stage 3 Excel Output Rules
-
-Read `references/stage-3-excel-output.md` before writing the reimbursement workbook. Keep these core rules in mind:
-
-- Ask the user for `Requester` if not already known.
-- Write `Date` as `YYYYMMDD`.
-- Use only confirmed, reliable, or explicitly provisional `other` `expense_date`; if `date_required` is true or `expense_date` is blank, ask in chat before writing the workbook.
-- Use confirmed `client_name` and `client_charge_code` from stage 2.
-- Set `Expense Nature` by the formal amount-column evidence, not by assigned project: meal uses invoice/restaurant city; taxi/Didi/Gaode ride rows use ride city. Shanghai formal city means local; non-Shanghai formal city means business trip.
-- Use the confirmed stage-2 `final_note` for `Note`.
-- Put each amount in exactly one template amount column: hotel, travel, taxi, meal, mobile, or other.
-- For meal rows, recompute the visible amount column by formal invoice/restaurant city before writing: Shanghai -> `meal`; non-Shanghai -> `travel`.
-- For taxi/Didi/Gaode ride rows, recompute the visible amount column by ride city before writing: Shanghai -> `taxi`; non-Shanghai -> `travel`. Do not change this merely because the ride is allocated to an out-of-town project.
-- For meal expenses with daily standards, apply the cap after rows are built: business-trip meals are RMB 150/day, local overtime meals are RMB 60/day. Show `meal_daily_cap_checks` in chat. If a date exceeds the relevant cap without attendee details, ask whether the meal date is wrong, attendees are missing, or one item should use a lower `reimbursable_amount`; if attendee details exist, treat the over-cap result as advisory only. If reimbursable amount differs from invoice amount, the final note must state `发票金额XX/实际报销XX`.
-- For hotel expenses, apply the per-night cap after rows are built: Beijing/Shanghai/Guangzhou/Shenzhen are RMB 800/night, other cities are RMB 600/night. Show `hotel_cap_checks` in chat. If nights or city tier are missing, ask for check-in/check-out/nights/city. If a hotel exceeds the relevant cap with shared-room/co-occupant details, treat it as advisory only; otherwise ask whether one item should use a lower `reimbursable_amount`.
-- Hotel final notes must not keep placeholders such as `X晚`, `入住日`, or `离店日`. If hotel nights/check-in/check-out are known, the scripts regenerate `出差酒店（X晚，入住日-离店日）` with actual values; if those fields are missing, Stage 3 preflight blocks workbook generation.
-- Always show or summarize `STAGE 3 PREFLIGHT CHECK TO SHOW IN CHAT`. If the writer exits with code `2`, no workbook was written because allocation is not structurally ready: open questions, invalid categories/columns, missing dates/client/code/amount, admin/mobile conflicts, raw ticket notes, or missing taxi place types must be fixed first.
-- If any stage script exits with code `4`, a process JSON failed its integrity check (modified outside the sanctioned flow); follow the printed recovery steps and do not patch further.
-- If `write_reimbursement_template.py` exits with code `3`, the workbook and final row files were written, but the `STAGE 3 REVIEW SUMMARY TO SHOW IN CHAT` block contains blocking meal/hotel policy checks that must be shown to the applicant and resolved before final submission.
-- Assign overall proof numbers by substantive proof order: flight/rail, hotel, taxi/Didi, Gaode, meal, mobile, other.
-- Split Didi/Gaode trip reports into one row per ride, but reuse the same overall proof number for all rides supported by the same invoice.
-- Write rows as project blocks; each block gets a subtotal row, then workbook-level column totals, Total, Grand Total, and Status formulas.
-
-## Stage 4 Packaging Rules
-
-Read `references/stage-4-package.md` before building the final file package. Keep these core rules in mind:
-
-- Put the filled workbook in the package root as `reimbursement-application-{requester}-{date}.xlsx` using the Chinese filename defined in the reference.
-- Create two folders: invoices and supporting documents.
-- Rename invoice files as proof number, type, amount, and special-invoice marker when applicable.
-- Rename support files as proof number and support type, such as trip report or substitute approval.
-- If multiple support files would have the same name, retain every file by adding deterministic `-2`, `-3` suffixes; never overwrite evidence.
-- Copy files; do not move or modify the original source files.
-- Build a fresh staging package and replace the prior package root only after all files and the stamped manifest are ready. A rerun must not retain files that are absent from the new manifest.
-- End with a concise user-facing submission summary only when the package manifest has no issues. If it has issues, list them directly in chat as blocking items, ask for the missing file or decision, and re-run Stage 4 after resolution.
-
-## Validation Expectations
-
-Before declaring the workflow complete:
-
-- Every input file appears either in the document index or the persisted unsupported-input list, and the extractor's `INPUT RECONCILIATION` plus allocation's `DOCUMENT RECONCILIATION` blocks were shown in chat with no unaccounted documents.
-- No unsupported input remains `open`; every such file has a user-recorded exclusion reason or a readable replacement path before allocation.
-- Every unidentified document was resolved through chat + `apply_extraction_corrections.py` (identified as invoice / approval screenshot / payment proof / other) or explicitly excluded with the user's reason — none left in limbo.
-- Every invoice-like file has extracted fields or review issues explaining why not.
-- Every Didi/Gaode trip report has parsed trip items and a reported total when available.
-- Didi/Gaode summary invoices are linked to matching trip reports when totals match.
-- Duplicate invoice numbers are flagged.
-- Amounts and dates are normalized.
-- Markdown and JSON outputs contain the same documents, amounts, categories, links, and review issues.
-- Stage 1 extraction review list has been shown or summarized in chat when there are recognized files or items needing review.
-- Stage 2 allocation has either a confirmed project/context assignment or a user-facing question for every allocation unit.
-- Allocation, final rows, workbook, and package manifest belong to the same current extraction/allocation generations; a stale generation is regenerated rather than patched.
-- Stage 3 output has a requester, no unconfirmed blocking items, one amount column per row, no duplicate Didi/Gaode summary rows, meal and hotel cap checks shown in chat, and totals reconcile to confirmed allocation units.
-- Substitute invoice metadata and approval screenshot paths remain in `final-expense-rows.json` even though they are not written into the visible Excel rows.
-- Stage 4 package has a stamped manifest bound to the current final-rows fingerprint and workbook hash; every listed invoice/support file exists and matches its manifest hash, and the manifest has no unresolved issues.
+- Stage 1: read `Extraction Decision Tree`, `Classification Priorities`, `First-Pass Categories`, and `Notes For Downstream Work` there together with `references/stage-1-output.md`.
+- Stage 2: read `Stage 2 Allocation Rules` there together with `references/stage-2-allocation.md`.
+- Stage 3: read `Stage 3 Excel Output Rules` there together with `references/stage-3-excel-output.md`.
+- Stage 4: read `Stage 4 Packaging Rules` there together with `references/stage-4-package.md`.
+- Completion: read `references/close-message.md` plus `Validation Expectations` there, verify every applicable invariant, and relay the generated Close Message only after Stage 4 succeeds with no manifest issues.

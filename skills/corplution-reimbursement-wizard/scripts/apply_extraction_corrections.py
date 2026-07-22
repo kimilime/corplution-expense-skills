@@ -6,7 +6,12 @@ Typical uses:
 - An agent with vision looked at an image the classifier marked unknown and
   identified it as an invoice (fill the invoice fields it read).
 - The user says an unknown file is a partner approval screenshot or an
-  Alipay/receipt payment proof -> document_role: supporting_document.
+  Alipay/receipt payment proof -> document_role: supporting_document. Also
+  set `support_type` (free-text label, e.g. 付款小票 / 审批截图) and
+  `supports_document_id` (the document_id of the invoice it backs) so Stage 4
+  can package it under the same proof number as that invoice. A
+  supporting_document with no `supports_document_id` is a hard block at Stage 3
+  until the user names the invoice it supports or excludes it.
 - The user says a file is not reimbursement evidence -> action: exclude
   with their reason.
 
@@ -24,7 +29,7 @@ Corrections file format:
 {
   "corrections": [
     {
-      "match": {"sha256": "..."},            // or document_id / source_file
+      "match": {"sha256": "..."},            // unique content
       "action": "correct",                    // or "exclude"
       "set": {
         "document_role": "invoice",
@@ -46,6 +51,11 @@ Corrections file format:
     }
   ]
 }
+
+For byte-identical copies, sha256 alone is intentionally ambiguous. Select one
+physical copy with both keys:
+  "match": {"sha256": "<shared hash>", "source_file": "<exact source path>"}
+The updater rejects every selector that still matches more than one file.
 """
 
 from __future__ import annotations
@@ -57,14 +67,14 @@ from pathlib import Path
 from typing import Any
 
 import extraction_corrections as xc
+from exit_codes import ExitCode
 import integrity
-
-
-def load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
+from io_utils import configure_utf8_stdio as configure_stdio
+from json_io import read_json_object as load_json
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_stdio()
     parser = argparse.ArgumentParser(description="Apply extraction corrections via the sanctioned overlay.")
     parser.add_argument("--extraction", required=True, help="Path to process/invoice-extraction.json")
     parser.add_argument("--corrections", required=True, help="Path to a corrections JSON file (see module docstring)")
@@ -81,7 +91,7 @@ def main(argv: list[str] | None = None) -> int:
     input_resolutions = incoming.get("input_resolutions", [])
     if not entries and not input_resolutions:
         print("ERROR: corrections file has neither 'corrections' nor 'input_resolutions' entries.", file=sys.stderr)
-        return 2
+        return ExitCode.COMMAND_ERROR
 
     all_errors: list[str] = []
     for idx, entry in enumerate(entries, start=1):
@@ -94,9 +104,9 @@ def main(argv: list[str] | None = None) -> int:
         for err in all_errors:
             print(f"ERROR: {err}", file=sys.stderr)
         print("", file=sys.stderr)
-        print("See the format example in this script's docstring. Match by sha256 when possible;", file=sys.stderr)
-        print("get it from the document entry in process/invoice-extraction.md or .json.", file=sys.stderr)
-        return 2
+        print("See the format example in this script's docstring. Use sha256 alone only when unique;", file=sys.stderr)
+        print("for exact copies combine the shared sha256 with the intended exact source_file.", file=sys.stderr)
+        return ExitCode.COMMAND_ERROR
 
     log = xc.apply_overlay(payload, {"corrections": entries})
     log.extend(xc.apply_input_resolutions(payload, {"input_resolutions": input_resolutions}))
@@ -106,13 +116,13 @@ def main(argv: list[str] | None = None) -> int:
     if hard_errors:
         print("", file=sys.stderr)
         print(f"ABORTED: {len(hard_errors)} correction(s) could not be applied safely — nothing was "
-              "written (extraction unchanged, overlay unchanged). Fix the match keys (use sha256 "
-              "from process/invoice-extraction.md) and re-run.", file=sys.stderr)
-        return 2
+              "written (extraction unchanged, overlay unchanged). Fix the match keys; for exact "
+              "copies combine sha256 with the intended exact source_file, then re-run.", file=sys.stderr)
+        return ExitCode.COMMAND_ERROR
 
     if args.dry_run:
         print("Dry run: nothing written.")
-        return 0
+        return ExitCode.SUCCESS
 
     # Persist entries into the durable overlay so extractor re-runs replay them.
     overlay = xc.load_overlay(process_dir)
@@ -126,9 +136,9 @@ def main(argv: list[str] | None = None) -> int:
     extraction_path.write_text(json.dumps(payload, ensure_ascii=False, indent=2) + "\n", encoding="utf-8")
     print(f"Updated {extraction_path}")
     print(f"Overlay saved: {xc.overlay_path(process_dir)} (replayed automatically on extractor re-runs)")
-    print("Next: re-run scripts/allocate_expenses.py, then REGENERATE the answers template —")
-    print("unit ids may have shifted; old answers files must not be replayed.")
-    return 0
+    print("Next: re-run scripts/allocate_expenses.py, then RECOMPOSE decisions with compose_answers.py —")
+    print("item bindings may have shifted; old answers files must not be replayed.")
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

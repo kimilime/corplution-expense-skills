@@ -49,6 +49,8 @@ When the user reports that an item is wrong:
 
 Do not require the user to mention internal IDs such as `DOC-001` or `UNIT-001`.
 
+`DOC-xxx` is generation-local, not a durable evidence identity. Adding, removing, converting, or reordering an input can change later document numbers. When preserving an explicit user correction for a possible clean rebuild, expand the current item number into the original source filename plus available corroborating fields such as SHA-256, invoice number, seller, amount, date, or route. Never retain only `DOC-xxx` or the displayed item number as the remembered fact.
+
 ## Unsupported Input Files
 
 Folder uploads can contain evidence formats the extractor cannot read, such as OFD, EML, or ZIP. These files are not document records, but they are still evidence and must be persisted in top-level `unresolved_input_files` with:
@@ -58,7 +60,31 @@ Folder uploads can contain evidence formats the extractor cannot read, such as O
 - `resolution`, `resolved_by`, and `resolved_at` once the user decides
 - `replacement_file` when status is `converted`
 
-`open` is a hard stop for Stage 2, Stage 3, and Stage 4. Ask the user whether the file should be excluded or converted to a readable PDF/image, then save the decision through `input_resolutions` in `apply_extraction_corrections.py`. Match by SHA-256 whenever possible; a filename-only match that finds multiple files must be rejected.
+`open` is a hard stop for Stage 2, Stage 3, and Stage 4. Ask the user whether the file should be excluded or converted to a readable PDF/image, then save the decision through `input_resolutions` in `apply_extraction_corrections.py`. Use SHA-256 alone only when it identifies one input. For byte-identical copies, combine the shared SHA-256 with the intended copy's exact `source_file`; every selector that still matches multiple files is rejected.
+
+Use the canonical nested `match` object below. Do not flatten `sha256` or `source_file` onto the resolution entry itself.
+
+```json
+{
+  "input_resolutions": [
+    {
+      "match": {"sha256": "<sha256 from unresolved_input_files>"},
+      "action": "exclude",
+      "reason": "用户确认该文件不属于本次报销",
+      "corrected_by": "user"
+    },
+    {
+      "match": {"source_file": "original-invoice.ofd"},
+      "action": "converted",
+      "replacement_file": "original-invoice.pdf",
+      "reason": "用户提供了可读取的 PDF 转换件",
+      "corrected_by": "user"
+    }
+  ]
+}
+```
+
+Use `sha256` when it identifies one unsupported-input content record. Use `source_file` alone only when its basename is unique in the current batch. For identical copies, use both keys and copy the exact source path from the extraction record. `input_resolutions` is only for `unresolved_input_files`. To correct or exclude an indexed document, use a `corrections` entry instead.
 
 ## Canonical Document Fields
 
@@ -70,6 +96,7 @@ Each source document must have:
 - `page_count`
 - `document_role`: `invoice`, `supporting_schedule`, `supporting_document`, or `unknown`
 - `document_subtype`
+- For a `supporting_document` (payment receipt, partner approval screenshot, or other user-kept evidence): also record, via `apply_extraction_corrections.py`, a free-text `support_type` (e.g. `付款小票` / `审批截图`) and `supports_document_id` (the `document_id` of the invoice it backs). Stage 4 packages it under that invoice's proof number. A `supporting_document` with no `supports_document_id` is a hard block at Stage 3 until the user names the invoice it supports or excludes it.
 - `extraction_method`: `text_layer`, `ocr`, `hybrid`, or `manual_review`
 - `ocr_required`
 - `confidence`
@@ -99,6 +126,24 @@ Classification fields:
 - `expense_date_source`: source of `expense_date`, such as `railway_travel_date`, `trip_report_period_start`, or blank when no reliable occurrence date was extracted
 - `expense_note`
 - `reason`
+
+For `railway_e_ticket`, also write `classification.railway_leg`:
+
+- `train_no`
+- `travel_date`
+- `departure_time`
+- `departure_datetime`
+- `origin_station`
+- `destination_station`
+- `route`
+- `is_refund_fee`
+- `refund_fee_amount`
+
+These structured fields support Stage 2 transfer-chain detection. Keep the readable railway `expense_note` as evidence and allow old extractions without `railway_leg` to fall back to parsing that note.
+
+For a railway refund invoice, the amount printed beside `退票费` is the amount being reimbursed. Write it to both `classification.railway_leg.refund_fee_amount` and `invoice.total_amount`. Railway PDF text layers may emit the visually adjacent row as `￥63.50` followed by `退票费:` on the next extracted line; support both label-before-amount and amount-before-label orders. A blank or unresolved label is not `0`: leave the amount blank, keep `needs_review=true`, and ask the applicant to verify it.
+
+Ordinary/special VAT invoices may still be flight evidence. Preserve line items such as `国内航空`, `国际航空`, `航空运输`, or `航空旅客运输`, plus seller and remark evidence, so Stage 2 can recognize the flight without a dedicated document subtype. Airline name is evidence, not the final reimbursement Note.
 
 Keep `invoice.issue_date` as the formal invoice date. Do not copy it into `classification.expense_date` for ordinary invoices, meal invoices, taxi summary invoices, hotel invoices without stay dates, or `other`/`unknown` invoices. Stage 2 will ask the applicant for the actual date when it is not reliable.
 
@@ -229,6 +274,8 @@ Create `document_links` for:
 - `duplicate_source_file`
 - `possible_duplicate_invoice_no`
 
+Both exact SHA-256 duplicates and repeated invoice numbers are Stage 1 review decisions. Byte-identical files have no substantive difference, so propose the first indexed copy as the canonical source instead of asking the applicant to choose between identical contents. Exclude each later copy through a `corrections` entry whose `match` combines the shared `sha256` with that copy's exact `source_file`. A SHA-only exclusion cannot identify one physical copy and is rejected atomically; Chief also requires exactly one active document in every exact-duplicate group. Repeated invoice numbers with different SHA-256 values are not exact copies and still require applicant review. Do not defer either decision to Stage 2 or drop an allocation unit: that would close a reimbursement row without resolving the source-evidence ledger.
+
 For Didi/Gaode, link summary invoice and trip report when total amounts match. Generate later reimbursement rows from the trip items, not from the summary invoice, when a matching trip report exists.
 
 ## Completion Criteria
@@ -237,6 +284,7 @@ Stage 1 is complete only when:
 
 - Every input file appears either in the document index or in `unresolved_input_files`.
 - No `unresolved_input_files` entry remains `open`; the user has recorded an exclusion reason or a readable replacement file.
+- No exact-file or invoice-number duplicate remains `needs_review`; the duplicate copy has an explicit Stage 1 keep/exclude decision.
 - Every invoice-like file has extracted fields or review issues.
 - Every Didi/Gaode trip report has parsed trip items and a reported total when available.
 - Didi/Gaode summary invoices are linked to matching trip reports when possible.

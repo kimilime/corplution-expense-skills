@@ -1,0 +1,20 @@
+{
+  "schema_version": "project_context.v1",
+  "project_contexts": [
+    {
+      "context_id": "CTX-001",
+      "date_start": "<YYYY-MM-DD>",
+      "date_end": "<YYYY-MM-DD>",
+      "city": "<项目城市>",
+      "client_name": "<客户名称>",
+      "client_charge_code": "<Client Charge Code>",
+      "project_description": "<项目或行程说明>",
+      "user_notes": "",
+      "travel_buffer_days": 1,
+      "status": "draft",
+      "meal_hints": [],
+      "expense_hints": [],
+      "meal_standards": []
+    }
+  ]
+}

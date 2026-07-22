@@ -6,8 +6,8 @@ from __future__ import annotations
 import argparse
 
 import extraction_corrections as xc
+from exit_codes import ExitCode
 import integrity
-import hashlib
 import json
 import re
 import shutil
@@ -17,6 +17,11 @@ from datetime import datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 from typing import Any
+
+from io_utils import configure_utf8_stdio as configure_stdio, sha256_file
+import text_utils
+import time_utils
+import value_utils
 
 
 IMAGE_SUFFIXES = {".png", ".jpg", ".jpeg", ".tif", ".tiff", ".bmp", ".webp", ".heic"}
@@ -53,6 +58,7 @@ C = {
     "hotel": "\u9152\u5e97",
     "railway_ticket": "\u94c1\u8def\u7535\u5b50\u5ba2\u7968",
     "ticket_price": "\u7968\u4ef7",
+    "refund_fee": "\u9000\u7968\u8d39",
     "shanghai": "\u4e0a\u6d77",
     "invoice": "\u53d1\u7968",
     "total": "\u5408\u8ba1",
@@ -104,36 +110,14 @@ class ExtractedText:
     issues: list[dict[str, str]]
 
 
-def clean(value: Any) -> str:
-    text = "" if value is None else str(value)
-    text = text.replace("\u3000", " ").replace("\r", "\n")
-    return re.sub(r"\s+", " ", text).strip()
-
-
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(errors="replace")
-            except Exception:
-                pass
+clean = text_utils.normalize_text
 
 
 def compact(value: str) -> str:
     return re.sub(r"\s+", "", value or "")
 
 
-def money(value: Any) -> str:
-    if value is None:
-        return ""
-    text = str(value).replace(",", "").replace("\uffe5", "").replace("\u00a5", "").strip()
-    match = re.search(r"-?\d+(?:\.\d+)?", text)
-    if not match:
-        return ""
-    try:
-        return f"{Decimal(match.group(0)):.2f}"
-    except InvalidOperation:
-        return ""
+money = value_utils.extract_evidence_amount
 
 
 def date_from_chinese(value: str) -> str:
@@ -148,14 +132,6 @@ def date_from_dash(value: str) -> str:
     if not match:
         return ""
     return f"{int(match.group(1)):04d}-{int(match.group(2)):02d}-{int(match.group(3)):02d}"
-
-
-def sha256_file(path: Path) -> str:
-    h = hashlib.sha256()
-    with path.open("rb") as f:
-        for chunk in iter(lambda: f.read(1024 * 1024), b""):
-            h.update(chunk)
-    return h.hexdigest()
 
 
 def iter_input_files(paths: list[Path]) -> tuple[list[Path], list[Path]]:
@@ -397,7 +373,42 @@ def classify_role_and_subtype(text: str, tables: list[list[list[str]]]) -> tuple
     return "unknown", "unknown"
 
 
+def is_railway_refund_text(text: str) -> bool:
+    normalized = compact(text).lower()
+    return "\u9000\u7968" in normalized or "refund" in normalized or "cancellation" in normalized
+
+
+def parse_railway_refund_fee_amount(text: str) -> str:
+    """Parse the reimbursable amount printed beside the railway refund-fee label.
+
+    China Railway e-ticket PDFs can place the larger amount glyph a few points
+    above the smaller label. pdfplumber can then emit the amount one line
+    before its refund-fee label, so support both semantic orders.
+    """
+    label = r"\u9000\s*\u7968\s*\u8d39"
+    amount = r"[0-9][0-9,]*(?:\.[0-9]{1,2})?"
+    currency = r"(?:[\u00a5\uffe5]|RMB|CNY)"
+    patterns = [
+        label + r"[^\S\r\n]*[:\uff1a]?\s*" + currency + r"\s*(" + amount + r")",
+        label + r"[^\S\r\n]*[:\uff1a][^\S\r\n]*(" + amount + r")",
+        (
+            r"(?m)^[^\S\r\n]*" + currency + r"[^\S\r\n]*(" + amount + r")"
+            r"[^\S\r\n]*(?:\r?\n[^\S\r\n]*)?" + label + r"[^\S\r\n]*[:\uff1a]?"
+        ),
+    ]
+    for pattern in patterns:
+        value = money(regex_first(pattern, text, re.S | re.I))
+        if value:
+            return value
+    return ""
+
+
 def parse_total_amount(text: str, tables: list[list[list[str]]], invoice_type: str) -> str:
+    if invoice_type == "railway_e_ticket" and is_railway_refund_text(text):
+        # A railway refund invoice reimburses the refund fee itself. Do not
+        # fall back to another visible amount or treat a blank label as zero.
+        return parse_railway_refund_fee_amount(text)
+
     patterns = [
         r"\u5c0f\s*\u5199\s*[\)\uff09]?\s*[\u00a5\uffe5]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
         r"[\(\uff08]\s*\u5c0f\s*\u5199\s*[\)\uff09]\s*[\u00a5\uffe5]?\s*([0-9]+(?:\.[0-9]{1,2})?)",
@@ -510,25 +521,58 @@ def note_for_invoice(text: str, invoice: dict[str, str], category: str, subtype:
     return clean(seller or line_item)
 
 
-def railway_note(text: str) -> str:
+def parse_railway_leg(text: str) -> dict[str, Any]:
     compact_text = clean(text)
     train = regex_first(r"\b([GDCZTK]\d{1,5})\b", compact_text)
-    travel_dt = date_from_chinese(regex_first(r"(\d{4}\s*\u5e74\s*\d{1,2}\s*\u6708\s*\d{1,2}\s*\u65e5\s*\d{1,2}:\d{2})", compact_text))
+    travel_date = date_from_chinese(regex_first(r"(\d{4}\s*\u5e74\s*\d{1,2}\s*\u6708\s*\d{1,2}\s*\u65e5\s*\d{1,2}:\d{2})", compact_text))
     time_part = regex_first(r"\d{4}\s*\u5e74\s*\d{1,2}\s*\u6708\s*\d{1,2}\s*\u65e5\s*(\d{1,2}:\d{2})", compact_text)
-    seat = regex_first(r"(\u4e00\u7b49\u5ea7|\u4e8c\u7b49\u5ea7|\u5546\u52a1\u5ea7|\u786c\u5ea7|\u786c\u5367|\u8f6f\u5367)", compact_text)
-    route = ""
+    origin = ""
+    destination = ""
     if train:
         route_match = re.search(r"([\u4e00-\u9fffA-Za-z]{2,30})\s+" + re.escape(train) + r"\s+([\u4e00-\u9fffA-Za-z]{2,30})", compact_text)
         if route_match:
-            route = f"{clean(route_match.group(1))} -> {clean(route_match.group(2))}"
-    refund = "\u9000\u7968" in compact_text or "refund" in compact_text.lower()
-    parts = [part for part in [train, route, f"{travel_dt} {time_part}".strip(), seat, "\u9000\u7968\u8d39" if refund else ""] if part]
+            origin = clean(route_match.group(1))
+            destination = clean(route_match.group(2))
+    refund = is_railway_refund_text(text)
+    refund_fee_amount = parse_railway_refund_fee_amount(text) if refund else ""
+    return {
+        "train_no": train,
+        "travel_date": travel_date,
+        "departure_time": time_part,
+        "departure_datetime": f"{travel_date} {time_part}".strip() if travel_date else "",
+        "origin_station": origin,
+        "destination_station": destination,
+        "route": f"{origin}-{destination}" if origin and destination else "",
+        "is_refund_fee": refund,
+        "refund_fee_amount": refund_fee_amount,
+    }
+
+
+def railway_note(text: str) -> str:
+    leg = parse_railway_leg(text)
+    seat = regex_first(r"(\u4e00\u7b49\u5ea7|\u4e8c\u7b49\u5ea7|\u5546\u52a1\u5ea7|\u786c\u5ea7|\u786c\u5367|\u8f6f\u5367)", clean(text))
+    route = leg["route"].replace("-", " -> ", 1) if leg["route"] else ""
+    refund_note = ""
+    if leg["is_refund_fee"]:
+        refund_note = C["refund_fee"]
+        if leg["refund_fee_amount"]:
+            refund_note += f" \u00a5{leg['refund_fee_amount']}"
+    parts = [
+        part
+        for part in [
+            leg["train_no"],
+            route,
+            leg["departure_datetime"],
+            seat,
+            refund_note,
+        ]
+        if part
+    ]
     return clean(", ".join(parts))
 
 
 def railway_travel_date(text: str) -> str:
-    value = regex_first(r"(\d{4}\s*\u5e74\s*\d{1,2}\s*\u6708\s*\d{1,2}\s*\u65e5)\s*\d{1,2}:\d{2}", text)
-    return date_from_chinese(value)
+    return clean(parse_railway_leg(text).get("travel_date"))
 
 
 def parse_invoice(text: str, tables: list[list[list[str]]], subtype: str) -> dict[str, str]:
@@ -749,7 +793,8 @@ def extract_document(document_id: str, path: Path) -> dict[str, Any]:
         expense_date = ""
         expense_date_source = ""
         if subtype == "railway_e_ticket":
-            expense_date = railway_travel_date(text)
+            railway_leg = parse_railway_leg(text)
+            expense_date = clean(railway_leg.get("travel_date"))
             expense_date_source = "railway_travel_date" if expense_date else ""
         doc["classification"] = {
             "expense_category": category,
@@ -758,15 +803,30 @@ def extract_document(document_id: str, path: Path) -> dict[str, Any]:
             "expense_note": invoice_note,
             "reason": reason,
         }
+        if subtype == "railway_e_ticket":
+            doc["classification"]["railway_leg"] = railway_leg
         required = ["invoice_no", "issue_date", "total_amount"]
         if subtype != "railway_e_ticket":
             required.append("seller_name")
         for field in required:
             if not invoice.get(field):
+                refund_amount_missing = (
+                    field == "total_amount"
+                    and subtype == "railway_e_ticket"
+                    and bool((doc["classification"].get("railway_leg") or {}).get("is_refund_fee"))
+                )
                 doc["issues"].append({
                     "field": field,
-                    "problem": "Required invoice field was not extracted.",
-                    "suggested_action": "Inspect source document or OCR output manually.",
+                    "problem": (
+                        "Railway refund-fee amount was not extracted; a blank label is not zero."
+                        if refund_amount_missing
+                        else "Required invoice field was not extracted."
+                    ),
+                    "suggested_action": (
+                        "Inspect the amount printed beside the refund-fee label and correct it through Stage 1."
+                        if refund_amount_missing
+                        else "Inspect source document or OCR output manually."
+                    ),
                 })
         doc["confidence"] = 0.95 if not doc["issues"] else 0.75
 
@@ -791,15 +851,25 @@ def build_links_and_reviews(documents: list[dict[str, Any]]) -> tuple[list[dict[
     seen_hashes: dict[str, str] = {}
     for doc in documents:
         source_hash = doc.get("sha256") or ""
-        if source_hash in seen_hashes:
+        if source_hash and source_hash in seen_hashes:
             links.append({
                 "source_document_id": seen_hashes[source_hash],
                 "target_document_id": doc["document_id"],
                 "relation": "duplicate_source_file",
                 "check": {"sha256": source_hash, "matched": True},
             })
+            doc["issues"].append({
+                "field": "source_file",
+                "problem": f"File content exactly duplicates {seen_hashes[source_hash]} (same SHA-256).",
+                "suggested_action": (
+                    "Confirm which copy to keep, then exclude the duplicate at Stage 1 through "
+                    "apply_extraction_corrections.py; dropping an allocation unit is not equivalent."
+                ),
+            })
+            doc["needs_review"] = True
         else:
-            seen_hashes[source_hash] = doc["document_id"]
+            if source_hash:
+                seen_hashes[source_hash] = doc["document_id"]
 
         invoice = doc.get("invoice") or {}
         invoice_no = invoice.get("invoice_no") or ""
@@ -1131,6 +1201,16 @@ def write_markdown(output_dir: Path, payload: dict[str, Any]) -> Path:
         lines.append(f"- Amount: {invoice.get('total_amount', '')}")
         lines.append(f"- Category: {classification.get('expense_category', '')}")
         lines.append(f"- Expense note: {classification.get('expense_note', '')}")
+        railway_leg = classification.get("railway_leg") or {}
+        if railway_leg:
+            lines.append(
+                "- Railway leg: "
+                f"{railway_leg.get('train_no', '') or '-'} | "
+                f"{railway_leg.get('origin_station', '') or '-'} -> {railway_leg.get('destination_station', '') or '-'} | "
+                f"{railway_leg.get('departure_datetime', '') or railway_leg.get('travel_date', '') or '-'}"
+            )
+            if railway_leg.get("is_refund_fee"):
+                lines.append(f"- Railway refund fee: {railway_leg.get('refund_fee_amount', '') or 'NEEDS REVIEW'}")
         lines.append(f"- Raw remarks: {invoice.get('raw_remarks', '')}")
         lines.append(f"- Confidence: {doc.get('confidence', '')}")
         lines.append(f"- Issues: {len(doc.get('issues', []))}")
@@ -1194,7 +1274,7 @@ def build_payload(input_files: list[Path], skipped_files: list[Path]) -> dict[st
     batch["unresolved_input_count"] = len(skipped_files)
     return {
         "schema_version": "invoice_extraction.v1",
-        "generated_at": datetime.now().replace(microsecond=0).isoformat(),
+        "generated_at": time_utils.iso_now(),
         "batch": batch,
         "documents": documents,
         "unresolved_input_files": [unsupported_input_record(path) for path in skipped_files],
@@ -1214,7 +1294,7 @@ def main(argv: list[str] | None = None) -> int:
     files, skipped = iter_input_files(input_paths)
     if not files and not skipped:
         print("No supported PDF or image files found.", file=sys.stderr)
-        return 2
+        return ExitCode.COMMAND_ERROR
 
     payload = build_payload(files, skipped)
     output_dir = Path(args.output)
@@ -1270,7 +1350,7 @@ def main(argv: list[str] | None = None) -> int:
     print(f"Wrote {json_path}")
     print_input_reconciliation(payload, files, skipped)
     print_extraction_review_list(payload)
-    return 0
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

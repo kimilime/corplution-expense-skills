@@ -20,7 +20,11 @@ first_tier_cities = [
 ]
 
 [charge_codes]
-# Administrative (non-project) charge code. Year-coded; update annually.
+# Year-coded fallback defaults. These are OVERRIDDEN by the agent/user-writable
+# assets/special-code-definitions.json when present (precedence: that file > this
+# file > built-in defaults). To roll the fiscal year, prefer
+# `python scripts/special_codes.py set-year 2027` rather than editing here.
+# Administrative (non-project) charge code.
 admin = "CORP-2026-ADMIN"
 # Shared business-development code that multiple pending projects may use.
 # Never treat it alone as a unique project key.

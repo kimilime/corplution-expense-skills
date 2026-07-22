@@ -4,6 +4,8 @@ Use this reference after stage 2 has produced `process/expense-allocation.json`.
 
 Before writing the workbook, `scripts/write_reimbursement_template.py` runs `STAGE 3 PREFLIGHT CHECK TO SHOW IN CHAT`. This is the hard connection-point validation between allocation and the initial reimbursement table. If it exits with code `2`, no workbook was written; fix the listed allocation issues first, such as open questions, unconfirmed units, invalid categories/columns, missing dates/client/code/amount, admin/mobile conflicts, raw rail/flight evidence in final notes, or missing taxi place types.
 
+Every run ends with one explicit `STAGE3_RESULT` block. Treat only `status=ok`, exit code `0`, and `package_allowed=true` as package-ready. `status=blocked` means no new Stage-3 artifact generation was committed and any prior workbook/final rows were preserved. `status=review_required` means the workbook and final rows were committed for applicant review, but policy confirmations remain and Stage 4 must not run.
+
 ## Inputs
 
 Required:
@@ -19,17 +21,30 @@ Optional:
 - Approval screenshot paths for substitute invoices
 - User confirmation for dropped or excluded items
 
+## Preferred Subagent Audits (before Stage 3)
+
+When the host supports a fresh isolated subagent (on Claude Code, the built-in Agent/Task tool), run both independent audits by default after Stage 2 is fully confirmed and immediately before Stage 3: `--role mirror_warden` (Otako, the Mirror Warden — precision-first factual evidence reconciliation) and `--role gate_challenger` (Kaede, the Gate Challenger — narrow explicit-policy and required-approval gate). Skip only when that capability is unavailable or the user opts out. Hand the compact path-free task and result-template JSON to the subagent by pasting both complete JSON values into its initial prompt. Do not give it local paths, tools, the other subagent's reasoning, or permission to modify artifacts, and never ask it to discover workspace files. When the host supports structured output, use the packet's `response_json_schema`. Validate the returned `subagent_audit.v2` with Chief `accept-agent`, then relay its generated review summary: only blocking findings become applicant questions; advisory findings are informational and need no reply.
+
+A current validated `block` result from either role is a pre-Stage-3 blocker and must cite current unit/evidence references. In every `coverage[]` entry, `status` is only `completed` or `not_applicable`; the overall `pass`, `advisory`, `block`, or `unavailable` conclusion belongs only in `outcome`. Every finding contains exactly `finding_id`, `severity`, `code`, `message`, `unit_refs`, `evidence_refs`, and `recommended_action`; do not use aliases such as `check_id`, `references`, or `summary`. Every accepted result is retained in an immutable current-task archive under `process/subagent-audit-generations/<role>/`; deleting or corrupting a `<role>-audit.json` sidecar does not clear it. Resolve the finding through Composer/Updater, then create a new audit bound to the new allocation fingerprint. A current `advisory`, `pass`, or explicit `unavailable` result is recorded in `final-expense-rows.json`. When no valid accepted result exists for the current task, the pilot explicitly fails open to the deterministic checks below; absence is never represented as a pass. Audit blockers are separate from `blocking_policy_checks`, which remains reserved for deterministic meal/hotel policy confirmations. The writer also rejects a `--process-dir` that is not the allocation's own directory.
+
+If a new current review is accepted after a workbook was generated, Stage 3 becomes stale and must be rerun before packaging. Packaging also rejects any current blocking review.
+
 ## Blocking Checks Before Writing
+
+> **Fiscal-year codes:** `<ADMIN_CODE>` and `<BD_CODE>` are placeholders for the current fiscal-year charge codes, defined in `assets/special-code-definitions.json` and rolled each fiscal year with `python scripts/special_codes.py set-year <year>`. Substitute the current codes; never write a literal `<...>` placeholder or hardcode a year — Stage 3 rejects any charge code containing `<`/`>`.
 
 Do not write the final workbook until:
 
 - `Requester` is known.
+- The extraction fingerprint and project-context SHA-256 recorded by Stage 2 still match their current inputs; otherwise rerun allocation and Composer first.
 - Every included allocation unit is confirmed or fixed.
 - Open questions that affect client, charge code, final template column, amount, date, note, or proof number are resolved.
 - No included unit has `date_required: true`, and no included unit has a blank `expense_date`. Pure `other` rows may use a provisional invoice-date `expense_date` when `date_is_provisional: true`; this is advisory, not blocking.
 - No non-mobile row uses Client `通讯费`, final column `mobile`, or a note containing `通讯费`.
-- No taxi/travel row is assigned to `CORP-2026-ADMIN`. Admin is not a fallback for unmatched transport.
-- If a flight/rail route destination uniquely matches a project context, the row is assigned to that destination project, not the origin project.
+- No taxi/travel row is assigned to `<ADMIN_CODE>`. Admin is not a fallback for unmatched transport.
+- Standalone flight/rail whose route destination uniquely matches a project context is assigned to that destination project, not the origin project.
+- Every active railway journey chain has at least two continuous ticket segments, one shared project assignment, no open whole-chain question, and current length/member/route metadata. A dropped or corrected segment requires Stage 2 to rebuild the chain. Skip per-ticket destination-project enforcement for intermediate transfer segments; validate the chain as a whole instead.
+- Every applicant expense hint has a current reverse-reconciliation entry. Valid final outcomes are active evidence matched through `matched_existing`, identified `covered_by_invoice`, automatic unique matching, or `not_reimbursed`. `pending_invoice` remains blocking; a matched hint whose unit was dropped must be resolved again.
 - Substitute invoices either have approval screenshot paths or explicit missing-screenshot issues.
 - Didi/Gaode summary invoices linked to trip reports are not duplicated as standalone expense rows.
 
@@ -43,7 +58,7 @@ Write these fields:
 | --- | --- |
 | `Date (YYYYMMDD)` | confirmed, reliable, or pure-`other` provisional `expense_date` formatted as `YYYYMMDD`; do not fall back to invoice issue date for non-`other` items |
 | `Requester` | ask user if missing |
-| `Client` | confirmed `client_name`; for `CORP-2026-ADMIN`, normalize mobile to `通讯费` and other missing/admin placeholders to `项目、调研以外的其他费用` |
+| `Client` | confirmed `client_name`; for `<ADMIN_CODE>`, normalize mobile to `通讯费` and other missing/admin placeholders to `项目、调研以外的其他费用` |
 | `Client Charge Code` | confirmed `client_charge_code` |
 | `Expenses Nature` | formal local/trip rule below |
 | `Note` | confirmed `final_note` from stage 2 |
@@ -59,14 +74,14 @@ Amounts must be numeric values. Each row must have exactly one populated amount 
 
 Use `reimbursable_amount` for the visible Excel amount when it is present; otherwise use `amount`. Preserve `invoice_amount` in `final-expense-rows.json`. If the reimbursable amount differs from the invoice amount, append `（发票金额XX/实际报销XX）` to the final note.
 
-Treat project allocation and visible amount-column classification as two separate layers. `client_name`, `client_charge_code`, and the project block come from the confirmed project allocation. `meal`/`taxi` versus `travel`, and the matching `Expenses Nature`, come from formal evidence only. Do not move a Shanghai meal or Shanghai ride into `travel` merely because it belongs to an out-of-town project; do not move a non-Shanghai meal or non-Shanghai ride into `meal`/`taxi` merely because it belongs to a Shanghai/admin context.
+Treat project allocation, visible form classification, and meal policy as separate axes. `client_name`, `client_charge_code`, and the project block come from confirmed project allocation. `meal`/`taxi` versus `travel`, and matching `Expenses Nature`, come from formal city evidence. Meal cap policy comes only from substantive purpose in `final_note`/`meal_context`. Never derive one axis from another.
 
 For meal rows, choose the visible amount column by formal invoice/restaurant city, not by project substance:
 
 - Shanghai formal city -> `meal`.
 - Non-Shanghai formal city -> `travel`.
 
-A Shanghai meal invoice assigned to an out-of-town project can still use note `出差餐费`, but its amount must stay in the `meal` column and `Expense Nature` must stay local.
+A Shanghai meal invoice assigned to an out-of-town project can still use note `出差餐费`, but its amount must stay in the `meal` column and `Expense Nature` must stay local. Despite those local form fields, it remains `business_trip_meal` under the RMB 150/day policy.
 
 For taxi/Didi/Gaode ride rows, choose the visible amount column by ride city, not by assigned project:
 
@@ -93,28 +108,41 @@ Corplution has two meal daily standards:
 
 Authoritative cap values live in `assets/policy.toml`; the numbers above are the current values for readability.
 
+There is no generic "Shanghai meal", "local meal", or `amount_column=meal` RMB 60 policy. RMB 60 applies only when the item is explicitly an overtime meal. `Expense Nature: 本地` is a workbook presentation value and is not a cap-policy signal.
+
+Keep these three axes distinct:
+
+| Axis | Meaning | Selector | Example for a Shanghai pre-departure trip meal |
+| --- | --- | --- | --- |
+| `source_category` | substantive expense type / inclusion in meal checks | recognized expense type | `meal` |
+| `amount_column` + `Expense Nature` | workbook form | formal invoice/restaurant city | `meal` + `本地` |
+| `meal_cap_policy` | daily cap and aggregation pool | explicit `final_note` / `meal_context` | `business_trip_meal` + `150.00` |
+
 After final rows are built and before final submission, calculate daily totals separately by meal policy.
 
 Treat a row as a business-trip meal when:
 
 - `source_category` is `meal`; and
-- final amount column is `travel`, or final note starts with `出差餐费`, or `meal_context` is `travel`, `business_trip`, or `station_airport`.
+- final note starts with `出差餐费`, or `meal_context` is `travel`, `business_trip`, or `station_airport`.
 
 Treat a row as a local overtime meal when:
 
 - `source_category` is `meal`; and
 - final note starts with `加班餐费`, or `meal_context` is `overtime`.
 
+If neither policy has an explicit signal, Stage 3 must block and ask for the meal purpose. If trip and overtime signals conflict, Stage 3 must also block. City, project, `amount_column`, `final_template_column`, and `Expense Nature` must never resolve a missing or conflicting policy.
+
 For each date and meal policy:
 
 - Sum the visible Excel amounts, meaning `reimbursable_amount` when present, otherwise `amount`.
+- Aggregate across workbook columns. For example, a Shanghai `meal`-column trip meal and a Zhengzhou `travel`-column trip meal on the same date share one RMB 150 business-trip pool.
 - If total is within the relevant cap, mark the date as OK.
 - If total exceeds the relevant cap and at least one item has `attendees`, set `severity: advisory` and show a warning only: the day exceeds the standard but may be valid because multiple people are involved.
 - If total exceeds the relevant cap and no item has `attendees`, ask the user directly whether the actual meal date is wrong, attendee details are missing, or one item should be partially reimbursed.
 - When partial reimbursement is needed, suggest a `reimbursable_amount` adjustment that makes the day total exactly equal to the relevant cap. For example, if a local overtime meal is 70, suggest changing `reimbursable_amount` to 60; if two same-day trip meals are 90 + 90, suggest changing one item's `reimbursable_amount` to 60.
 - Apply user-confirmed partial reimbursement with `scripts/apply_allocation_answers.py`, then regenerate the workbook. The final note should show the invoice/reimbursable difference automatically.
 
-Always copy or summarize the script's `MEAL DAILY CAP CHECK TO SHOW IN CHAT` output in the conversation. Do not leave this only in `final-expense-rows.json/md`.
+Relay the script's complete `MEAL DAILY CAP CHECK TO RELAY VERBATIM` block without independently reclassifying or recomputing it. The script writes `meal_cap_policy`, `meal_daily_cap`, and `meal_policy_basis` onto every meal row and includes the authoritative policy/day pools in `meal_daily_cap_checks`. Do not replace those fields with an inference from city or workbook column.
 
 ## Hotel Caps
 
@@ -188,9 +216,9 @@ The workbook is organized by project blocks. A project is identified by:
 Client + Client Charge Code
 ```
 
-If two projects share the same `Client Charge Code` but have different `Client` values, treat them as separate project blocks. This is common when several pending projects use `CORP-2026-BD`.
+If two projects share the same `Client Charge Code` but have different `Client` values, treat them as separate project blocks. This is common when several pending projects use `<BD_CODE>`.
 
-For `CORP-2026-ADMIN`, do not group all rows under `Admin`. Treat the Client value as the admin matter name. Mobile rows should group under `通讯费 / CORP-2026-ADMIN`; other admin rows should use the specific matter name when provided, or `项目、调研以外的其他费用 / CORP-2026-ADMIN` as the non-blocking default.
+For `<ADMIN_CODE>`, do not group all rows under `Admin`. Treat the Client value as the admin matter name. Mobile rows should group under `通讯费 / <ADMIN_CODE>`; other admin rows should use the specific matter name when provided, or `项目、调研以外的其他费用 / <ADMIN_CODE>` as the non-blocking default.
 
 For each project block:
 
@@ -390,6 +418,29 @@ Create or update:
 - `process/final-expense-rows.md`
 - `process/final-expense-rows.json`
 
+The workbook, final-rows JSON, and final-rows Markdown are one artifact generation. Write all three to hidden sibling staging paths first, keep the temporary workbook's `.xlsx` suffix, scan and validate the staged files, then promote them together. If staging or promotion fails, remove temporary files and restore the previous three-file generation; never delete a prior valid `final-expense-rows.json` merely because the current write attempt is blocked. The JSON records the SHA-256 of the workbook from the same promoted set.
+
+Result meanings:
+
+```text
+STAGE3_RESULT: blocked
+artifacts_written=false
+previous_artifacts_preserved=true
+package_allowed=false
+```
+
+```text
+STAGE3_RESULT: review_required
+artifacts_written=true
+package_allowed=false
+```
+
+```text
+STAGE3_RESULT: ok
+artifacts_written=true
+package_allowed=true
+```
+
 `final-expense-rows.json` should include:
 
 ```json
@@ -419,8 +470,8 @@ Create or update:
       "client": "",
       "client_charge_code": "",
       "expenses_nature": "本地",
-      "note": "",
-      "amount_column": "travel",
+      "note": "出差餐费（上海出发前）",
+      "amount_column": "meal",
       "amount": "0.00",
       "invoice_amount": "0.00",
       "reimbursable_amount": "0.00",
@@ -438,7 +489,29 @@ Create or update:
       "date_required": false,
       "seller_name": "",
       "attendees": "",
-      "meal_context": "",
+      "meal_context": "business_trip",
+      "train_no": "",
+      "origin_station": "",
+      "destination_station": "",
+      "rail_departure_time": "",
+      "rail_departure_datetime": "",
+      "journey_chain_id": "",
+      "journey_chain_route": "",
+      "journey_chain_position": "",
+      "journey_chain_length": "",
+      "journey_chain_unit_ids": [],
+      "journey_chain_confidence": "",
+      "journey_chain_assignment_rule": "",
+      "journey_chain_match_reason": "",
+      "journey_chain_project_context_id": "",
+      "journey_chain_needs_confirmation": false,
+      "meal_cap_policy": "business_trip_meal",
+      "meal_daily_cap": "150.00",
+      "meal_policy_basis": [
+        "final_note starts with 出差餐费",
+        "meal_context=business_trip"
+      ],
+      "meal_policy_error": "",
       "hotel_city": "",
       "hotel_city_tier": "",
       "hotel_nights": "",
@@ -457,6 +530,9 @@ Create or update:
       "corrected_fields": []
     }
   ],
+  "rail_journey_chains": [],
+  "expense_hint_reconciliation": [],
+  "unresolved_expense_hint_count": 0,
   "project_blocks": [
     {
       "project_key": "Client|Client Charge Code",
@@ -474,12 +550,36 @@ Create or update:
     "grand_total_row": 22,
     "status_row": 23
   },
+  "meal_policy_rule": {
+    "population_selector": "source_category=meal",
+    "cap_selector": "final_note/meal_context substantive purpose",
+    "not_cap_selectors": [
+      "city",
+      "amount_column",
+      "final_template_column",
+      "expenses_nature"
+    ],
+    "cross_column_aggregation": "Same-date rows with the same meal_cap_policy are summed together even when one is in meal and another is in travel.",
+    "critical_invariant": "A Shanghai meal-column/local-nature row with Note=出差餐费 remains business_trip_meal at RMB 150/day; only explicit 加班餐费 uses RMB 60/day."
+  },
   "meal_daily_cap_checks": [
     {
       "policy": "business_trip_meal",
       "policy_name": "出差餐费",
       "date": "YYYYMMDD",
       "cap": "150.00",
+      "aggregation_key": "meal_cap_policy + expense_date",
+      "cross_column_aggregation": true,
+      "policy_basis": [
+        "final_note starts with 出差餐费",
+        "meal_context=business_trip"
+      ],
+      "policy_non_triggers": [
+        "city",
+        "amount_column",
+        "final_template_column",
+        "expenses_nature"
+      ],
       "total": "0.00",
       "over_by": "0.00",
       "status": "未超标",
@@ -558,12 +658,14 @@ Before delivering the workbook:
 - `Status` evaluates to `TRUE` only when Total equals Grand Total.
 - Didi/Gaode rides are split into ride rows and share the linked invoice proof number.
 - No Didi/Gaode summary invoice is also written as a duplicate row.
-- No taxi/travel/meal/hotel row falls back to Client `通讯费`, mobile column, or `CORP-2026-ADMIN`.
+- No taxi/travel/meal/hotel row falls back to Client `通讯费`, mobile column, or `<ADMIN_CODE>`.
 - Meal amount columns follow the formal invoice/restaurant city rule: Shanghai -> `meal`; non-Shanghai -> `travel`.
 - Taxi/Didi/Gaode amount columns follow the ride city rule: Shanghai -> `taxi`; non-Shanghai -> `travel`.
 - Taxi/Didi/Gaode final notes do not contain literal `出发地类型` or `目的地类型` placeholders.
 - Hotel final notes do not contain literal `X晚`, `入住日`, or `离店日` placeholders.
-- Flight/rail between two project cities belongs to the destination/project being traveled to.
+- Standalone flight/rail between two project cities belongs to the destination/project being traveled to.
+- Connected railway tickets retain separate rows/proofs/Notes but share one project assignment. Adjacent stations must still connect, and a transfer station must not split the chain into another project.
+- `expense_hint_reconciliation` contains every distinct user-provided expense record exactly once, and `unresolved_expense_hint_count` is zero.
 - `Expense Nature` follows the formal Shanghai/non-Shanghai rule.
 - All substitute invoice notes include `（抵）`.
 - Meal daily cap checks are present and have been shown in chat. Any over-cap day with attendees is advisory only; any over-cap day without attendees must be resolved or explicitly acknowledged before final submission.

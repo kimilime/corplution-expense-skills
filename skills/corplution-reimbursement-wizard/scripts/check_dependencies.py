@@ -10,6 +10,9 @@ import subprocess
 import sys
 from pathlib import Path
 
+from exit_codes import ExitCode
+from io_utils import configure_utf8_stdio as configure_stdio
+
 
 PYTHON_IMPORTS = {
     "openpyxl": "openpyxl",
@@ -62,6 +65,7 @@ def install_requirements(requirements: Path) -> int:
 
 
 def main(argv: list[str] | None = None) -> int:
+    configure_stdio()
     parser = argparse.ArgumentParser(description="Check Corplution reimbursement skill dependencies.")
     parser.add_argument("--install", action="store_true", help="Install missing Python dependencies from requirements.txt.")
     parser.add_argument("--strict-ocr", action="store_true", help="Fail if OCR system tools are missing.")
@@ -70,7 +74,7 @@ def main(argv: list[str] | None = None) -> int:
     requirements = requirements_path()
     if not requirements.exists():
         print(f"ERROR: requirements.txt not found: {requirements}", file=sys.stderr)
-        return 2
+        return ExitCode.COMMAND_ERROR
 
     missing_packages = missing_python_packages()
     if missing_packages:
@@ -82,10 +86,10 @@ def main(argv: list[str] | None = None) -> int:
             missing_packages = missing_python_packages()
             if missing_packages:
                 print("ERROR: Packages still missing after install: " + ", ".join(missing_packages), file=sys.stderr)
-                return 1
+                return ExitCode.OPERATIONAL_ERROR
         else:
             print(f"Run: {sys.executable} -m pip install -r {requirements}")
-            return 1
+            return ExitCode.OPERATIONAL_ERROR
     else:
         print("Python dependencies OK.")
 
@@ -94,11 +98,11 @@ def main(argv: list[str] | None = None) -> int:
         for tool in missing_tools:
             print(f"WARNING: {tool} not found. {SYSTEM_TOOLS[tool]}")
         if args.strict_ocr:
-            return 1
+            return ExitCode.OPERATIONAL_ERROR
         print("OCR can still fall back to manual_review when system OCR tools are unavailable.")
     else:
         print("OCR system tools OK.")
-    return 0
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

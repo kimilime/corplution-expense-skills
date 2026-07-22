@@ -93,11 +93,12 @@ Examples:
 006-替票审批.png
 ```
 
-Support document types:
+Support document types are open-ended — respect the user's judgement rather than a fixed list. Every supporting document the user keeps is packaged under the proof number of the invoice it backs (support file No. = that invoice's No.), with its type as the label:
 
-- `行程单` for Didi/Gaode trip reports.
-- `替票审批` for partner approval screenshots.
-- User-provided type for unusual support files.
+- `行程单` / `高德行程单` for Didi/Gaode trip reports.
+- `替票审批` only for the approval screenshot of an item the user declared a substitute invoice (`is_substitute_invoice: true`). Do not apply this label to ordinary approval screenshots — a partner approval that is not tied to a declared substitute is not a 替票审批.
+- The document's own `support_type` for standalone supporting documents (e.g. `付款小票`, `审批截图`, or any user-provided label); defaults to `支持文档` when unset.
+- A `supporting_document` that names no invoice (`supports_document_id`) is a hard block at Stage 3 — it is neither silently packaged nor silently dropped. Record its `supports_document_id` (and optional `support_type`) via `apply_extraction_corrections.py`, or exclude it with the user's reason.
 
 Rules:
 
@@ -127,6 +128,7 @@ The manifest should list:
 - every support document copied
 - unresolved issues that must be shown directly to the user before submission
 - current final-rows fingerprint and workbook SHA-256
+- count of reconciled applicant expense records
 - SHA-256 for every copied invoice and support document
 - proof number
 - source document ID
@@ -135,6 +137,7 @@ The manifest should list:
 - amount
 - special-invoice flag
 - missing support or approval issues
+- an integrity-bound `close_summary` containing final evidence counts, amount adjustments, omitted records with reasons, and per-project category totals
 
 JSON shape:
 
@@ -149,6 +152,7 @@ JSON shape:
   "final_rows_fingerprint": "",
   "invoice_count": 1,
   "support_count": 1,
+  "expense_hint_reconciliation_count": 3,
   "invoice_files": [
     {
       "proof_no": 1,
@@ -170,6 +174,26 @@ JSON shape:
       "type": "行程单"
     }
   ],
+  "close_summary": {
+    "schema_version": "reimbursement_close_summary.v1",
+    "packaged_invoice_count": 1,
+    "packaged_support_count": 1,
+    "excluded_evidence_count": 0,
+    "excluded_invoice_count": 0,
+    "excluded_support_count": 0,
+    "omitted_unit_count": 0,
+    "not_reimbursed_record_count": 0,
+    "amount_adjustment_count": 0,
+    "policy_advisory_count": 0,
+    "project_count": 0,
+    "grand_total": "446.00",
+    "amount_adjustments": [],
+    "policy_advisories": [],
+    "excluded_evidence": [],
+    "omitted_units": [],
+    "not_reimbursed_records": [],
+    "projects": []
+  },
   "issues": []
 }
 ```
@@ -178,7 +202,19 @@ The manifest is integrity-stamped after all package files are copied. A package 
 
 Build each package in a fresh sibling staging directory. Only after its workbook, evidence folders, and stamped manifest are complete may the script replace the previous package root for the same requester/date. This replacement is deliberate: a rerun must contain exactly the files named by its new manifest and must not retain stale invoices or support files from an earlier run.
 
+Before copying files, require final rows to carry an `expense_hint_reconciliation` list identical to the current allocation and `unresolved_expense_hint_count: 0`. Missing legacy fields, open records, and `pending_invoice`/`pending_evidence` records require Stage 2/3 regeneration. Packaging must not infer that a note can be ignored merely because no invoice row exists. A record explicitly marked `not_reimbursed` is resolved and does not require an invoice in the package.
+
+For the preferred subagent checkpoint, packaging resolves the current accepted audits (Otako Mirror Warden and Kaede Gate Challenger) from the per-role `<role>-audit.json` sidecars plus the immutable `process/subagent-audit-generations/` archive. A current `block` from either role prevents packaging even if a convenience sidecar was deleted or damaged. A newer current `pass`, `advisory`, or `unavailable` result whose fingerprints were not consumed by final rows makes the workbook stale and requires Stage 3 to run again. If the host had no fresh subagent capability or the user opted out and no valid accepted result exists, packaging continues under the deterministic checks; absence is not recorded as a pass.
+
+On Windows, renaming an existing package can be temporarily blocked by an open workbook, Explorer preview, antivirus scan, or indexer. Retry transient `PermissionError` locks with bounded exponential backoff while preserving the staging/backup rollback. If retries are exhausted, keep the old package intact, attempt to remove staging, warn if Windows also locks cleanup, and tell the agent to close the workbook and package-folder previews before rerunning Stage 4 through Chief. Status and journal discovery ignore hidden `.staging-*`/`.previous-*` folders so an interrupted package cannot masquerade as the deliverable. Direct script invocation does not bypass the lock and must not be presented as the fix.
+
 If `package_reimbursement_files.py` exits with code `3`, it has written a review package and manifest, but `issues` is non-empty. Treat this as a blocking stop: show the issue list in chat, obtain the missing evidence or an explicit applicant decision, then re-run Stage 4. Do not describe that package as complete or submit it.
+
+## Close Message
+
+On exit code `0`, the script prints `CLOSE MESSAGE TO SHOW IN CHAT (relay verbatim)`. Read `references/close-message.md` and relay that complete block verbatim. The stamped `close_summary` is authoritative; do not manually recount files, recompute project totals, infer why an amount changed, or omit excluded/not-reimbursed items.
+
+The Close Message is a success-only artifact. A review package with issues gets the blocking issue list, not a success summary.
 
 ## Validation
 
@@ -194,5 +230,7 @@ Before final delivery:
 - Original source files were copied, not moved.
 - A rerun has no stale invoice or support file outside the current manifest.
 - The integrity-stamped manifest matches the current final-rows fingerprint, workbook hash, file counts, and every listed package file hash.
+- The packaged final rows carry the same applicant expense-record reconciliation as the current allocation, with zero unresolved records.
+- No current subagent-audit blocker exists (Mirror Warden or Gate Challenger), and any current accepted audit fingerprints were consumed by Stage 3.
 - The manifest has no unresolved issues before calling the workflow complete or submitting the package.
-- A concise final package summary has been shown in chat: package folder, workbook filename, and invoice/support-document counts.
+- The generated Close Message has been relayed verbatim in chat, including package/workbook locations, invoice/support counts, total reimbursement, amount adjustments and policy advisories, exclusions/omissions with reasons, and per-project totals.

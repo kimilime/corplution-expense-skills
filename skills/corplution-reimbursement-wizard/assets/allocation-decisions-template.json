@@ -1,0 +1,30 @@
+{
+  "schema_version": "allocation_decisions.v1",
+  "for_allocation_fingerprint": "<8-char generation code from the allocate output / review list header>",
+  "decisions": [
+    {
+      "units": "<N@ref, e.g. 1@a1b2c3d4 — copy the [token] from the current review list>",
+      "set": {
+        "status": "confirmed",
+        "client": "<real client name>",
+        "code": "<real client charge code>",
+        "date": "<YYYY-MM-DD>",
+        "note": "<final reimbursement note>"
+      }
+    }
+  ],
+  "expense_hint_resolutions": [
+    {
+      "question_id": "<Q-HINT-...>",
+      "record_ref": "<R1@ref, copy the full token from the current question>",
+      "action": "<matched_existing|covered_by_invoice|not_reimbursed|pending_invoice>",
+      "units": "<current N@ref token(s), required for matched_existing/covered_by_invoice>",
+      "note": "<applicant decision or evidence note>"
+    }
+  ],
+  "question_updates": [],
+  "project_contexts": [],
+  "confirm_units": [],
+  "drop_units": [],
+  "exclude_units": []
+}

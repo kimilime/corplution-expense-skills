@@ -7,13 +7,15 @@ import argparse
 import hashlib
 import copy
 import json
+import os
 import re
 import sys
 from collections import OrderedDict, defaultdict
 from datetime import date, datetime, timedelta
-from decimal import Decimal, InvalidOperation
+from decimal import Decimal
 from pathlib import Path
 from typing import Any
+from uuid import uuid4
 
 import openpyxl
 from openpyxl.styles import Alignment, Border, Font, PatternFill, Side
@@ -49,8 +51,23 @@ C = {
 # Policy numbers and year-coded values come from assets/policy.toml via
 # policy_config; edit that file (not this one) when company policy changes.
 from policy_config import load_policy
+import evidence_paths
+from exit_codes import ExitCode
 import integrity
+from io_utils import configure_utf8_stdio as configure_stdio
+from json_io import read_json_object as load_json
 import text_safety
+from text_utils import normalize_text as clean
+import subagent_protocol
+import time_utils
+from travel_ticket_utils import (
+    contains_raw_ticket_evidence,
+    is_flight_ticket,
+    is_rail_ticket,
+    route_from_text,
+    ticket_note,
+)
+import value_utils
 
 _POLICY = load_policy()
 BUSINESS_TRIP_MEAL_DAILY_CAP = _POLICY.business_trip_meal_daily_cap
@@ -61,6 +78,10 @@ ADMIN_CODE = _POLICY.admin_code
 ADMIN_FALLBACK_CLIENT = _POLICY.admin_fallback_client
 MOBILE_CLIENT = _POLICY.mobile_client
 FIRST_TIER_CITIES = _POLICY.first_tier_cities
+
+TRIP_MEAL_CONTEXTS = {"travel", "business_trip", "station_airport"}
+OVERTIME_MEAL_CONTEXTS = {"overtime"}
+MEAL_POLICY_NON_TRIGGERS = ["city", "amount_column", "final_template_column", "expenses_nature"]
 
 
 AMOUNT_COLUMNS = {
@@ -89,6 +110,8 @@ ALLOCATION_TEXT_FIELDS = {
     "expenses_nature",
     "final_note",
     "hotel_city",
+    "journey_chain_match_reason",
+    "journey_chain_route",
     "origin",
     "origin_place_type",
     "room_share_note",
@@ -188,13 +211,140 @@ def load_layout(path: Path) -> dict[str, Any]:
     return layout
 
 
-def load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
-
-
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
+
+
+class Stage3PromotionError(RuntimeError):
+    """A fully staged Stage-3 artifact set could not be promoted safely."""
+
+    def __init__(self, message: str, *, previous_artifacts_preserved: bool) -> None:
+        super().__init__(message)
+        self.previous_artifacts_preserved = previous_artifacts_preserved
+
+
+def stage3_temporary_path(target: Path, token: str) -> Path:
+    """Return a hidden sibling staging path while preserving the real suffix."""
+    return target.with_name(f".{target.stem}.stage3-{token}{target.suffix}")
+
+
+def cleanup_paths(paths: list[Path]) -> None:
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            # Cleanup failure must not hide the original staging/promotion error.
+            pass
+
+
+def promote_stage3_artifacts(artifacts: list[tuple[Path, Path]]) -> None:
+    """Promote one staged Stage-3 generation, restoring the old set on failure.
+
+    Each staged file lives beside its target, so every individual ``os.replace``
+    is atomic. The backup/rollback layer keeps the workbook, JSON, and Markdown
+    on the same generation when one of the multi-file replacements fails.
+    """
+    if not artifacts:
+        raise ValueError("Stage 3 promotion requires at least one artifact")
+    missing = [str(staged) for staged, _target in artifacts if not staged.is_file()]
+    if missing:
+        raise Stage3PromotionError(
+            "Stage 3 promotion refused because staged artifacts are missing: "
+            + ", ".join(missing),
+            previous_artifacts_preserved=True,
+        )
+
+    token = uuid4().hex
+    backups: list[tuple[Path, Path]] = []
+    promoted: list[Path] = []
+    try:
+        for _staged, target in artifacts:
+            target.parent.mkdir(parents=True, exist_ok=True)
+            if not target.exists():
+                continue
+            backup = target.with_name(f".{target.name}.stage3-previous-{token}")
+            os.replace(target, backup)
+            backups.append((target, backup))
+
+        for staged, target in artifacts:
+            os.replace(staged, target)
+            promoted.append(target)
+    except BaseException as exc:
+        rollback_errors: list[str] = []
+        for target in reversed(promoted):
+            try:
+                target.unlink(missing_ok=True)
+            except OSError as rollback_exc:
+                rollback_errors.append(f"remove new {target}: {rollback_exc}")
+        for target, backup in reversed(backups):
+            try:
+                if backup.exists():
+                    os.replace(backup, target)
+            except OSError as rollback_exc:
+                rollback_errors.append(f"restore {target} from {backup}: {rollback_exc}")
+        cleanup_paths([staged for staged, _target in artifacts])
+        if rollback_errors:
+            raise Stage3PromotionError(
+                "Stage 3 artifact promotion failed and rollback was incomplete; "
+                "preserved backup paths are named .stage3-previous-*. "
+                + "; ".join(rollback_errors),
+                previous_artifacts_preserved=False,
+            ) from exc
+        if isinstance(exc, Exception):
+            raise Stage3PromotionError(
+                f"Stage 3 artifact promotion failed; previous artifacts were restored: {exc}",
+                previous_artifacts_preserved=True,
+            ) from exc
+        raise
+    else:
+        cleanup_paths([backup for _target, backup in backups])
+
+
+def print_stage3_result(
+    status: str,
+    *,
+    exit_code: int | ExitCode,
+    allocation_fingerprint: str = "",
+    blocking_errors: int = 0,
+    blocking_policy_checks: int = 0,
+    artifacts_written: bool,
+    previous_artifacts_preserved: bool,
+    package_allowed: bool,
+) -> None:
+    """Emit one compact, machine-readable terminal result for Stage 3."""
+    print("")
+    print(f"STAGE3_RESULT: {status}")
+    print(f"exit_code={int(exit_code)}")
+    print(f"allocation_generation={allocation_fingerprint[:8] or '<unknown>'}")
+    print(f"blocking_errors={blocking_errors}")
+    print(f"blocking_policy_checks={blocking_policy_checks}")
+    print(f"artifacts_written={'true' if artifacts_written else 'false'}")
+    print(
+        "previous_artifacts_preserved="
+        + ("true" if previous_artifacts_preserved else "false")
+    )
+    print(f"package_allowed={'true' if package_allowed else 'false'}")
+    if not package_allowed:
+        print("DO NOT RUN PACKAGE")
+
+
+def stage3_blocked_result(
+    *,
+    allocation_fingerprint: str = "",
+    blocking_errors: int = 1,
+    previous_artifacts_preserved: bool = True,
+) -> int:
+    print_stage3_result(
+        "blocked",
+        exit_code=ExitCode.COMMAND_ERROR,
+        allocation_fingerprint=allocation_fingerprint,
+        blocking_errors=blocking_errors,
+        artifacts_written=False,
+        previous_artifacts_preserved=previous_artifacts_preserved,
+        package_allowed=False,
+    )
+    return ExitCode.COMMAND_ERROR
 
 
 def workbook_text_issues(path: Path) -> list[str]:
@@ -219,19 +369,6 @@ def workbook_text_issues(path: Path) -> list[str]:
     finally:
         workbook.close()
     return findings
-
-
-def clean(value: Any) -> str:
-    return re.sub(r"\s+", " ", "" if value is None else str(value)).strip()
-
-
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(errors="replace")
-            except Exception:
-                pass
 
 
 def normalized_client_name(unit: dict[str, Any]) -> str:
@@ -328,95 +465,6 @@ def contains_hotel_placeholder(note: Any) -> bool:
     return any(token in text for token in ["X晚", "入住日", "离店日"])
 
 
-def strip_route_place(value: Any) -> str:
-    text = clean(value)
-    text = re.sub(r"^[A-Z]{0,3}\d{1,5}\s*[,，]?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^(高铁|动车|火车|铁路|飞机|航班|机票)\s*", "", text)
-    text = re.sub(r"\s*(二等座|一等座|商务座|硬座|软座|硬卧|软卧|经济舱|公务舱|头等舱).*$", "", text)
-    return text.strip(" ,，;；。()（）")
-
-
-def route_from_text(value: Any) -> str:
-    text = clean(value)
-    if not text:
-        return ""
-    match = re.search(r"（([^（）]+)）", text)
-    if match:
-        text = match.group(1)
-    for piece in re.split(r"[,，;；]", text):
-        match = re.search(r"(.+?)\s*(?:->|—|~|至|到|-)\s*(.+)", piece)
-        if match:
-            origin = strip_route_place(match.group(1))
-            destination = strip_route_place(match.group(2))
-            if origin and destination:
-                return f"{origin}-{destination}"
-    match = re.search(r"(.+?)\s*(?:->|—|~|至|到|-)\s*(.+)", text)
-    if match:
-        origin = strip_route_place(match.group(1))
-        destination = strip_route_place(match.group(2))
-        if origin and destination:
-            return f"{origin}-{destination}"
-    return ""
-
-
-def is_refund_fee(unit: dict[str, Any]) -> bool:
-    text = clean(" ".join([
-        unit.get("final_note", ""),
-        unit.get("source_note", ""),
-        unit.get("expense_note", ""),
-        unit.get("raw_remarks", ""),
-        unit.get("line_item_name", ""),
-        unit.get("seller_name", ""),
-    ]))
-    return any(keyword in text for keyword in ["退票费", "退票", "退款", "refund", "Refund", "cancellation"])
-
-
-def is_rail_ticket(unit: dict[str, Any]) -> bool:
-    subtype = clean(unit.get("document_subtype"))
-    text = clean(" ".join([unit.get("source_note", ""), unit.get("expense_note", ""), unit.get("final_note", "")]))
-    return subtype == "railway_e_ticket" or bool(re.match(r"^[GCDKZT]\d{1,5}\b", text, flags=re.IGNORECASE))
-
-
-def is_flight_ticket(unit: dict[str, Any]) -> bool:
-    text = clean(" ".join([
-        unit.get("document_subtype", ""),
-        unit.get("source_note", ""),
-        unit.get("expense_note", ""),
-        unit.get("final_note", ""),
-        unit.get("raw_remarks", ""),
-    ])).lower()
-    return any(keyword in text for keyword in ["飞机", "机票", "航班", "flight"])
-
-
-def ticket_note(unit: dict[str, Any]) -> str:
-    if clean(unit.get("origin")):
-        return ""
-    route = (
-        route_from_text(unit.get("route"))
-        or route_from_text(unit.get("source_note"))
-        or route_from_text(unit.get("expense_note"))
-        or route_from_text(unit.get("final_note"))
-    )
-    if not route:
-        return ""
-    if is_rail_ticket(unit):
-        prefix = "高铁退票费" if is_refund_fee(unit) else "高铁"
-    elif is_flight_ticket(unit):
-        prefix = "飞机退票费" if is_refund_fee(unit) else "飞机"
-    else:
-        return ""
-    return f"{prefix}（{route}）"
-
-
-def contains_raw_ticket_evidence(note: Any) -> bool:
-    text = clean(note)
-    return bool(
-        "->" in text
-        or re.search(r"\b[GCDKZT]\d{1,5}\b", text, flags=re.IGNORECASE)
-        or any(keyword in text for keyword in ["二等座", "一等座", "商务座", "经济舱", "公务舱", "头等舱"])
-    )
-
-
 def taxi_template_note(unit: dict[str, Any]) -> str:
     if clean(unit.get("source_category")) not in {"taxi", "travel"} or not clean(unit.get("origin")):
         return ""
@@ -441,6 +489,69 @@ def meal_template_note(unit: dict[str, Any]) -> str:
     if context == "station_airport":
         return "出差餐费（高铁站/机场）"
     return C["trip_meal"]
+
+
+def classify_meal_policy(value: dict[str, Any]) -> tuple[dict[str, Any] | None, str | None]:
+    """Classify meal policy by substantive purpose, never by workbook form fields."""
+    if clean(value.get("source_category")) != "meal":
+        return None, None
+
+    # Event-declared, one-off daily cap wins over the generic two-tier policy.
+    # It is stamped by annotate_event_meal_standards() from the meal's
+    # project_context meal_standards; never inferred from city/amount column.
+    event_cap = clean(value.get("event_meal_cap"))
+    if event_cap:
+        context_id = clean(value.get("event_meal_context_id"))
+        label = clean(value.get("event_meal_label")) or "事件餐标"
+        direction = clean(value.get("event_meal_direction")) or "unknown"
+        return {
+            "policy": f"event_declared:{context_id}" if context_id else "event_declared",
+            "policy_name": label,
+            "cap": Decimal(money(event_cap)),
+            "basis": [
+                f"event-declared daily cap {money(event_cap)} from "
+                f"{context_id or 'project_context'} ({label}); user-declared via "
+                f"project_context.meal_standards; direction={direction}"
+            ],
+        }, None
+
+    note = clean(value.get("note") or value.get("final_note"))
+    context = clean(value.get("meal_context"))
+    trip_signals: list[str] = []
+    overtime_signals: list[str] = []
+    if note.startswith(C["trip_meal"]):
+        trip_signals.append("final_note starts with 出差餐费")
+    if note.startswith(C["overtime_meal"]):
+        overtime_signals.append("final_note starts with 加班餐费")
+    if context in TRIP_MEAL_CONTEXTS:
+        trip_signals.append(f"meal_context={context}")
+    if context in OVERTIME_MEAL_CONTEXTS:
+        overtime_signals.append(f"meal_context={context}")
+
+    if trip_signals and overtime_signals:
+        return None, (
+            "meal policy signals conflict: " + ", ".join(trip_signals + overtime_signals)
+            + "; city/amount column cannot resolve this conflict"
+        )
+    if trip_signals:
+        return {
+            "policy": "business_trip_meal",
+            "policy_name": C["business_trip_meal_policy"],
+            "cap": BUSINESS_TRIP_MEAL_DAILY_CAP,
+            "basis": trip_signals,
+        }, None
+    if overtime_signals:
+        return {
+            "policy": "local_overtime_meal",
+            "policy_name": C["local_overtime_meal_policy"],
+            "cap": LOCAL_OVERTIME_MEAL_DAILY_CAP,
+            "basis": overtime_signals,
+        }, None
+    return None, (
+        "meal policy is missing: explicitly set final_note to 出差餐费/出差餐费（高铁站/机场）/加班餐费 "
+        "or set meal_context to business_trip/station_airport/overtime; do not infer it from Shanghai, "
+        "amount_column, or Expense Nature"
+    )
 
 
 def hotel_template_note(unit: dict[str, Any]) -> str:
@@ -483,7 +594,7 @@ def normalized_note_base(unit: dict[str, Any]) -> str:
     return note
 
 
-def note_placeholder_errors(unit: dict[str, Any]) -> list[str]:
+def stage3_note_errors(unit: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if contains_place_type_placeholder(unit.get("final_note")):
         errors.append("taxi note still contains place-type placeholders")
@@ -505,7 +616,7 @@ def note_placeholder_errors(unit: dict[str, Any]) -> list[str]:
         if not ticket_note(unit):
             errors.append("rail/flight item requires route evidence for the final note template")
         elif contains_raw_ticket_evidence(unit.get("final_note")):
-            unit["final_note"] = ticket_note(unit)
+            errors.append("rail/flight final_note must use the finance template, not raw ticket evidence")
     return errors
 
 
@@ -535,6 +646,30 @@ def stage3_rule_errors(unit: dict[str, Any]) -> list[str]:
             errors.append("hotel final note must use actual nights/check-in/check-out, not X晚/入住日/离店日 placeholders")
     if category == "mobile" and visible_column != "mobile":
         errors.append("mobile expenses must use the mobile amount column")
+    if category == "meal":
+        _policy, policy_error = classify_meal_policy(unit)
+        if policy_error:
+            errors.append(policy_error)
+
+    for field in ("amount", "invoice_amount", "reimbursable_amount"):
+        value = unit.get(field)
+        if value_utils.is_blank(value):
+            continue
+        try:
+            value_utils.parse_finite_decimal(value, field=field)
+        except ValueError as exc:
+            errors.append(str(exc))
+
+    # A doc/template placeholder such as <ADMIN_CODE>/<BD_CODE>/CORP-<FY>-ADMIN must
+    # never reach the workbook. Angle brackets never appear in a real fiscal-year
+    # code, so treat any as an unresolved placeholder and block generation.
+    code_text = clean(unit.get("client_charge_code"))
+    if "<" in code_text or ">" in code_text:
+        errors.append(
+            f"client_charge_code still contains a template placeholder ({code_text!r}); "
+            "use the current fiscal-year BD/ADMIN code from assets/special-code-definitions.json "
+            "(roll it with special_codes.py set-year), never a <...> placeholder"
+        )
 
     if not normalized_note_base(unit) and category != "other":
         errors.append("final note cannot be derived from the confirmed allocation")
@@ -544,22 +679,15 @@ def stage3_rule_errors(unit: dict[str, Any]) -> list[str]:
     return errors
 
 
-def money(value: Any) -> str:
-    if value in (None, ""):
-        return "0.00"
-    try:
-        return f"{Decimal(str(value).replace(',', '')):.2f}"
-    except InvalidOperation:
-        match = re.search(r"-?\d+(?:\.\d+)?", str(value))
-        return f"{Decimal(match.group(0)):.2f}" if match else "0.00"
+money = value_utils.format_money
 
 
 def invoice_amount(unit: dict[str, Any]) -> str:
-    return money(unit.get("invoice_amount") or unit.get("amount"))
+    return money(value_utils.first_nonblank(unit.get("invoice_amount"), unit.get("amount")))
 
 
 def reimbursable_amount(unit: dict[str, Any]) -> str:
-    return money(unit.get("reimbursable_amount") or unit.get("amount"))
+    return money(value_utils.first_nonblank(unit.get("reimbursable_amount"), unit.get("amount")))
 
 
 def date_yyyymmdd(value: str) -> str:
@@ -605,6 +733,144 @@ def route_endpoints(unit: dict[str, Any]) -> tuple[str, str]:
     return "", ""
 
 
+def rail_station_key(value: Any) -> str:
+    text = clean(value).lower().replace(" ", "")
+    for suffix in ["火车站", "高铁站", "铁路站", "站"]:
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+            break
+    return text
+
+
+def rail_station_city_key(value: Any) -> str:
+    text = rail_station_key(value)
+    if len(text) >= 3 and text[-1:] in {"东", "西", "南", "北"}:
+        text = text[:-1]
+    return text.replace("市", "")
+
+
+def rail_stations_connect(destination: Any, origin: Any) -> bool:
+    destination_station = rail_station_key(destination)
+    origin_station = rail_station_key(origin)
+    if not destination_station or not origin_station:
+        return False
+    return (
+        destination_station == origin_station
+        or rail_station_city_key(destination_station) == rail_station_city_key(origin_station)
+    )
+
+
+def rail_chain_groups(units: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    groups: dict[str, list[dict[str, Any]]] = defaultdict(list)
+    for unit in units:
+        chain_id = clean(unit.get("journey_chain_id"))
+        if chain_id and clean(unit.get("status")) not in {"dropped", "excluded", "non_reimbursable"}:
+            groups[chain_id].append(unit)
+    for chain_units in groups.values():
+        chain_units.sort(key=lambda unit: integer_or_zero(unit.get("journey_chain_position")))
+    return dict(groups)
+
+
+def rail_chain_route(chain_units: list[dict[str, Any]]) -> str:
+    if not chain_units:
+        return ""
+    first_origin, _ = route_endpoints(chain_units[0])
+    destinations = [route_endpoints(unit)[1] for unit in chain_units]
+    if not first_origin or any(not destination for destination in destinations):
+        return ""
+    return " -> ".join([first_origin, *destinations])
+
+
+def integer_or_zero(value: Any) -> int:
+    try:
+        return int(value or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def rail_chain_ready_errors(units: list[dict[str, Any]]) -> list[str]:
+    errors: list[str] = []
+    for chain_id, chain_units in rail_chain_groups(units).items():
+        if len(chain_units) < 2:
+            errors.append(f"{chain_id} has fewer than two active rail legs; rerun Stage 2 to rebuild journey chains")
+            continue
+        if any(unit.get("journey_chain_needs_confirmation") for unit in chain_units):
+            errors.append(f"{chain_id} still needs one whole-journey project decision")
+
+        assignments = {
+            (
+                clean(unit.get("project_context_id")),
+                clean(unit.get("client_name")),
+                clean(unit.get("client_charge_code")),
+            )
+            for unit in chain_units
+        }
+        if len(assignments) != 1:
+            numbers = ", ".join(str(unit.get("user_no") or unit.get("unit_id")) for unit in chain_units)
+            errors.append(
+                f"{chain_id} items {numbers} are one connected rail journey but have different project assignments; "
+                "update all legs together or rerun Stage 2 if the chain itself is wrong"
+            )
+
+        expected_positions = list(range(1, len(chain_units) + 1))
+        actual_positions = [integer_or_zero(unit.get("journey_chain_position")) for unit in chain_units]
+        if actual_positions != expected_positions:
+            errors.append(f"{chain_id} has stale or duplicate leg positions; rerun Stage 2")
+
+        declared_lengths = {
+            integer_or_zero(unit.get("journey_chain_length"))
+            for unit in chain_units
+        }
+        if declared_lengths != {len(chain_units)}:
+            errors.append(
+                f"{chain_id} has stale chain length metadata, usually because a leg was dropped; rerun Stage 2"
+            )
+
+        active_unit_ids = [clean(unit.get("unit_id")) for unit in chain_units]
+        declared_member_lists = {
+            tuple(clean(unit_id) for unit_id in (unit.get("journey_chain_unit_ids") or []))
+            for unit in chain_units
+        }
+        if declared_member_lists != {tuple(active_unit_ids)}:
+            errors.append(
+                f"{chain_id} has stale chain member metadata, usually because a leg was dropped; rerun Stage 2"
+            )
+
+        current_route = rail_chain_route(chain_units)
+        declared_routes = {clean(unit.get("journey_chain_route")) for unit in chain_units}
+        if not current_route or declared_routes != {current_route}:
+            errors.append(f"{chain_id} has stale whole-journey route metadata; rerun Stage 2")
+
+        for first, second in zip(chain_units, chain_units[1:]):
+            _, first_destination = route_endpoints(first)
+            second_origin, _ = route_endpoints(second)
+            if not rail_stations_connect(first_destination, second_origin):
+                errors.append(
+                    f"{chain_id} is no longer continuous at {first_destination or '?'} -> {second_origin or '?'}; "
+                    "a route correction invalidated the chain, so rerun Stage 2"
+                )
+    return errors
+
+
+def rail_chain_summaries(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    summaries: list[dict[str, Any]] = []
+    for chain_id, chain_units in rail_chain_groups(units).items():
+        first = chain_units[0]
+        summaries.append({
+            "journey_chain_id": chain_id,
+            "route": clean(first.get("journey_chain_route")),
+            "unit_ids": [clean(unit.get("unit_id")) for unit in chain_units],
+            "user_nos": [unit.get("user_no", "") for unit in chain_units],
+            "project_context_id": clean(first.get("project_context_id")),
+            "client_name": clean(first.get("client_name")),
+            "client_charge_code": clean(first.get("client_charge_code")),
+            "confidence": clean(first.get("journey_chain_confidence")),
+            "assignment_rule": clean(first.get("journey_chain_assignment_rule")),
+            "needs_confirmation": any(unit.get("journey_chain_needs_confirmation") for unit in chain_units),
+        })
+    return summaries
+
+
 def assignment_matches_context(unit: dict[str, Any], ctx: dict[str, Any]) -> bool:
     if clean(unit.get("project_context_id")) and clean(unit.get("project_context_id")) == clean(ctx.get("context_id")):
         return True
@@ -625,6 +891,9 @@ def travel_destination_context(unit: dict[str, Any], contexts: list[dict[str, An
         if date_in_context(unit.get("expense_date", ""), ctx)
         and clean(ctx.get("city"))
         and clean(ctx.get("city")) in destination
+        # Admin is not a project you travel to; never treat it as a destination
+        # match (consistent with allocate_expenses.non_admin_contexts).
+        and clean(ctx.get("client_charge_code")).upper() != ADMIN_CODE
     ]
     context_ids = {clean(ctx.get("context_id")) for ctx in candidates}
     if len(context_ids) == 1:
@@ -632,9 +901,81 @@ def travel_destination_context(unit: dict[str, Any], contexts: list[dict[str, An
     return None
 
 
+def expense_hint_reconciliation_errors(allocation: dict[str, Any]) -> list[str]:
+    contexts_have_hints = any(
+        context.get(field)
+        for context in allocation.get("project_contexts", [])
+        for field in ("meal_hints", "expense_hints")
+    )
+    if "expense_hint_reconciliation" not in allocation:
+        if contexts_have_hints:
+            return [
+                "User expense hints exist but the reverse reconciliation ledger is missing; rerun Stage 2."
+            ]
+        return []
+    records = allocation.get("expense_hint_reconciliation")
+    if not isinstance(records, list):
+        return ["User expense hint reconciliation must be a list; rerun Stage 2."]
+
+    units_by_id = {
+        clean(unit.get("unit_id")): unit
+        for unit in allocation.get("allocation_units", [])
+        if clean(unit.get("unit_id"))
+    }
+    errors: list[str] = []
+    for record in records:
+        hint_id = clean(record.get("hint_id")) or "<unknown hint>"
+        resolution_status = clean(record.get("resolution_status"))
+        match_status = clean(record.get("match_status"))
+        if resolution_status not in {"not_required", "open", "pending_evidence", "resolved"}:
+            errors.append(
+                f"User expense record {hint_id} has invalid resolution status {resolution_status!r}; rerun Stage 2."
+            )
+            continue
+        if resolution_status == "open":
+            errors.append(
+                f"User expense record {hint_id} ({record.get('summary', '')}) has no unique invoice match or explicit resolution."
+            )
+            continue
+        if resolution_status == "pending_evidence":
+            errors.append(
+                f"User expense record {hint_id} ({record.get('summary', '')}) is still waiting for an invoice; "
+                "supply the evidence or explicitly mark the record not reimbursed."
+            )
+            continue
+        if resolution_status == "resolved":
+            action = clean(record.get("resolution_action"))
+            if action not in {"matched_existing", "covered_by_invoice", "not_reimbursed"}:
+                errors.append(
+                    f"User expense record {hint_id} has no valid structured resolution action; resolve it again in Stage 2."
+                )
+            if not clean(record.get("resolution_answer")):
+                errors.append(f"User expense record {hint_id} was closed without an explicit resolution answer.")
+        if resolution_status == "not_required" and match_status != "matched":
+            errors.append(
+                f"User expense record {hint_id} skips explicit resolution without a unique matched unit."
+            )
+        if match_status in {"matched", "covered"}:
+            matched_ids = [clean(value) for value in record.get("matched_unit_ids", []) if clean(value)]
+            active_matches = [
+                unit_id for unit_id in matched_ids
+                if unit_id in units_by_id
+                and clean(units_by_id[unit_id].get("status")) not in {"dropped", "excluded", "non_reimbursable"}
+            ]
+            if not matched_ids or not active_matches:
+                errors.append(
+                    f"User expense record {hint_id} points only to a missing/dropped expense unit; resolve it again."
+                )
+    return errors
+
+
 def require_ready(allocation: dict[str, Any], allow_unconfirmed: bool) -> list[str]:
     errors: list[str] = []
     contexts = allocation.get("project_contexts", [])
+    errors.extend(rail_chain_ready_errors(allocation.get("allocation_units", [])))
+    hint_errors = expense_hint_reconciliation_errors(allocation)
+    if hint_errors and not allow_unconfirmed:
+        errors.extend(hint_errors)
     open_questions = [q for q in allocation.get("questions", []) if q.get("status", "open") == "open"]
     if open_questions and not allow_unconfirmed:
         errors.append(f"{len(open_questions)} open allocation question(s) remain.")
@@ -660,11 +1001,11 @@ def require_ready(allocation: dict[str, Any], allow_unconfirmed: bool) -> list[s
             errors.append(f"{unit.get('unit_id')} has a provisional date but is not an other expense.")
         for accounting_error in mobile_accounting_errors(unit):
             errors.append(f"{unit.get('unit_id')} accounting conflict: {accounting_error}.")
-        for note_error in note_placeholder_errors(unit):
+        for note_error in stage3_note_errors(unit):
             errors.append(f"{unit.get('unit_id')} note conflict: {note_error}.")
         for rule_error in stage3_rule_errors(unit):
             errors.append(f"{unit.get('unit_id')} stage-3 rule conflict: {rule_error}.")
-        destination_ctx = travel_destination_context(unit, contexts)
+        destination_ctx = None if clean(unit.get("journey_chain_id")) else travel_destination_context(unit, contexts)
         if destination_ctx and not assignment_matches_context(unit, destination_ctx):
             errors.append(
                 f"{unit.get('unit_id')} travel route destination points to "
@@ -708,14 +1049,110 @@ def included_units(allocation: dict[str, Any]) -> list[dict[str, Any]]:
     return out
 
 
+# Neutral fallback label for a supporting document whose type the user left unset.
+SUPPORT_DOC_DEFAULT_TYPE = "支持文档"  # 支持文档
+
+
+def _resolve_path(value: str) -> str:
+    value = clean(value)
+    if not value:
+        return ""
+    try:
+        return str(Path(value).resolve())
+    except OSError:
+        return value
+
+
+def _unit_invoice_doc_ids(units: list[dict[str, Any]]) -> set[str]:
+    """Document ids that a supporting document may legitimately name as its invoice."""
+    ids: set[str] = set()
+    for unit in units:
+        for field in ("supporting_invoice_document_id", "source_document_id"):
+            value = clean(unit.get(field))
+            if value:
+                ids.add(value)
+    return ids
+
+
+def _substitute_approval_sources(units: list[dict[str, Any]]) -> set[str]:
+    """Resolved paths already packaged via the substitute-invoice approval_file path."""
+    out: set[str] = set()
+    for unit in units:
+        if unit.get("is_substitute_invoice"):
+            resolved = _resolve_path(unit.get("approval_file", ""))
+            if resolved:
+                out.add(resolved)
+    return out
+
+
+def collect_support_documents(
+    extraction: dict[str, Any], units: list[dict[str, Any]]
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]]]:
+    """Split standalone supporting documents into mounted vs. orphan.
+
+    A supporting document is *mounted* when it names, via ``supports_document_id``,
+    an invoice that survives into an included expense unit — it will be packaged
+    under that invoice's proof number. A substitute-invoice approval screenshot is
+    already carried through the substitute unit's ``approval_file`` and is skipped
+    here to avoid double packaging. Everything else is an *orphan*: evidence the
+    user kept but did not tie to any invoice, which hard-blocks Stage 3.
+    """
+    valid_invoice_ids = _unit_invoice_doc_ids(units)
+    substitute_sources = _substitute_approval_sources(units)
+    mounted: list[dict[str, Any]] = []
+    orphans: list[dict[str, Any]] = []
+    for doc in extraction.get("documents", []):
+        if doc.get("excluded_by_user"):
+            continue
+        if doc.get("document_role") != "supporting_document":
+            continue
+        source = clean(doc.get("source_file"))
+        if source and _resolve_path(source) in substitute_sources:
+            continue
+        supports = clean(doc.get("supports_document_id"))
+        if supports and supports in valid_invoice_ids:
+            mounted.append({
+                "document_id": doc.get("document_id"),
+                "source_file": source,
+                "support_type": clean(doc.get("support_type")) or SUPPORT_DOC_DEFAULT_TYPE,
+                "supports_document_id": supports,
+            })
+        else:
+            orphans.append(doc)
+    return mounted, orphans
+
+
+def attach_support_documents_to_groups(
+    proof_groups: list[dict[str, Any]], mounted: list[dict[str, Any]]
+) -> None:
+    """Add each mounted support document to the proof group of the invoice it backs."""
+    group_by_invoice: dict[str, dict[str, Any]] = {}
+    for group in proof_groups:
+        for doc_id in group.get("source_document_ids", []):
+            group_by_invoice.setdefault(doc_id, group)
+    for item in mounted:
+        group = group_by_invoice.get(item["supports_document_id"])
+        if group is None:
+            continue  # unreachable once preflight has passed; guard defensively
+        group.setdefault("support_documents", []).append({
+            "document_id": item["document_id"],
+            "source_file": item["source_file"],
+            "support_type": item["support_type"],
+        })
+
+
 def proof_type(unit: dict[str, Any]) -> str:
     subtype = unit.get("document_subtype", "")
     source = unit.get("source_category", "")
     seller = clean(unit.get("seller_name", ""))
     source_doc = clean(unit.get("source_note", ""))
+    if subtype == "railway_e_ticket":
+        return "rail"
+    if source == "meal":
+        return "meal"
     if is_flight_ticket(unit) or source == "flight":
         return "flight"
-    if is_rail_ticket(unit) or subtype == "railway_e_ticket" or source == "rail" or "高铁" in source_doc:
+    if is_rail_ticket(unit) or source == "rail":
         return "rail"
     if source == "hotel":
         return "hotel"
@@ -725,8 +1162,6 @@ def proof_type(unit: dict[str, Any]) -> str:
         return "taxi_didi"
     if source == "taxi":
         return "taxi"
-    if source == "meal":
-        return "meal"
     if source == "mobile":
         return "mobile"
     if source == "travel":
@@ -827,6 +1262,7 @@ def make_rows(units: list[dict[str, Any]], requester: str) -> list[dict[str, Any
             "requester": requester,
             "client": normalized_client_name(unit),
             "client_charge_code": unit.get("client_charge_code", ""),
+            "project_context_id": clean(unit.get("project_context_id")),
             "expenses_nature": expense_nature(unit),
             "note": final_note(unit),
             "amount_column": amount_col,
@@ -846,9 +1282,25 @@ def make_rows(units: list[dict[str, Any]], requester: str) -> list[dict[str, Any
             "date_is_provisional": unit.get("date_is_provisional", False),
             "date_required": unit.get("date_required", False),
             "seller_name": unit.get("seller_name", ""),
+            "city": unit.get("city", ""),
             "attendees": unit.get("attendees", ""),
             "meal_context": unit.get("meal_context", ""),
-            "hotel_city": unit.get("hotel_city", ""),
+            "train_no": unit.get("train_no", ""),
+            "origin_station": unit.get("origin_station", ""),
+            "destination_station": unit.get("destination_station", ""),
+            "rail_departure_time": unit.get("rail_departure_time", ""),
+            "rail_departure_datetime": unit.get("rail_departure_datetime", ""),
+            "journey_chain_id": unit.get("journey_chain_id", ""),
+            "journey_chain_route": unit.get("journey_chain_route", ""),
+            "journey_chain_position": unit.get("journey_chain_position", ""),
+            "journey_chain_length": unit.get("journey_chain_length", ""),
+            "journey_chain_unit_ids": unit.get("journey_chain_unit_ids", []),
+            "journey_chain_confidence": unit.get("journey_chain_confidence", ""),
+            "journey_chain_assignment_rule": unit.get("journey_chain_assignment_rule", ""),
+            "journey_chain_match_reason": unit.get("journey_chain_match_reason", ""),
+            "journey_chain_project_context_id": unit.get("journey_chain_project_context_id", ""),
+            "journey_chain_needs_confirmation": bool(unit.get("journey_chain_needs_confirmation")),
+            "hotel_city": unit.get("hotel_city") or unit.get("city", ""),
             "hotel_city_tier": unit.get("hotel_city_tier", ""),
             "hotel_nights": unit.get("hotel_nights", ""),
             "check_in_date": unit.get("check_in_date", ""),
@@ -871,29 +1323,97 @@ def make_rows(units: list[dict[str, Any]], requester: str) -> list[dict[str, Any
 
 
 def meal_cap_policy(row: dict[str, Any]) -> dict[str, Any] | None:
-    if row.get("source_category") != "meal":
+    policy, _error = classify_meal_policy(row)
+    return policy
+
+
+def _context_meal_standard(
+    contexts: list[dict[str, Any]], context_id: str, normalized_date: str
+) -> dict[str, Any] | None:
+    """One-off daily meal cap the user declared for this context on this date.
+
+    Matches strictly on context_id + date so a same-date expense in another
+    context is never captured by an event standard.
+    """
+    if not context_id or not normalized_date:
         return None
-    note = clean(row.get("note"))
-    meal_context = clean(row.get("meal_context"))
-    is_trip_meal = (
-        row.get("amount_column") == "travel"
-        or note.startswith(C["trip_meal"])
-        or meal_context in {"travel", "business_trip", "station_airport"}
-    )
-    if is_trip_meal:
-        return {
-            "policy": "business_trip_meal",
-            "policy_name": C["business_trip_meal_policy"],
-            "cap": BUSINESS_TRIP_MEAL_DAILY_CAP,
-        }
-    is_local_overtime_meal = meal_context == "overtime" or note.startswith(C["overtime_meal"])
-    if is_local_overtime_meal:
-        return {
-            "policy": "local_overtime_meal",
-            "policy_name": C["local_overtime_meal_policy"],
-            "cap": LOCAL_OVERTIME_MEAL_DAILY_CAP,
-        }
+    for ctx in contexts:
+        if not isinstance(ctx, dict) or clean(ctx.get("context_id")) != context_id:
+            continue
+        for standard in ctx.get("meal_standards", []) or []:
+            if not isinstance(standard, dict):
+                continue
+            if date_yyyymmdd(clean(standard.get("date"))) != normalized_date:
+                continue
+            cap = clean(standard.get("daily_cap"))
+            if not cap:
+                return None
+            return {
+                "context_id": context_id,
+                "cap": cap,
+                "label": clean(standard.get("label")) or "事件餐标",
+                "basis": clean(standard.get("basis")) or "用户声明",
+            }
+        return None
     return None
+
+
+def annotate_event_meal_standards(
+    rows: list[dict[str, Any]], contexts: list[dict[str, Any]]
+) -> None:
+    """Stamp user-declared event daily caps onto meal rows before classification.
+
+    Records the effective cap plus its direction against the generic policy that
+    would otherwise apply, so the deterministic writer and the Gate Challenger
+    both see an auditable provenance for the override.
+    """
+    contexts = contexts or []
+    for row in rows:
+        for field in ("event_meal_cap", "event_meal_label", "event_meal_context_id", "event_meal_direction"):
+            row.pop(field, None)
+        if clean(row.get("source_category")) != "meal":
+            continue
+        context_id = clean(row.get("project_context_id"))
+        normalized_date = clean(row.get("date")) or date_yyyymmdd(row.get("expense_date", ""))
+        standard = _context_meal_standard(contexts, context_id, normalized_date)
+        if not standard:
+            continue
+        # Compute direction against the generic cap that would apply without the
+        # override. classify_meal_policy still returns the generic tier here
+        # because event_meal_cap has not been stamped on the row yet.
+        generic_policy, _error = classify_meal_policy(row)
+        if generic_policy is None:
+            direction = "no_generic_baseline"
+        else:
+            event_cap = Decimal(money(standard["cap"]))
+            generic_cap = generic_policy["cap"]
+            if event_cap > generic_cap:
+                direction = "exceeds_generic"
+            elif event_cap < generic_cap:
+                direction = "conservative"
+            else:
+                direction = "equal"
+        row["event_meal_cap"] = money(standard["cap"])
+        row["event_meal_label"] = standard["label"]
+        row["event_meal_context_id"] = standard["context_id"]
+        row["event_meal_direction"] = direction
+
+
+def annotate_meal_policies(rows: list[dict[str, Any]]) -> None:
+    for row in rows:
+        if clean(row.get("source_category")) != "meal":
+            continue
+        policy, error = classify_meal_policy(row)
+        if error or not policy:
+            row["meal_cap_policy"] = "unclassified"
+            row["meal_daily_cap"] = ""
+            row["meal_policy_basis"] = []
+            row["meal_policy_error"] = error or "meal policy could not be classified"
+            continue
+        row["meal_cap_policy"] = policy["policy"]
+        row["meal_daily_cap"] = money(policy["cap"])
+        row["meal_policy_basis"] = policy["basis"]
+        row["meal_policy_error"] = ""
 
 
 def meal_item(row: dict[str, Any]) -> dict[str, Any]:
@@ -907,6 +1427,11 @@ def meal_item(row: dict[str, Any]) -> dict[str, Any]:
         "reimbursable_amount": row.get("reimbursable_amount", row.get("amount", "0.00")),
         "attendees": row.get("attendees", ""),
         "note": row.get("note", ""),
+        "amount_column": row.get("amount_column", ""),
+        "expenses_nature": row.get("expenses_nature", ""),
+        "meal_cap_policy": row.get("meal_cap_policy", ""),
+        "meal_daily_cap": row.get("meal_daily_cap", ""),
+        "meal_policy_basis": row.get("meal_policy_basis", []),
     }
 
 
@@ -972,11 +1497,26 @@ def meal_daily_cap_checks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
                 severity = "blocking"
                 requires_confirmation = True
                 suggestions = suggest_meal_adjustments(day_rows, over_by)
+        event_declared = str(policy["policy"]).startswith("event_declared")
+        event_direction = next(
+            (clean(row.get("event_meal_direction")) for row in day_rows if clean(row.get("event_meal_direction"))),
+            "",
+        )
         checks.append({
             "policy": policy["policy"],
             "policy_name": policy["policy_name"],
             "date": date_value,
             "cap": money(cap),
+            "event_declared": event_declared,
+            "event_meal_direction": event_direction,
+            "aggregation_key": "meal_cap_policy + expense_date",
+            "cross_column_aggregation": True,
+            "policy_basis": sorted({
+                basis
+                for row in day_rows
+                for basis in row.get("meal_policy_basis", [])
+            }),
+            "policy_non_triggers": list(MEAL_POLICY_NON_TRIGGERS),
             "total": money(total),
             "over_by": money(over_by) if over_by > 0 else "0.00",
             "status": status,
@@ -992,15 +1532,56 @@ def meal_daily_cap_checks(rows: list[dict[str, Any]]) -> list[dict[str, Any]]:
 
 def _meal_population_line(meal_checks: list) -> str:
     total = sum(len(day.get("items", [])) for day in meal_checks)
-    return f"(covering {total} meal item(s) across {len(meal_checks)} day(s) — items are selected by source_category=meal)"
+    return (
+        f"(covering {total} meal item(s) across {len(meal_checks)} policy/day pool(s); "
+        "source_category=meal selects the population only)"
+    )
+
+
+def meal_policy_rule() -> dict[str, Any]:
+    return {
+        "population_selector": "source_category=meal",
+        "cap_selector": "final_note/meal_context substantive purpose",
+        "business_trip_meal": {
+            "cap": money(BUSINESS_TRIP_MEAL_DAILY_CAP),
+            "signals": ["final_note starts with 出差餐费", "meal_context=business_trip/station_airport/travel"],
+        },
+        "local_overtime_meal": {
+            "cap": money(LOCAL_OVERTIME_MEAL_DAILY_CAP),
+            "signals": ["final_note starts with 加班餐费", "meal_context=overtime"],
+        },
+        "not_cap_selectors": list(MEAL_POLICY_NON_TRIGGERS),
+        "cross_column_aggregation": (
+            "Same-date rows with the same meal_cap_policy are summed together even when one is in meal "
+            "and another is in travel."
+        ),
+        "critical_invariant": (
+            "A Shanghai row may use amount_column=meal and expenses_nature=本地 while remaining "
+            "business_trip_meal with a 150/day cap. There is no generic Shanghai/local meal 60/day rule; "
+            "60/day applies only to explicit local overtime meals."
+        ),
+    }
 
 
 def print_meal_cap_check(checks: list[dict[str, Any]]) -> None:
-    print("\nMEAL DAILY CAP CHECK TO SHOW IN CHAT")
+    print("\n=== MEAL DAILY CAP CHECK TO RELAY VERBATIM ===")
+    print(
+        "POLICY INVARIANT: source_category=meal only selects meal rows. The 150/60 cap is selected only "
+        "by final_note/meal_context: 出差餐费=150/day; explicit 加班餐费=60/day."
+    )
+    print(
+        "NEVER select a cap from city, amount_column, or Expense Nature. A Shanghai row in the meal column "
+        "with Note=出差餐费 is still in the 150/day business-trip pool. There is no generic 本地餐=60 rule."
+    )
+    print(
+        "AGGREGATION: sum all rows sharing meal_cap_policy + date, including rows split across the meal and "
+        "travel columns. Do not recalculate separate pools by workbook column."
+    )
     print(_meal_population_line(checks))
-    print("Copy or summarize this check in the conversation before final submission.")
+    print("Relay this block as generated; do not independently reclassify or recompute it from workbook columns.")
     if not checks:
         print("No meal rows requiring daily cap checks found.")
+        print("=== END MEAL DAILY CAP CHECK ===")
         return
     for check in checks:
         print(
@@ -1011,7 +1592,10 @@ def print_meal_cap_check(checks: list[dict[str, Any]]) -> None:
             print(
                 f"  item {item.get('user_no') or '-'} | proof {item.get('proof_no') or '-'} | "
                 f"{item.get('source_filename') or '-'} | invoice {item['invoice_amount']} | "
-                f"reimburse {item['reimbursable_amount']} | attendees {item.get('attendees') or '-'}"
+                f"reimburse {item['reimbursable_amount']} | policy {item.get('meal_cap_policy') or '-'} "
+                f"cap {item.get('meal_daily_cap') or '-'} | column {item.get('amount_column') or '-'} | "
+                f"nature {item.get('expenses_nature') or '-'} | note {item.get('note') or '-'} | "
+                f"attendees {item.get('attendees') or '-'}"
             )
         if check["suggested_adjustments"]:
             print("  suggested adjustment to fit cap:")
@@ -1022,6 +1606,7 @@ def print_meal_cap_check(checks: list[dict[str, Any]]) -> None:
                     f"{adjustment['suggested_reimbursable_amount']} "
                     f"(reduce {adjustment['reduce_by']})"
                 )
+    print("=== END MEAL DAILY CAP CHECK ===")
 
 
 def boolish(value: Any) -> bool:
@@ -1577,6 +2162,48 @@ def build_markdown(payload: dict[str, Any], workbook: Path) -> str:
             f"| {block['project_key']} | {block['first_detail_row']}:{block['last_detail_row']} | "
             f"{block['subtotal_row']} | {block['subtotal_formula']} |"
         )
+    chains = payload.get("rail_journey_chains", [])
+    if chains:
+        lines += [
+            "",
+            "## Railway Journey Chains",
+            "",
+            "| Chain | Items | Route | Project | Code | Rule | Needs Confirmation |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for chain in chains:
+            lines.append(
+                f"| {chain.get('journey_chain_id', '')} | {', '.join(str(value) for value in chain.get('user_nos', []))} | "
+                f"{chain.get('route', '')} | {chain.get('client_name', '')} | {chain.get('client_charge_code', '')} | "
+                f"{chain.get('assignment_rule', '')} | {chain.get('needs_confirmation', False)} |"
+            )
+    hint_records = payload.get("expense_hint_reconciliation", [])
+    if hint_records:
+        lines += [
+            "",
+            "## User Expense Record Reconciliation",
+            "",
+            "| Hint | Record | Match | Resolution | Matched Items | Answer |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+        for record in hint_records:
+            lines.append(
+                f"| {record.get('hint_id', '')} | {record.get('summary', '')} | "
+                f"{record.get('match_status', '')} | {record.get('resolution_status', '')} | "
+                f"{', '.join(str(value) for value in record.get('matched_user_nos', []))} | "
+                f"{record.get('resolution_answer', '')} |"
+            )
+    meal_rule = payload.get("meal_policy_rule", {})
+    lines += [
+        "",
+        "## Meal Policy Rule",
+        "",
+        f"- Population selector: {meal_rule.get('population_selector', '')}",
+        f"- Cap selector: {meal_rule.get('cap_selector', '')}",
+        f"- Not cap selectors: {', '.join(meal_rule.get('not_cap_selectors', []))}",
+        f"- Invariant: {meal_rule.get('critical_invariant', '')}",
+        f"- Aggregation: {meal_rule.get('cross_column_aggregation', '')}",
+    ]
     lines += [
         "",
         "## Meal Daily Cap Checks",
@@ -1639,6 +2266,10 @@ def print_stage3_review_summary(payload: dict[str, Any]) -> None:
     advisory = advisory_checks(payload)
     print("\nSTAGE 3 REVIEW SUMMARY TO SHOW IN CHAT")
     print(
+        "AUTHORITATIVE MEAL RESULT: use the generated MEAL DAILY CAP CHECK block and per-row "
+        "meal_cap_policy/meal_daily_cap fields; never reclassify from city, amount column, or Expense Nature."
+    )
+    print(
         "meal_daily_caps="
         f"{payload['checks'][0]['status']} "
         f"({payload['checks'][0]['days_requiring_confirmation']} requiring confirmation, "
@@ -1672,7 +2303,10 @@ def print_stage3_review_summary(payload: dict[str, Any]) -> None:
                 f"over {check.get('over_by')} / {check.get('status')}"
             )
         return
-    print("OK: No meal or hotel cap issue requiring applicant attention.")
+    print(
+        "OK: No meal or hotel cap issue requiring applicant attention. This means zero blocking/advisory "
+        "issues, not zero checked meal rows; retain the generated policy classification and totals."
+    )
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1694,6 +2328,15 @@ def main(argv: list[str] | None = None) -> int:
     args = parser.parse_args(argv)
 
     allocation_path = Path(args.allocation)
+    process_dir = Path(args.process_dir)
+    if process_dir.resolve() != allocation_path.parent.resolve():
+        print(
+            "ERROR: --process-dir must be the canonical directory containing --allocation. "
+            "A different process folder could hide the current independent-review gate or mix batches. "
+            f"Expected: {allocation_path.parent.resolve()}",
+            file=sys.stderr,
+        )
+        return stage3_blocked_result()
     template_path = resolve_template_arg(args.template)
     if template_path and not template_path.exists():
         print(
@@ -1701,7 +2344,7 @@ def main(argv: list[str] | None = None) -> int:
             "Pass an existing --template path or omit --template to generate the workbook directly.",
             file=sys.stderr,
         )
-        return 2
+        return stage3_blocked_result()
     layout_path = resolve_layout_arg(args.layout)
     layout = None
     if not template_path or args.layout:
@@ -1709,11 +2352,37 @@ def main(argv: list[str] | None = None) -> int:
             layout = load_layout(layout_path)
         except (OSError, ValueError, tomllib.TOMLDecodeError) as exc:
             print(f"ERROR: Workbook layout could not be loaded from {layout_path}: {exc}", file=sys.stderr)
-            return 2
+            return stage3_blocked_result()
 
     allocation = load_json(allocation_path)
     integrity.require_valid(allocation, allocation_path)
+    allocation_fingerprint = str((allocation.get("integrity") or {}).get("fingerprint", ""))
+    for unit in allocation.get("allocation_units", []):
+        if unit.get("is_substitute_invoice") and unit.get("approval_file"):
+            evidence_paths.normalize_approval_file(unit, process_dir)
     errors = require_ready(allocation, args.allow_unconfirmed)
+    expected_context_sha = str(allocation.get("source_project_context_sha256", "")).strip()
+    recorded_context = str(allocation.get("source_project_context_file", "")).strip()
+    if expected_context_sha:
+        context_path = Path(recorded_context).expanduser() if recorded_context else Path()
+        if recorded_context and not context_path.is_absolute():
+            context_path = allocation_path.parent.parent / context_path
+        if not recorded_context or not context_path.is_file():
+            errors.append(
+                "The project context used by allocation is missing. Restore/rewrite the canonical "
+                "project-context.json and rerun Stage 2 plus Composer before writing Excel."
+            )
+        else:
+            try:
+                actual_context_sha = hashlib.sha256(context_path.read_bytes()).hexdigest()
+            except OSError as exc:
+                errors.append(f"The project context cannot be read for provenance validation: {exc}")
+            else:
+                if actual_context_sha != expected_context_sha:
+                    errors.append(
+                        "Project context changed after allocation was created. Rerun Stage 2, recompose "
+                        "answers, and apply them before writing Excel."
+                    )
     allocation_text_issues = text_safety.find_suspect_text(
         {
             "allocation_units": text_safety.pick_fields(
@@ -1724,8 +2393,9 @@ def main(argv: list[str] | None = None) -> int:
     )
     if allocation_text_issues:
         errors.append(
-            "Allocation contains suspect encoding damage in user-visible fields. Regenerate the answers file "
-            "from UTF-8 input and apply it through the updater: " + "; ".join(allocation_text_issues)
+            "Allocation contains suspect encoding damage in user-visible fields. Correct the UTF-8 "
+            "allocation_decisions.v1 input, rerun Composer, and apply it through the updater: "
+            + "; ".join(allocation_text_issues)
         )
     extraction_path = allocation_path.parent / "invoice-extraction.json"
     if not extraction_path.exists():
@@ -1741,12 +2411,12 @@ def main(argv: list[str] | None = None) -> int:
         if not allocated_fp:
             errors.append(
                 "Allocation has no source_extraction_fingerprint and cannot prove which extraction generation "
-                "it used. Re-run allocate_expenses.py and regenerate the answers template."
+                "it used. Re-run allocate_expenses.py and recompose decisions."
             )
         elif allocated_fp != extraction_fp:
             errors.append(
-                "Extraction changed after allocation was created. Re-run allocate_expenses.py, regenerate the "
-                "answers template, and reapply the user's answers before writing Excel."
+                "Extraction changed after allocation was created. Re-run allocate_expenses.py, recompose "
+                "decisions, and reapply the user's answers before writing Excel."
             )
         unresolved_inputs = [
             item for item in extraction.get("unresolved_input_files", [])
@@ -1758,38 +2428,117 @@ def main(argv: list[str] | None = None) -> int:
                 "Unsupported input files still need a recorded user decision: " + names + ". "
                 "Resolve them through apply_extraction_corrections.py, then re-run Stage 1 and Stage 2."
             )
+        _, support_orphans = collect_support_documents(extraction, included_units(allocation))
+        if support_orphans:
+            names = ", ".join(
+                f"{doc.get('document_id')} ({Path(str(doc.get('source_file', ''))).name})"
+                for doc in support_orphans
+            )
+            errors.append(
+                "These supporting documents are not tied to any invoice and cannot be packaged: "
+                + names + ". For each, record the invoice it backs (supports_document_id) and an "
+                "optional support_type via apply_extraction_corrections.py, or exclude it with the "
+                "user's reason, then re-run Stage 1 and Stage 2."
+            )
+    audit_roles = (("mirror_warden", "Otako - Mirror Warden"), ("gate_challenger", "Kaede - Gate Challenger"))
+    audit_states = {}
+    for _role, _display in audit_roles:
+        _st = subagent_protocol.audit_state(_role, process_dir, allocation, allocation_path, extraction_path)
+        audit_states[_role] = _st
+        if (
+            _st.get("current")
+            and _st.get("outcome") == "block"
+            and int(_st.get("blocking_count", 0) or 0) > 0
+        ):
+            for finding in _st.get("findings", []):
+                if finding.get("severity") == "blocking":
+                    errors.append(
+                        f"{_display} audit blocker "
+                        f"[{finding.get('code', finding.get('finding_id', '?'))}]: "
+                        f"{finding.get('message', '')} Recommended action: "
+                        f"{finding.get('recommended_action', '')}"
+                    )
+        if _st.get("current"):
+            print(
+                f"{_display} AUDIT: "
+                f"{_st.get('outcome')} / "
+                f"{_st.get('blocking_count', 0)} blocking / "
+                f"{_st.get('advisory_count', 0)} advisory"
+            )
+        else:
+            print(
+                f"{_display} AUDIT: "
+                f"{_st.get('status', 'missing')} - checkpoint unavailable, opted out, or stale; "
+                "continuing with deterministic Stage 3 preflight only."
+            )
     print_stage3_preflight_summary(allocation, errors)
     if errors:
         for error in errors:
             print(f"ERROR: {error}", file=sys.stderr)
-        return 2
+        return stage3_blocked_result(
+            allocation_fingerprint=allocation_fingerprint,
+            blocking_errors=len(errors),
+        )
 
     units = included_units(allocation)
     proof_groups = assign_proof_numbers(units)
+    mounted_support, _ = collect_support_documents(extraction, units)
+    attach_support_documents_to_groups(proof_groups, mounted_support)
     rows = make_rows(units, args.requester)
     rows.sort(key=lambda r: (r["client"], r["client_charge_code"], ROW_ORDER.get(r["row_order_type"], 99), r["expense_date"], r["proof_no"]))
+    annotate_event_meal_standards(rows, allocation.get("project_contexts", []))
+    annotate_meal_policies(rows)
     row_text_issues = text_safety.find_suspect_text(
         text_safety.pick_fields(rows, WORKBOOK_ROW_TEXT_FIELDS),
         path="final_rows.rows",
     )
     if row_text_issues:
         print("ERROR: Refusing to write a workbook with suspect encoding damage: " + "; ".join(row_text_issues), file=sys.stderr)
-        return 2
+        return stage3_blocked_result(
+            allocation_fingerprint=allocation_fingerprint,
+            blocking_errors=len(row_text_issues),
+        )
     meal_checks = meal_daily_cap_checks(rows)
     hotel_checks = hotel_cap_checks(rows)
-    project_blocks, summary_rows = write_workbook(Path(args.output), rows, template_path, layout)
-    saved_workbook_text_issues = workbook_text_issues(Path(args.output))
+    workbook_path = Path(args.output)
+    final_rows_path = process_dir / "final-expense-rows.json"
+    final_rows_markdown_path = process_dir / "final-expense-rows.md"
+    staging_token = uuid4().hex
+    staged_workbook_path = stage3_temporary_path(workbook_path, staging_token)
+    staged_final_rows_path = stage3_temporary_path(final_rows_path, staging_token)
+    staged_markdown_path = stage3_temporary_path(final_rows_markdown_path, staging_token)
+    staged_paths = [staged_workbook_path, staged_final_rows_path, staged_markdown_path]
+    cleanup_paths(staged_paths)
+    try:
+        project_blocks, summary_rows = write_workbook(
+            staged_workbook_path,
+            rows,
+            template_path,
+            layout,
+        )
+        saved_workbook_text_issues = workbook_text_issues(staged_workbook_path)
+    except Exception as exc:
+        cleanup_paths(staged_paths)
+        print(f"ERROR: Stage 3 workbook staging failed: {exc}", file=sys.stderr)
+        return stage3_blocked_result(
+            allocation_fingerprint=allocation_fingerprint,
+            blocking_errors=1,
+        )
     if saved_workbook_text_issues:
+        cleanup_paths(staged_paths)
         print("ERROR: Workbook text scan found suspect encoding damage. The workbook is not a deliverable; "
               "fix the UTF-8 answers input and re-run Stage 3. Findings: "
               + "; ".join(saved_workbook_text_issues), file=sys.stderr)
-        return 2
+        return stage3_blocked_result(
+            allocation_fingerprint=allocation_fingerprint,
+            blocking_errors=len(saved_workbook_text_issues),
+        )
     meal_check_status = aggregate_check_status(meal_checks)
     hotel_check_status = aggregate_check_status(hotel_checks)
 
     payload = {
         "schema_version": "final_expense_rows.v1",
-        "generated_at": datetime.now().replace(microsecond=0).isoformat(),
+        "generated_at": time_utils.iso_now(),
         "requester": args.requester,
         "source_allocation_file": str(allocation_path),
         "workbook_source": "template" if template_path else "generated",
@@ -1798,10 +2547,28 @@ def main(argv: list[str] | None = None) -> int:
         "workbook": str(Path(args.output)),
         "proof_groups": [{k: v for k, v in group.items() if k != "units"} for group in proof_groups],
         "rows": rows,
+        "rail_journey_chains": rail_chain_summaries(units),
+        "expense_hint_reconciliation": allocation.get("expense_hint_reconciliation", []),
+        "unresolved_expense_hint_count": sum(
+            1
+            for record in allocation.get("expense_hint_reconciliation", [])
+            if record.get("resolution_status") not in {"not_required", "resolved"}
+        ),
         "project_blocks": project_blocks,
         "summary_rows": summary_rows,
+        "meal_policy_rule": meal_policy_rule(),
         "meal_daily_cap_checks": meal_checks,
         "hotel_cap_checks": hotel_checks,
+        "subagent_audit": {
+            "result_fingerprint": "|".join(
+                f"{_role}:{audit_states[_role].get('result_fingerprint', '')}"
+                for _role, _ in audit_roles
+            ),
+            "roles": {
+                _role: subagent_protocol.review_record(audit_states[_role])
+                for _role, _ in audit_roles
+            },
+        },
         "checks": [
             {
                 "name": "meal_daily_caps",
@@ -1809,6 +2576,7 @@ def main(argv: list[str] | None = None) -> int:
                     "business_trip_meal": money(BUSINESS_TRIP_MEAL_DAILY_CAP),
                     "local_overtime_meal": money(LOCAL_OVERTIME_MEAL_DAILY_CAP),
                 },
+                "classification_rule": meal_policy_rule(),
                 "status": meal_check_status,
                 "days_checked": len(meal_checks),
                 "days_with_advisory": sum(1 for check in meal_checks if check.get("severity") == "advisory"),
@@ -1837,15 +2605,45 @@ def main(argv: list[str] | None = None) -> int:
     payload["open_allocation_questions"] = len([
         q for q in allocation.get("questions", []) if q.get("status", "open") == "open"
     ])
-    workbook_path = Path(args.output)
-    payload["workbook_sha256"] = hashlib.sha256(workbook_path.read_bytes()).hexdigest()
-    process_dir = Path(args.process_dir)
+    payload["workbook_sha256"] = hashlib.sha256(staged_workbook_path.read_bytes()).hexdigest()
     integrity.stamp(payload, "write_reimbursement_template.py")
-    write_json(process_dir / "final-expense-rows.json", payload)
-    (process_dir / "final-expense-rows.md").write_text(build_markdown(payload, Path(args.output)), encoding="utf-8")
+    try:
+        write_json(staged_final_rows_path, payload)
+        staged_markdown_path.write_text(
+            build_markdown(payload, workbook_path),
+            encoding="utf-8",
+        )
+        staged_payload = load_json(staged_final_rows_path)
+        staged_ok, staged_reason = integrity.check(staged_payload)
+        if not staged_ok:
+            raise ValueError(f"staged final rows failed integrity validation: {staged_reason}")
+        if staged_payload.get("workbook_sha256") != hashlib.sha256(staged_workbook_path.read_bytes()).hexdigest():
+            raise ValueError("staged final rows workbook hash changed before promotion")
+        promote_stage3_artifacts([
+            (staged_workbook_path, workbook_path),
+            (staged_final_rows_path, final_rows_path),
+            (staged_markdown_path, final_rows_markdown_path),
+        ])
+    except Stage3PromotionError as exc:
+        cleanup_paths(staged_paths)
+        print(f"ERROR: {exc}", file=sys.stderr)
+        return stage3_blocked_result(
+            allocation_fingerprint=allocation_fingerprint,
+            blocking_errors=1,
+            previous_artifacts_preserved=exc.previous_artifacts_preserved,
+        )
+    except Exception as exc:
+        cleanup_paths(staged_paths)
+        print(f"ERROR: Stage 3 artifact staging failed: {exc}", file=sys.stderr)
+        return stage3_blocked_result(
+            allocation_fingerprint=allocation_fingerprint,
+            blocking_errors=1,
+        )
+    finally:
+        cleanup_paths(staged_paths)
     print(f"Wrote {args.output}")
-    print(f"Wrote {process_dir / 'final-expense-rows.json'}")
-    print(f"Wrote {process_dir / 'final-expense-rows.md'}")
+    print(f"Wrote {final_rows_path}")
+    print(f"Wrote {final_rows_markdown_path}")
     print_meal_cap_check(meal_checks)
     print_hotel_cap_check(hotel_checks)
     print_stage3_review_summary(payload)
@@ -1854,9 +2652,26 @@ def main(argv: list[str] | None = None) -> int:
         print("NEXT: relay the STAGE 3 REVIEW SUMMARY above to the user VERBATIM, resolve the blocking "
               "checks via the answers updater, then RE-RUN this script. Packaging will refuse until "
               "blocking checks are zero.")
-        return 3
+        print_stage3_result(
+            "review_required",
+            exit_code=ExitCode.REVIEW_REQUIRED,
+            allocation_fingerprint=allocation_fingerprint,
+            blocking_policy_checks=payload["blocking_policy_checks"],
+            artifacts_written=True,
+            previous_artifacts_preserved=False,
+            package_allowed=False,
+        )
+        return ExitCode.REVIEW_REQUIRED
     print("NEXT: run scripts/package_reimbursement_files.py to build the final submission package.")
-    return 0
+    print_stage3_result(
+        "ok",
+        exit_code=ExitCode.SUCCESS,
+        allocation_fingerprint=allocation_fingerprint,
+        artifacts_written=True,
+        previous_artifacts_preserved=False,
+        package_allowed=True,
+    )
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

@@ -1,5 +1,5 @@
 #!/usr/bin/env python3
-"""Build a canonical allocation-answers template from stage-2 allocation JSON."""
+"""Build a read-only schema preview from stage-2 allocation JSON."""
 
 from __future__ import annotations
 
@@ -7,9 +7,15 @@ import argparse
 import json
 import integrity
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Any
+
+from io_utils import configure_utf8_stdio as configure_stdio
+from json_io import read_json_object as load_json
+from text_utils import strip_scalar as clean
+import time_utils
+import value_utils
+from exit_codes import ExitCode
 
 
 OPEN_QUESTION_STATUSES = {"open", "needs_confirmation", "draft"}
@@ -27,26 +33,9 @@ RELIABLE_DATE_SOURCES = {
 }
 
 
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(errors="replace")
-            except Exception:
-                pass
-
-
-def load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
-
-
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def clean(value: Any) -> str:
-    return "" if value is None else str(value).strip()
 
 
 def as_bool(value: Any) -> bool:
@@ -171,10 +160,11 @@ def build_unit_update(unit: dict[str, Any], question_ids: list[str]) -> dict[str
 
     # final_template_column is intentionally NOT offered: the visible amount
     # column is computed from source_category + city (Shanghai meal -> meal
-    # column, out-of-town trip meal -> travel column, etc.) and re-normalized
+    # column, non-Shanghai meal -> travel column, etc.) and re-normalized
     # on every apply. Offering it here invited models to set it and then
     # watch normalize silently override their value. To change a column, fix
-    # source_category or city instead.
+    # source_category or city instead. Meal cap policy is a separate axis and
+    # comes only from final_note/meal_context, never from this column.
     if category == "hotel":
         update["hotel_nights"] = value_or_placeholder(unit.get("hotel_nights"), "<nights>")
         update["check_in_date"] = value_or_placeholder(unit.get("check_in_date"), "<YYYY-MM-DD>")
@@ -226,7 +216,7 @@ def review_context(unit: dict[str, Any], question_ids: list[str]) -> dict[str, A
         "seller_or_provider": clean(unit.get("seller_name") or unit.get("line_item_name")),
         "date": clean(unit.get("expense_date") or unit.get("issue_date")),
         "date_source": clean(unit.get("date_source")),
-        "amount": clean(unit.get("amount") or unit.get("invoice_amount")),
+        "amount": clean(value_utils.first_nonblank(unit.get("amount"), unit.get("invoice_amount"))),
         "category": clean(unit.get("source_category")),
         "final_template_column": clean(unit.get("final_template_column")),
         "suggested_client": clean(unit.get("client_name")),
@@ -240,14 +230,14 @@ def build_template(payload: dict[str, Any], allocation_path: Path, include_advis
     _questions, question_ids_by_unit = question_maps(payload, include_advisory)
     units = selected_units(payload, question_ids_by_unit)
     return {
-        "schema_version": "allocation_answers.v1",
-        "generated_at": datetime.now().replace(microsecond=0).isoformat(),
+        "schema_version": "allocation_answers_diagnostic.v1",
+        "diagnostic_only": True,
+        "generated_at": time_utils.iso_now(),
         "source_allocation_file": str(allocation_path),
-        "fill_instructions": [
-            "Fill this canonical template from the user's natural-language answers.",
-            "Replace every <...> placeholder before running apply_allocation_answers.py.",
-            "Keep unit_updates as the only place for per-item changes; do not invent answers[].allocations or patch expense-allocation.json directly.",
-            "Use unit_no in generated answers. Do not expose internal unit_id values to the applicant in chat.",
+        "inspection_instructions": [
+            "This file is diagnostic only and is intentionally rejected by the updater.",
+            "Do not fill, rename, or submit it as allocation-answers.json.",
+            "Create allocation_decisions.v1 and run compose_answers.py for every real update.",
         ],
         "review_context": [
             review_context(unit, question_ids_by_unit.get(clean(unit.get("unit_id")), []))
@@ -264,9 +254,9 @@ def build_template(payload: dict[str, Any], allocation_path: Path, include_advis
 
 def main(argv: list[str] | None = None) -> int:
     configure_stdio()
-    parser = argparse.ArgumentParser(description="Build a canonical allocation answers template.")
+    parser = argparse.ArgumentParser(description="Build a read-only allocation answers schema preview.")
     parser.add_argument("--allocation", required=True, help="Path to process/expense-allocation.json.")
-    parser.add_argument("--output", required=True, help="Path to write allocation-answers.template.json.")
+    parser.add_argument("--output", required=True, help="Path to write the diagnostic schema preview.")
     parser.add_argument("--include-advisory", action="store_true", help="Also include advisory questions.")
     args = parser.parse_args(argv)
 
@@ -278,12 +268,12 @@ def main(argv: list[str] | None = None) -> int:
     output_path = Path(args.output)
     write_json(output_path, template)
     print(f"Wrote {output_path}")
-    print(f"Template unit updates: {len(template['unit_updates'])}")
+    print(f"Diagnostic unit previews: {len(template['unit_updates'])}")
     if not template["unit_updates"]:
-        print("No open or draft allocation units need an answers template.")
+        print("No open or draft allocation units need inspection.")
     else:
-        print("Fill placeholders, save as process/allocation-answers.json, then run apply_allocation_answers.py.")
-    return 0
+        print("DIAGNOSTIC ONLY: do not fill or apply this file. Use allocation_decisions.v1 + Composer.")
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

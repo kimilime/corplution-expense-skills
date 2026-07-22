@@ -4,6 +4,21 @@ Use this reference after stage 1 has produced `process/invoice-extraction.json`.
 
 Do not fill the Excel reimbursement template in this stage. Produce allocation process files for the next stage.
 
+## Contents
+
+- [Inputs](#inputs)
+- [User Project Context](#user-project-context)
+- [Project Context Model](#project-context-model)
+- [Allocation Units](#allocation-units)
+- [Matching Method](#matching-method)
+- [Expense-Type Rules](#expense-type-rules)
+- [Final Note Format](#final-note-format)
+- [Interaction Loop](#interaction-loop)
+- [Applying User Answers](#applying-user-answers)
+- [Composer Field Quick Reference](#composer-field-quick-reference)
+- [JSON Output](#json-output)
+- [Completion Criteria](#completion-criteria)
+
 ## Inputs
 
 Required:
@@ -35,7 +50,8 @@ Ask the user to provide, in natural language:
   - actual meal date
   - client/project
   - attendees or dining counterparties
-  - whether it was local Shanghai meal or out-of-town trip meal
+  - substantive purpose: business-trip meal (including a Shanghai meal before/during travel) or explicit local overtime meal
+  - formal restaurant/invoice city, which separately determines the workbook column and `Expense Nature`
   - any "with X", "和X一起", "同事X", or similar companion/counterparty note, even if the meal is under the daily cap
 - Substitute invoice notes:
   - which invoice/item is a substitute invoice
@@ -48,22 +64,31 @@ Ask missing information in the current chat, not by asking the user to open proc
 
 ## Project Context Model
 
-Represent user context as `project_contexts`:
+Write the agent-created `project-context.json` in exactly the `project_context.v1` root shape below. The user supplies business facts in natural language; the agent writes this JSON. Do not use aliases such as root `projects`, `charge_code`, or free-form `notes`.
 
 ```json
 {
-  "context_id": "CTX-001",
-  "date_start": "YYYY-MM-DD",
-  "date_end": "YYYY-MM-DD",
-  "city": "Taiyuan",
-  "client_name": "",
-  "client_charge_code": "CORP-2026-BD",
-  "project_description": "",
-  "user_notes": "",
-  "travel_buffer_days": 1,
-  "status": "draft"
+  "schema_version": "project_context.v1",
+  "project_contexts": [
+    {
+      "context_id": "CTX-001",
+      "date_start": "<YYYY-MM-DD>",
+      "date_end": "<YYYY-MM-DD>",
+      "city": "<project city>",
+      "client_name": "<client name>",
+      "client_charge_code": "<Client Charge Code>",
+      "project_description": "",
+      "user_notes": "",
+      "travel_buffer_days": 1,
+      "status": "draft",
+      "meal_hints": [],
+      "expense_hints": []
+    }
+  ]
 }
 ```
+
+Use `assets/project-context-template.json` as the source structure. Create one context object for each distinct travel/project date window. Repeating the same Client and Code across several date windows is valid; final workbook blocks still merge by `client_name + client_charge_code`. Allocation rejects malformed, empty, placeholder-filled, or alias-based contexts before creating any expense units.
 
 Project identity is composite:
 
@@ -71,7 +96,9 @@ Project identity is composite:
 client_name + city + date_start/date_end + client_charge_code + project_description
 ```
 
-Never use `client_charge_code` alone as the project key. Multiple distinct projects may share `CORP-2026-BD` while belonging to different clients.
+Never use `client_charge_code` alone as the project key. Multiple distinct projects may share `<BD_CODE>` while belonging to different clients.
+
+> **Fiscal-year codes:** `<ADMIN_CODE>` and `<BD_CODE>` are placeholders for the current fiscal-year charge codes, defined in `assets/special-code-definitions.json` and rolled each fiscal year with `python scripts/special_codes.py set-year <year>`. Substitute the current codes; never write a literal `<...>` placeholder or hardcode a year — Stage 3 rejects any charge code containing `<`/`>`.
 
 When the user provides concrete meal or expense notes, translate them into structured hints inside the relevant project context whenever possible:
 
@@ -89,14 +116,19 @@ When the user provides concrete meal or expense notes, translate them into struc
   ],
   "expense_hints": [
     {
-      "source_category": "meal",
+      "source_category": "other",
       "date": "YYYY-MM-DD",
-      "amount": "117.00",
-      "attendees": "姚"
+      "amount": "299.00",
+      "merchant": "腾讯会议",
+      "description": "项目线上会议服务费"
     }
   ]
 }
 ```
+
+One concrete applicant record belongs in exactly one array: use `meal_hints` for meals and `expense_hints` for other categories. Never copy the same meal into both arrays. For backward compatibility, Stage 2 deduplicates a legacy `meal_hints` + `expense_hints` pair only when context, category, date, amount, and any supplied merchant evidence identify one unambiguous cross-array duplicate; conflicting merchants remain separate. It does not deduplicate two same-array records because two real expenses may share a date and amount.
+
+`高铁上点餐`、`餐车用餐`、`列车餐` 等是餐费记录，必须放入 `meal_hints`，而不是高铁票；`高铁` 在这里仅说明用餐场景。只有 `铁路电子客票`、`12306`、可核验的车次与路线等实际票据证据，才把记录视为铁路出行。若申请人已明确是在出差途中用餐，可同时写 `meal_context: "business_trip"`；否则仍询问其实际用途，不能只因出现高铁二字而推断餐费政策。
 
 The allocation script scores these hints against extracted units using amount, date, merchant text, and optional city. Treat these fields as evidence, not strict filters:
 
@@ -104,10 +136,12 @@ The allocation script scores these hints against extracted units using amount, d
 - Merchant can be brand/store text supplied by the applicant even when the invoice seller is a franchisee, platform merchant, or individual business.
 - Date is the actual meal/expense date from the applicant's note. For ordinary meal invoices, invoice issue date is only weak evidence and must not replace the actual meal date.
 - Auto-apply a hint only when one extracted unit is the unique high-confidence match. If several units have similar evidence, show the candidates in the chat and ask the user to confirm by item number.
+- Reconcile in the reverse direction too. Every distinct hint becomes one `expense_hint_reconciliation` record. Group unresolved records by expense type in chat, label each `R1`, `R2`, and so on, and show the original record plus any candidates. Convert each answer into `expense_hint_resolutions` with `matched_existing`, `covered_by_invoice`, `not_reimbursed`, or `pending_invoice`. A pending invoice records progress but does not close the gate; an erroneous/out-of-scope note may close as not reimbursed. Never close this question using a free-text `question_updates` answer.
+- If a matched allocation unit is later dropped/excluded/non-reimbursable, reopen the related hint gate. Deleting a row must not silently delete the applicant's original expected-expense record.
 
 Use hints to preserve attendee details even when a meal does not exceed the cap.
 
-Do not let a meal hint override the formal amount column or `Expense Nature`. For meal invoices, `final_template_column` and nature follow the invoice/restaurant city: Shanghai formal city -> `meal`/local; non-Shanghai formal city -> `travel`/business trip. A Shanghai invoice can still belong to an out-of-town project and use note `出差餐费`, but its amount column remains `meal` and its nature remains local. `final_template_column` is computed and re-normalized on every apply — it cannot be set through the answers file; to change a column, correct `city` or `source_category` instead.
+Do not let a meal hint override the formal amount column or `Expense Nature`. For meal invoices, `final_template_column` and nature follow the invoice/restaurant city: Shanghai formal city -> `meal`/local; non-Shanghai formal city -> `travel`/business trip. These are workbook-form fields only and never select the meal cap. A Shanghai invoice can belong to an out-of-town project, use note `出差餐费`, remain in the `meal` column with local nature, and still use the RMB 150/day business-trip policy. `final_template_column` is computed and re-normalized on every apply — it cannot be set through the answers file; to change a column, correct `city` or `source_category` instead.
 
 ## Allocation Units
 
@@ -128,6 +162,7 @@ Each allocation unit should carry:
 - formal invoice issue date when available
 - reliable expense date or date range, plus `date_source` and `date_required`
 - city, origin, destination, route, seller, and note evidence
+- railway leg fields when applicable, plus `journey_chain_id`, ordered position, whole-chain route, confidence, assignment rule, and whole-chain confirmation status after transfer detection
 - raw remarks
 - linked support documents
 
@@ -146,7 +181,7 @@ For ordinary meal, taxi summary, hotel-without-stay-date, and `unknown` invoices
 
 For each allocation unit, score candidate project contexts using:
 
-- Candidate filter: for hotel, meal, taxi, Didi/Gaode, railway, and flight auto-matching, exclude `CORP-2026-ADMIN` contexts before city/date scoring. Admin is not a Shanghai project.
+- Candidate filter: for hotel, meal, taxi, Didi/Gaode, railway, and flight auto-matching, exclude `<ADMIN_CODE>` contexts before city/date scoring. Admin is not a Shanghai project.
 - Date fit: inside project date range, or within the allowed travel buffer for airport/station transfer.
 - City fit: exact city match, destination city match, route endpoint match, or strong textual city evidence.
 - Expense-type logic: taxi, travel, hotel, meal, mobile, other.
@@ -167,12 +202,13 @@ Use type-specific pre-allocation rules. Do not apply one generic city/date rule 
 - Meal amount column and `Expense Nature` are form-over-substance: decide `meal`/local versus `travel`/business trip by the invoice/restaurant city, not by the assigned project. Shanghai meal invoices go to `meal`/local even when allocated to a business-trip project; non-Shanghai meal invoices go to `travel`/business trip.
 - Taxi/Didi/Gaode: allocate to the project journey the ride supports. Ordinary non-local city rides may match by city/date. Shanghai/base-city rides must not be auto-assigned to a Shanghai local project merely because city and date match; require explicit client/project evidence in the ride endpoint, route note, user note, or context keyword. Airport/station transfers belong to the upcoming destination project when the next project starts within the travel buffer. Transfers from one project city to a station/airport for the next city belong to the project being traveled to.
 - Taxi/Didi/Gaode amount column and `Expense Nature` are also form-over-substance: decide `taxi`/local versus `travel`/business trip by ride city, not by the assigned project. A Shanghai ride to an airport or railway station can belong to an out-of-town project while staying in the `taxi` column.
-- Flight/rail: match by route destination and travel date, allowing a reasonable +/- 1 day project buffer.
+- Railway: before per-ticket matching, group connected ticket segments into a journey chain only when both departure timestamps are usable, the later departure is no more than six hours after the earlier departure, and each intermediate destination station/city matches the next origin station/city. Missing times do not auto-form a chain. Allocate the chain as one journey only when the applicant has not assigned adjacent legs to different projects and no intermediate city has an active project context requiring transfer-versus-stop confirmation.
+- Standalone flight/rail: match by route destination and travel date, allowing a reasonable +/- 1 day project buffer.
 - For taxi/ride transfers, do not require the ride city to equal the project city when the ride is clearly to/from an airport or railway station. A Shanghai ride to Hongqiao station/airport can belong to the out-of-town destination project if it supports that journey.
-- Never assign unmatched taxi/travel/hotel/meal to `CORP-2026-ADMIN`, Client `通讯费`, or the mobile amount column. If transfer logic does not identify a project, ask the user.
+- Never assign unmatched taxi/travel/hotel/meal to `<ADMIN_CODE>`, Client `通讯费`, or the mobile amount column. If transfer logic does not identify a project, ask the user.
 - Other and unknown: do not pre-match by invoice city. Ask the user for accounting note and project/admin matter because issuer city can be misleading for SaaS, online meeting, association, platform, or generic service expenses. For pure `other`, temporarily use the invoice issue date as Date and advise the user to confirm/correct it; for `unknown`, ask for the actual date until reclassified.
 
-Record deterministic pre-allocation in `auto_project_match` with values such as `hotel_stay_dates`, `hotel_unique_city`, `unique_non_shanghai_city`, `taxi_explicit_project_evidence`, `taxi_transfer_to_next_project`, `taxi_transfer_matches_travel_unit`, `taxi_city_date`, `travel_destination_date`, or `travel_route_date`, and explain the basis in `match_reason`.
+Record deterministic pre-allocation in `auto_project_match` with values such as `hotel_stay_dates`, `hotel_unique_city`, `unique_non_shanghai_city`, `taxi_explicit_project_evidence`, `taxi_transfer_to_next_project`, `taxi_transfer_matches_travel_unit`, `taxi_city_date`, `rail_transfer_chain_destination`, `rail_transfer_chain_return`, `travel_destination_date`, or `travel_route_date`, and explain the basis in `match_reason`.
 
 ## Expense-Type Rules
 
@@ -224,6 +260,18 @@ Determine `origin_place_type` and `destination_place_type` before finalizing the
 
 Match by route, destination city, and travel date. Travel is usually high-confidence when the destination city and travel date align with a project city/date range, allowing a reasonable +/- 1 day buffer.
 
+Before applying that rule ticket by ticket, build railway journey chains:
+
+- Rail tickets form a chain only when both departure timestamps are usable, the later departure is no more than six hours after the earlier departure, and the earlier destination station matches the later origin station. Treat directional station variants in the same city, such as `周口东` and `周口`, as connectable when the remaining evidence is consistent. Missing times or a gap over six hours remain standalone tickets rather than an inferred chain.
+- `上海虹桥 -> 周口东` plus `周口东 -> 郑州东` may be one journey to Zhengzhou. If no active Zhoukou project explains that date, treat Zhoukou as a transfer and assign both tickets to the Zhengzhou project. If Zhoukou also has an active project context, ask whether it was merely a transfer or an actual project stop; do not auto-assign the chain until the applicant answers.
+- Local/home -> project: assign every segment to the terminal/upcoming project.
+- Project A -> project B: assign every segment to project B, the project being traveled to.
+- Project -> local/home: assign every segment to the project just completed.
+- Preserve each ticket as a separate allocation unit, proof, amount, and final Note such as `高铁（上海虹桥-周口东）`; share only `journey_chain_id` and project assignment.
+- Apply the same route/date/terminal-project rules to railway refund-fee tickets. Their printed `refund_fee_amount` is their invoice and reimbursable amount. Build connected refund tickets as a separate refund chain; never mix cancelled tickets with actually travelled or replacement tickets in one chain.
+- Show a resolved chain once as an advisory review item. Do not ask about each intermediate destination. Ask one blocking whole-chain question if station continuity/time order is ambiguous, the whole chain has multiple plausible projects, an intermediate city has an active project context, or the applicant says an intermediate city was an actual stop.
+- Applicant declarations override inferred continuity. If adjacent legs are explicitly assigned to different projects, do not create a chain. If the applicant later corrects an existing chain into different complete per-leg project assignments, the updater splits the obsolete chain at those project boundaries; incomplete assignments remain blocking.
+
 When travel connects two project cities, assign it to the project being traveled to. Return travel without a following project usually belongs to the project just completed. If route direction is unclear, ask in the travel batch question. Do not assign a train/flight to the origin project merely because the departure station city matches it.
 
 Final template column: `travel`.
@@ -236,6 +284,8 @@ Final note:
 - Flight refund or cancellation fee: `飞机退票费（出发地-目的地）`
 
 Use city or station/airport names from the route. Do not include train number, flight number, or seat in the final note unless the user asks; keep those details in evidence fields if needed. If the invoice text, line item, or remarks include `退票`, `退票费`, `退款`, `refund`, or cancellation wording, use the refund-fee note template.
+
+For a railway refund invoice already supplied by the applicant, presume the printed refund fee is claimed in full unless the applicant explicitly drops the evidence or gives a different reimbursable amount. Do not ask whether the original fare or the refund fee should be claimed.
 
 ### Hotel
 
@@ -269,6 +319,8 @@ Carry these fields when known:
 - `room_shared_with`
 - `room_share_note`
 
+For hotel units, `city` and `hotel_city` describe the same policy city. The updater mirrors either field into the other when only one is supplied and rejects conflicting values. Correct the city once; do not repeat the same applicant answer under a second field name just to make hotel-cap logic see it.
+
 If the user says only the cap amount should be reimbursed, keep `amount` / `invoice_amount` as the invoice amount and write the amount to claim in `reimbursable_amount`.
 
 ### Meal
@@ -286,7 +338,7 @@ Create a meal review list unless the user already provided clear meal details. A
 - actual meal date
 - project/client
 - attendees or dining counterparties
-- whether it is local Shanghai meal or out-of-town trip meal
+- whether its substantive purpose is business-trip meal (including a Shanghai pre-departure/station/airport meal) or explicit local overtime meal; never infer this from invoice city
 - whether it is a substitute invoice
 - whether actual reimbursable amount differs from invoice amount, when the user says a meal should be partially reimbursed to meet the daily standard
 
@@ -299,9 +351,11 @@ This is form-over-substance. A Shanghai meal invoice allocated to a non-Shanghai
 
 Final note:
 
-- Out-of-town business-trip meal: `出差餐费`
-- Shanghai meal that belongs in `meal` but is tied to station/airport travel context: `出差餐费（高铁站/机场）`
-- Overtime meal: `加班餐费`
+- Business-trip meal, regardless of whether formal city puts it in `meal` or `travel`: `出差餐费`
+- Shanghai meal specifically tied to station/airport travel context: `出差餐费（高铁站/机场）`
+- Explicit local overtime meal: `加班餐费`
+
+These notes also select the downstream cap policy: either `出差餐费` form -> `business_trip_meal` at RMB 150/day, or explicit `加班餐费` -> `local_overtime_meal` at RMB 60/day. There is no generic local/Shanghai meal RMB 60 policy. Same-date business-trip meal rows are one 150 pool even when Shanghai rows appear in `meal` and non-Shanghai rows appear in `travel`.
 
 Carry attendee details in a separate `attendees` field for downstream use. Include attendees in the final note only if the user explicitly wants that style.
 
@@ -313,7 +367,7 @@ If the user says only part of a meal invoice should be reimbursed, keep `amount`
 
 Assign mobile/telecom expenses to:
 
-- `client_charge_code`: `CORP-2026-ADMIN`
+- `client_charge_code`: `<ADMIN_CODE>`
 - `client_name`: `通讯费`
 - confidence: `fixed`
 
@@ -327,7 +381,7 @@ Use the billing period, not the invoice issue date, when available. For example,
 
 ### Admin Matter Client Names
 
-Never use `Admin` as the final `client_name` for `CORP-2026-ADMIN` rows. The Client column should describe the matter:
+Never use `Admin` as the final `client_name` for `<ADMIN_CODE>` rows. The Client column should describe the matter:
 
 - Mobile/telecom: use `通讯费` automatically and do not ask the user.
 - Other admin expenses: use the specific matter when known, such as `年会`, `半年会`, `客户会`, or `行业协会会议`.
@@ -335,7 +389,7 @@ Never use `Admin` as the final `client_name` for `CORP-2026-ADMIN` rows. The Cli
 
 This prompt is advisory only. Do not block stage 3 Excel output merely because the admin matter name is still the default.
 
-`CORP-2026-ADMIN` is not a fallback bucket. Taxi, Didi/Gaode, railway, flight, hotel, and meal expenses must not be assigned to `CORP-2026-ADMIN` or Client `通讯费` unless the source category is genuinely mobile/telecom. If a transport item cannot be matched, keep it in the blocking question queue.
+`<ADMIN_CODE>` is not a fallback bucket. Taxi, Didi/Gaode, railway, flight, hotel, and meal expenses must not be assigned to `<ADMIN_CODE>` or Client `通讯费` unless the source category is genuinely mobile/telecom. If a transport item cannot be matched, keep it in the blocking question queue.
 
 ### Other
 
@@ -372,11 +426,40 @@ Do not use the verbose evidence note from stage 1 as the final reimbursement not
 
 ## Place Type Classification For Taxi Notes
 
+### Persistent Place Memory (read first, remembered on confirm)
+
+Custom place↔type relationships that only this applicant knows — 友力国际大厦=公司,
+某某公寓=家, 中关村产业园=某客户 — are kept in a persistent, cross-run memory file at
+`assets/place-definitions.json` (schema `place_definitions.v1`). Allocation consults it
+**before** any heuristic or question: a place recorded there is authoritative and resolves
+as `高` confidence with no confirmation, so private locations are not re-asked every month.
+
+- The file survives the per-run `process/` reset because it lives under the skill assets dir.
+  No private facts are hard-coded anywhere: the office 友力国际大厦=公司 lives only in this JSON.
+- **Public places need no memory.** Airports, rail stations, and hotels (虹桥T2→机场,
+  虹桥火车站→火车站, 全季酒店→酒店) are general knowledge, classified by keyword heuristics
+  (`place_config.public_place_type`). They are never stored in the file and never written back —
+  only private POIs (office, home, a specific client's site) go in the memory.
+- Each entry is `{ "name", "place_type", "aliases"?, "client_name"?, "note"? }`; `place_type`
+  must be one of `公司/机场/火车站/酒店/客户/家/餐厅/其他`. Matching is case-insensitive
+  substring of `name` or any alias against the ride endpoint text.
+- **Write-back is automatic.** When the applicant confirms a taxi endpoint's type in chat and
+  that answer is applied through Composer/Updater (an explicit `origin_type`/`destination_type`,
+  i.e. canonical `origin_place_type`/`destination_place_type`), the updater records the raw
+  endpoint text → confirmed type into `place-definitions.json`, deduped by name+type, skipping
+  any public place. Next month the same private POI resolves silently. Model auto-guesses are
+  never memorized — only applicant-confirmed answers.
+- The file is fully user/agent-editable: edit the JSON directly, or use the CLI —
+  `python scripts/place_config.py add --name 友力国际大厦 --type 公司 --alias 江宁路`,
+  `python scripts/place_config.py list`, `python scripts/place_config.py remove --name 友力国际大厦`.
+- Loading fails open: a missing or malformed file degrades to an EMPTY memory (unknown places are
+  simply asked as usual) and prints a non-blocking advisory; it never blocks allocation.
+
 Classify taxi/Didi/Gaode origin and destination into place types:
 
 | Evidence | Place Type |
 | --- | --- |
-| `江宁路`, `友力国际大厦`, company office aliases, or known office address | `公司` |
+| Any place recorded in `assets/place-definitions.json` (name or alias) | its recorded type (authoritative) |
 | Airport names, terminals, arrivals, departures, or `机场` | `机场` |
 | Railway stations, high-speed rail stations, train stations, or `火车站` | `火车站` |
 | Hotel names or addresses that clearly look like lodging | `酒店` |
@@ -391,6 +474,10 @@ Use LLM judgment for obvious place types, but do not guess sensitive or ambiguou
 这笔打车的出发地/目的地「XXX」我无法确定类型，应该写成 公司/客户/酒店/机场/火车站/家/餐厅/其他 哪一种？
 ```
 
+Once the user answers, apply it through Composer/Updater with `origin_type`/`destination_type`
+so the confirmed mapping is written back to `assets/place-definitions.json` automatically. Do
+not re-ask a place already resolved by the persistent memory.
+
 Store:
 
 - `origin_place_type`
@@ -402,7 +489,21 @@ Only generate the final taxi note after both endpoint types are known or confirm
 
 ## Substitute Invoices
 
-When the user says an invoice is a substitute invoice, replacement invoice, or "替票":
+Substitute status is user-declared, never inferred. Set `is_substitute_invoice: true`
+**only** when the user explicitly says a specific invoice/item is a substitute invoice,
+replacement invoice, "替票", or "抵用发票". This is strictly one-directional:
+
+- Substitute invoice ⟹ needs a partner approval screenshot.
+- Partner approval screenshot ⟹ does **not** make anything a substitute invoice.
+
+Do NOT flag an item as a substitute just because an approval screenshot exists, because a
+file is named "审批"/"approval", or because a partner approved the expense. Approvals attach
+to many ordinary expenses (over-cap, special categories) that are not substitutes. An
+approval screenshot the user has not tied to a declared substitute is just evidence: keep it
+as a `supporting_document` (see Unclaimed Approval Screenshots below), and never append `（抵）`
+to its expense on that basis alone.
+
+When — and only when — the user explicitly declares an item a substitute:
 
 - Set `is_substitute_invoice: true`.
 - Ask the user to provide the partner approval screenshot file.
@@ -412,6 +513,14 @@ When the user says an invoice is a substitute invoice, replacement invoice, or "
 - Record approval screenshot file path when provided.
 - Set `approval_file_status: provided` when the file path is known and `approval_file_status: missing` when it is not.
 - Add an issue if the screenshot is required but missing.
+
+### Unclaimed Approval Screenshots
+
+A partner approval screenshot the user provides without declaring the related item a
+substitute stays a plain `supporting_document`. Do not create an expense row for it, do not
+set `is_substitute_invoice`, and do not add `（抵）` to any note. If it is unclear which
+expense the screenshot supports or whether the user intends a substitute, ask — do not assume
+substitute.
 
 The final file-packaging stage must include the partner approval screenshot.
 
@@ -438,7 +547,7 @@ Stage 2 is intentionally iterative:
 5. Create suggested assignments for medium-confidence items.
 6. Show an applicant review list in the current conversation before questions, so the user can identify each item by simple number and source filename.
 7. Ask targeted questions in the current conversation for low-confidence, medium-confidence, meal, other, conflicting, or substitute-invoice items. Batch repetitive questions by expense type whenever several items need the same kind of answer.
-8. Generate `allocation-answers.template.json`, fill it with the user's answers as canonical `unit_updates`, apply it with `scripts/apply_allocation_answers.py`, and regenerate `expense-allocation.md/json`.
+8. Translate the user's answers into canonical `allocation_decisions.v1`, run `scripts/compose_answers.py`, then apply the published answers with `scripts/apply_allocation_answers.py` to regenerate `expense-allocation.md/json`.
 9. Repeat until every allocation unit is confirmed or explicitly left in the question queue.
 
 Group questions by expense type first, then list user-facing item numbers inside each group. If one item has multiple uncertainties, ask them together in that type group. For example, a single meal group can ask for actual meal date, project/client, attendees, and note type for items 1/3/5/7. A single hotel group can ask for check-in/check-out/nights for several hotels. A single taxi group can ask for unclear origin/destination place types for several rides.
@@ -455,7 +564,7 @@ When presenting a grouped question, include enough information for batch replies
 - suggested client/code/project
 - short evidence note
 
-Tell the user they can answer by grouped item numbers, such as: "1/3/5/7 属于山西信托，日期分别是...；2/4/6 属于广联达，日期分别是..." The agent should translate that natural-language answer into `unit_updates` with `unit_nos` arrays.
+Tell the user they can answer by grouped item numbers, such as: "1/3/5/7 属于山西信托，日期分别是...；2/4/6 属于广联达，日期分别是..." The agent should translate that natural-language answer into `unit_updates` with `unit_nos` arrays. Item numbers are convenient handles only for the current allocation generation. At the time of the answer, associate each explicit user-confirmed fact with that unit's source filename and corroborating invoice/trip fields so it can be safely understood if a clean rebuild later becomes necessary.
 
 Use `status: advisory` with `blocking: false` for optional refinements that should be shown in chat but must not block Excel output, such as replacing the default admin Client `项目、调研以外的其他费用` with a more specific matter name, or reviewing pure `other` items whose Date temporarily uses the invoice issue date.
 
@@ -483,108 +592,162 @@ python scripts/trace_expense_item.py --allocation process/expense-allocation.jso
 
 Then answer with the source filename(s), invoice number, seller/service provider, amount, date, and trip details so the user can confirm which file it is.
 
-After the user provides the corrected value, fill the generated answers template into `allocation-answers.json` and apply it with `scripts/apply_allocation_answers.py`. Include `manual_correction: true` and a short `correction_note` when the correction changes recognized evidence such as amount, date, seller, invoice number, category, route, origin, or destination.
+After the user provides the corrected value, encode it in `allocation_decisions.v1`, run Composer, and apply the published answers. Include `manual_correction: true` and a short `correction_note` when the correction changes recognized evidence such as amount, date, seller, invoice number, category, route, origin, or destination.
 
-Example correction patch:
+Example correction decision:
 
 ```json
 {
-  "unit_updates": [
+  "schema_version": "allocation_decisions.v1",
+  "decisions": [
     {
-      "unit_no": 9,
-      "amount": "123.45",
-      "expense_date": "2026-06-09",
-      "source_category": "meal",
-      "final_template_column": "meal",
-      "final_note": "加班餐费",
-      "manual_correction": true,
-      "correction_note": "User checked the source invoice and corrected the recognized amount/date."
+      "units": "9",
+      "set": {
+        "amount": "123.45",
+        "expense_date": "2026-06-09",
+        "source_category": "meal",
+        "final_note": "加班餐费",
+        "manual_correction": true,
+        "correction_note": "User checked the source invoice and corrected the recognized amount/date."
+      }
     }
-  ]
+  ],
+  "question_updates": [],
+  "project_contexts": [],
+  "confirm_units": [],
+  "drop_units": [],
+  "exclude_units": []
 }
 ```
 
 ## Applying User Answers
 
-After the user answers in natural language, first generate a current-task answers template:
+After the user answers in natural language, write a UTF-8 decisions file using `assets/allocation-decisions-template.json` as the exact root structure. Do not ask the user to create it.
 
-```bash
-python scripts/build_allocation_answers_template.py --allocation process/expense-allocation.json --output process/allocation-answers.template.json
-```
-
-The template includes canonical `unit_updates` plus `review_context` so the model can fill item numbers, source filenames, current suggestions, and missing fields without guessing the JSON schema. Fill the template into `process/allocation-answers.json`; replace every `<...>` placeholder before applying. Do not create `answers[].allocations`, `patch_allocation.py`, or any other ad hoc shape.
-
-Validate the filled JSON before writing:
-
-```bash
-python scripts/apply_allocation_answers.py --allocation process/expense-allocation.json --answers process/allocation-answers.json --dry-run
-```
-
-Then apply:
-
-```bash
-python scripts/apply_allocation_answers.py --allocation process/expense-allocation.json --answers process/allocation-answers.json
-```
-
-Use this script instead of manually editing `expense-allocation.json`. It updates allocation units, closes answered questions, keeps a backup when overwriting, and appends a change-log entry. The updater rejects noncanonical top-level keys such as `answers`, empty/no-op update files, and unfilled template placeholders so a failed answer translation cannot look like a successful apply.
-
-Do not write one-off patch scripts for bulk allocation updates. Even if the user confirms many hotel dates, taxi place types, meal dates, or project assignments at once, create an `allocation-answers.json` with multiple `unit_updates` and run `scripts/apply_allocation_answers.py`. The updater also refreshes derived notes such as hotel, taxi, and rail/flight notes; direct JSON mutation can bypass these safeguards.
-
-Canonical answers JSON shape:
+Canonical decisions shape:
 
 ```json
 {
-  "schema_version": "allocation_answers.v1",
-  "unit_updates": [
+  "schema_version": "allocation_decisions.v1",
+  "decisions": [
     {
-      "unit_no": 1,
-      "status": "confirmed",
-      "client_name": "",
-      "client_charge_code": "",
-      "admin_client_review_needed": false,
-      "project_context_id": "CTX-001",
-      "expense_date": "YYYY-MM-DD",
-      "date_source": "user_confirmed",
-      "date_is_provisional": false,
-      "date_required": false,
-      "city": "",
-      "final_template_column": "travel",
-      "final_note": "",
-      "reimbursable_amount": "",
-      "hotel_nights": "",
-      "check_in_date": "",
-      "check_out_date": "",
-      "shared_room": false,
-      "room_shared_with": "",
-      "origin_place_type": "",
-      "destination_place_type": "",
-      "attendees": "",
-      "is_substitute_invoice": false,
-      "substitute_for": "",
-      "approval_file": "",
-      "answer": "Short human-readable summary of the user's answer."
+      "units": "1,3,5-7",
+      "set": {
+        "status": "confirmed",
+        "client_name": "<real client name>",
+        "client_charge_code": "<real charge code>",
+        "expense_date": "<YYYY-MM-DD>",
+        "final_note": "<final reimbursement note>"
+      }
     }
   ],
-  "question_updates": [
-    {
-      "question_id": "Q-001",
-      "status": "answered",
-      "answer": "User confirmed this item belongs to Client X / Code Y."
-    }
-  ],
-  "project_contexts": []
+  "question_updates": [],
+  "project_contexts": [],
+  "confirm_units": [],
+  "drop_units": [],
+  "exclude_units": []
 }
 ```
 
-Convenience keys are also supported:
+`decisions[].units` accepts one displayed item number, comma-separated numbers, or ranges. `decisions[].set` accepts canonical updater fields plus Composer aliases such as `client`, `code`, `note`, `date`, `nights`, `checkin`, `checkout`, `attendee`, `origin_type`, and `destination_type`.
 
-- `confirm_units`: list of user-facing item numbers or internal unit IDs to mark confirmed.
-- `drop_units`: list of user-facing item numbers or internal unit IDs to drop.
-- `exclude_units`: list of user-facing item numbers or internal unit IDs to exclude.
+### Composer Field Quick Reference
 
-For grouped questions, translate each natural-language batch into one or more `unit_updates` using `unit_nos`, for example `{"unit_nos": [1, 3, 5, 7], "client_name": "山西信托", "client_charge_code": "CORP-2026-BD", ...}`. If the user provides different dates for each item, create separate unit updates or separate per-item entries so each `expense_date` is correct.
+Use these aliases inside `decisions[].set`. Canonical field names remain valid too.
 
-Prefer `unit_no` or numeric lists when translating user answers. Internal `unit_id` / `unit_ids` remain supported for scripts and process files, but they should not be shown to the user in chat.
+| Short field | Canonical field | Use |
+| --- | --- | --- |
+| `client` | `client_name` | Client shown in the workbook project block |
+| `code` / `charge_code` | `client_charge_code` | Client Charge Code |
+| `date` | `expense_date` | Actual reimbursement date in `YYYY-MM-DD` |
+| `note` | `final_note` | Final Chinese reimbursement Note |
+| `category` | `source_category` | Substantive category such as `meal`, `hotel`, or `taxi` |
+| `context` | `meal_context` | Meal policy context, such as `business_trip` or `overtime` |
+| `project_context` | `project_context_id` | Existing Stage 2 project-context ID |
+| `nights` | `hotel_nights` | Number of hotel nights |
+| `checkin` / `check_in` | `check_in_date` | Hotel check-in date |
+| `checkout` / `check_out` | `check_out_date` | Hotel check-out date |
+| `attendee` | `attendees` | Meal attendee/counterparty text |
+| `origin_type` | `origin_place_type` | Taxi origin type, such as `家`, `公司`, or `火车站` |
+| `destination_type` | `destination_place_type` | Taxi destination type |
+| `reimbursable` | `reimbursable_amount` | Amount actually claimed when lower than invoice amount |
+
+For a hotel, setting either canonical `city` or `hotel_city` is sufficient; the updater mirrors it to the other field and rejects conflicting values. Never set `final_template_column`: it is computed from `source_category` and formal city. Fix `city` or `source_category` when the visible amount column is wrong.
+
+Use `question_updates` for ordinary question status/answer updates. Use `expense_hint_resolutions` for every generation-safe `R1@ref` applicant-record completeness decision; free-text `question_updates` cannot close those records.
+
+The root action arrays are also supported:
+
+- `confirm_units`: list of current `N@ref` tokens to mark confirmed.
+- `drop_units`: list of current `N@ref` tokens to drop.
+- `exclude_units`: list of current `N@ref` tokens to exclude.
+- `question_updates`: explicit question status/answer updates.
+- `expense_hint_resolutions`: structured outcomes for each displayed `R` record; evidence actions require current item numbers in `units`.
+- `project_contexts`: controlled context additions/updates.
+
+For a grouped user-record completeness question, write one structured entry per displayed full `R@ref` token. A mixed answer may close some records while leaving a missing invoice pending:
+
+```json
+{
+  "expense_hint_resolutions": [
+    {
+      "question_id": "Q-HINT-001",
+      "record_ref": "R1@a1b2c3d4",
+      "action": "matched_existing",
+      "units": "16@11223344",
+      "note": "对应第16项"
+    },
+    {
+      "question_id": "Q-HINT-001",
+      "record_ref": "R2@b2c3d4e5",
+      "action": "covered_by_invoice",
+      "units": "20@55667788",
+      "note": "由第20项汇总发票覆盖"
+    },
+    {
+      "question_id": "Q-HINT-001",
+      "record_ref": "R3@c3d4e5f6",
+      "action": "pending_invoice",
+      "note": "商户稍后补开；本条继续阻断"
+    },
+    {
+      "question_id": "Q-HINT-001",
+      "record_ref": "R4@d4e5f6a7",
+      "action": "not_reimbursed",
+      "note": "记录有误，本次不报销"
+    }
+  ]
+}
+```
+
+Composer resolves and verifies each full R@ref token against the current fingerprint-bound ledger; bare R numbers and hint_id-only lookups are rejected. The updater closes only evidence-backed or not-reimbursed records and keeps the grouped question open while any record is `pending_evidence`.
+
+Run Composer, then apply only its published output:
+
+```bash
+python scripts/chief_orchestrator.py run compose --decisions process/batch-decisions.json
+python scripts/chief_orchestrator.py run apply
+```
+
+Composer resolves the current displayed `user_no` values, binds the current allocation fingerprint, validates text and fields, and calls the updater in dry-run mode before atomically publishing `process/allocation-answers.json`. The updater remains the sole writer of `expense-allocation.json`; it refreshes derived hotel/taxi/rail/flight Notes, closes questions, archives the prior stamped generation by fingerprint, records a lineage pointer, and appends change history.
+
+If Composer or its updater dry-run fails, correct the same UTF-8 decisions file and rerun Composer. Never generate `fill_answers.py`, write a batch helper, fill a diagnostic answers template, create a patch/fix script, edit a process JSON, or modify a bundled script. `build_allocation_answers_template.py` is developer-only diagnostic output and its schema is intentionally rejected by the updater.
+
+For grouped questions, translate each natural-language batch into one or more `decisions` entries. If the user provides different dates for each item, create separate decision entries so each `expense_date` is correct.
+
+Always use the full displayed `N@ref` token when translating user answers, including `--set` and control arrays. Internal `unit_id` values remain supported only in control action arrays and process files; do not show them to the user in chat. After any extraction/allocation rerun, both old numeric selectors and old internal IDs expire. Re-read the new review list and rebind facts by the clean-rebuild mapping rules in `troubleshooting.md` before composing new decisions.
+
+For one or two scalar edits, Chief `run compose --set` accepts direct UTF-8 Chinese and spaces inside a value; keep the complete `N@ref: field=value ...` spec as one command argument. The compact parser treats a later `field=value` token as the next field and appends intervening words to the current value. Use the canonical UTF-8 decisions template for quotes, paths, multiline values, or larger batches. Run Chief `lineage` whenever the current full fingerprint or selected rebase source is needed; do not grep stdout or choose a generation archive manually.
+
+## Preferred Mirror Warden Audit (runs before Stage 3)
+
+Otako, the Mirror Warden is a precision-first independent reconciliation audit that runs immediately before Stage 3, once the allocation is confirmed — not during Stage 2 questioning. It re-checks only concrete factual surfaces from scratch: attribution, journey coherence, dates/routes, over-claiming, true duplicate economic expenses, required evidence for the claimed unit itself, and genuinely unresolved material. It does not invent personal-invoice requirements for company-booked contextual travel or question ordinary trip behavior. Run it through Chief `prepare-agent --role mirror_warden` / `accept-agent --role mirror_warden` when the host can create a fresh isolated subagent (on Claude Code, the built-in Agent/Task tool); skip only when that capability is unavailable or the user opts out. A blocking finding gates Stage 3; advisory findings require no applicant reply. See `references/stage-3-excel-output.md` and the SKILL "Preferred Subagent Checkpoints" section for the full audit contract and gating.
+
+If the runtime has no genuinely fresh subagent context, skip this pass. Do not call a second reading by the same context an independent analysis.
+
+For ordinary invoice additions/removals, ask Chief for the next action instead of manually choosing a historical file. Official allocation generations form an immutable chain under `process/allocation-generations/`; repeated fresh allocator reruns are skipped until Chief finds the nearest generation with an updater change log. Rebase matches the hidden full unit/hint SHA-256 identities, while `N@ref` and `R@ref` remain compact chat handles. It carries only fields proven to have been set through the official updater plus final status, and lets the current updater regenerate derived columns, confidence, place-type state, approval-file status, and standard Notes. Rebase refuses changed project contexts, policy SHA-256, allocation engine revision, missing identities, or duplicate refs. Composer/updater also refuse ordinary answers while this lineage gate is open; the rebase metadata must bind the Chief-selected source and current target fingerprints. A zero-carry result still passes once through Composer/updater as a lineage clearance before new decisions may be applied. Explicit applicant-record outcomes (`matched_existing`, `covered_by_invoice`, `not_reimbursed`, and `pending_invoice`) are carried only when the record identity remains unchanged. For a multi-unit match, prior-generation links already marked `dropped`, `excluded`, or `non_reimbursable` are removed before Composer; remaining valid links are carried and reported as adjusted. If every linked unit was closed, the old resolution is omitted so the current record remains open for applicant confirmation.
+
+Rebase also performs a reverse evidence-presence reconciliation. Every source-generation unit absent from the current generation enters stamped `removed_evidence`. Prior closed items auto-resolve; all others receive an `M@ref` and are shown in chat with original filename, amount, date/category, and prior status. The applicant must choose `intentional_removal`, `replacement_provided`, or `restore_required`. Write that natural-language answer into the prefilled UTF-8 `rebase_removal_resolutions.v1` template and rerun Chief `rebase --resolutions <file>`. A replacement must use exact current `N@ref` token(s). `restore_required` stays blocking until the evidence is restored and extraction/allocation/rebase are regenerated. Composer and updater independently verify that the ledger exactly covers every disappeared source unit; do not edit `rebase-decisions.json` or its stamp.
 
 For substitute invoices, keep `approval_file` even though it will not appear in the visible Excel sheet. Stage 3 must carry it into `final-expense-rows.json`, and Stage 4 must use it to copy the approval screenshot into the support-document folder.
 
@@ -637,6 +800,25 @@ Write `process/expense-allocation.json`:
   "generated_at": "YYYY-MM-DDTHH:mm:ss",
   "source_extraction_file": "process/invoice-extraction.json",
   "project_contexts": [],
+  "expense_hint_reconciliation": [
+    {
+      "hint_id": "CTX-001:meal_hints:1",
+      "source_fields": ["meal_hints"],
+      "project_context_id": "CTX-001",
+      "client_name": "",
+      "client_charge_code": "",
+      "source_category": "meal",
+      "summary": "2026-06-01 德克士 RMB 61.80",
+      "match_status": "matched|ambiguous|unmatched|matched_unit_closed",
+      "resolution_status": "not_required|open|pending_evidence|resolved",
+      "resolution_action": "|matched_existing|covered_by_invoice|not_reimbursed|pending_invoice",
+      "matched_unit_ids": [],
+      "matched_user_nos": [],
+      "candidate_units": [],
+      "question_id": "",
+      "resolution_answer": ""
+    }
+  ],
   "allocation_units": [
     {
       "unit_id": "UNIT-001",
@@ -671,6 +853,21 @@ Write `process/expense-allocation.json`:
       "room_shared_with": "",
       "room_share_note": "",
       "route": "",
+      "train_no": "",
+      "origin_station": "",
+      "destination_station": "",
+      "rail_departure_time": "",
+      "rail_departure_datetime": "",
+      "journey_chain_id": "",
+      "journey_chain_route": "",
+      "journey_chain_position": "",
+      "journey_chain_length": "",
+      "journey_chain_unit_ids": [],
+      "journey_chain_confidence": "",
+      "journey_chain_assignment_rule": "",
+      "journey_chain_match_reason": "",
+      "journey_chain_project_context_id": "",
+      "journey_chain_needs_confirmation": false,
       "origin_place_type": "",
       "destination_place_type": "",
       "place_type_confidence": "",
@@ -680,7 +877,7 @@ Write `process/expense-allocation.json`:
       "client_name": "",
       "client_charge_code": "",
       "admin_client_review_needed": false,
-      "expenses_nature": "out_of_town",
+      "expenses_nature": "出差",
       "expense_note": "",
       "final_note": "",
       "attendees": "",
@@ -722,7 +919,8 @@ Stage 2 is complete when:
 - The user-provided project context has been structured and confirmed enough to allocate expenses.
 - Every allocation unit has a project assignment, fixed admin assignment, or open question.
 - Every included allocation unit has a reliable `expense_date`, a pure-`other` provisional invoice-date `expense_date` with an advisory review item, or a blocking open question asking the applicant for the actual date to record.
+- Every distinct applicant hint is represented once in `expense_hint_reconciliation` and is either uniquely matched to active evidence, covered by an identified invoice, or explicitly marked `not_reimbursed`; `pending_invoice` is not Stage 2 complete.
 - Meals have actual date/project/attendee details when needed.
-- `CORP-2026-BD` collisions are separated by client/city/date context.
+- `<BD_CODE>` collisions are separated by client/city/date context.
 - Substitute invoices are marked and screenshot requirements are recorded.
 - The Markdown and JSON allocation files agree.

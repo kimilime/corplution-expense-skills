@@ -11,40 +11,49 @@ Usage:
 from __future__ import annotations
 
 import argparse
-import hashlib
 import json
 import sys
 from pathlib import Path
 from typing import Any
 
 import integrity
+import allocate_expenses
+import allocation_generations
+import close_message
+from exit_codes import ExitCode
+from io_utils import configure_utf8_stdio as configure_stdio, sha256_file
+from json_io import read_optional_json_object as load
+import subagent_protocol
+import value_utils
 
 
-def configure_stdio() -> None:
-    """Status is often run from Windows terminals that cannot encode all markers."""
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(errors="replace")
-            except Exception:
-                pass
-
-
-def load(path: Path) -> dict[str, Any] | None:
-    if not path.exists():
-        return None
+def is_hidden_package_artifact(path: Path, root: Path) -> bool:
     try:
-        return json.loads(path.read_text(encoding="utf-8-sig"))
-    except Exception:
-        return None
+        relative = path.relative_to(root)
+    except ValueError:
+        return False
+    return any(part.startswith(".") for part in relative.parts[:-1])
 
 
-def sha256_file(path: Path) -> str:
-    digest = hashlib.sha256()
-    with path.open("rb") as handle:
-        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
-            digest.update(chunk)
-    return digest.hexdigest()
+def validate_project_context(path: Path) -> tuple[bool, str]:
+    if not path.is_file():
+        return False, "project context file does not exist"
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        return False, f"project context JSON cannot be read: {exc}"
+    errors = allocate_expenses.context_schema_errors(payload)
+    if errors:
+        return False, "; ".join(errors)
+    return True, "ok"
+
+
+def recorded_project_context_path(allocation: dict[str, Any] | None, process_dir: Path) -> Path:
+    recorded = str((allocation or {}).get("source_project_context_file", "")).strip()
+    if not recorded:
+        return process_dir.parent / "project-context.json"
+    path = Path(recorded).expanduser()
+    return path if path.is_absolute() else process_dir.parent / path
 
 
 def manifest_file_path(folder: Path, filename: Any) -> Path | None:
@@ -59,6 +68,7 @@ def validate_package_manifest(
     workbook: Path,
     expected_workbook_sha: str,
     final_rows_fingerprint: str,
+    expected_hint_count: int,
 ) -> tuple[bool, str]:
     ok, reason = integrity.check(manifest)
     if not ok:
@@ -71,6 +81,12 @@ def validate_package_manifest(
         return False, "manifest workbook hash does not match current final rows"
     if str(manifest.get("final_rows_fingerprint", "")) != final_rows_fingerprint:
         return False, "manifest belongs to an older or different final-rows generation"
+    try:
+        manifest_hint_count = int(manifest.get("expense_hint_reconciliation_count", -1))
+    except (TypeError, ValueError):
+        return False, "manifest expense_hint_reconciliation_count is invalid"
+    if manifest_hint_count != expected_hint_count:
+        return False, "manifest applicant expense-record count does not match current final rows"
     issues = manifest.get("issues", [])
     if not isinstance(issues, list):
         return False, "manifest issues field is malformed"
@@ -104,129 +120,1033 @@ def validate_package_manifest(
                 return False, f"package file has no recorded hash: {folder_name}/{path.name}"
             if sha256_file(path) != expected_file_sha:
                 return False, f"package file hash mismatch: {folder_name}/{path.name}"
+    close_ok, close_reason = close_message.validate(
+        manifest.get("close_summary"),
+        invoice_count=manifest.get("invoice_count"),
+        support_count=manifest.get("support_count"),
+    )
+    if not close_ok:
+        return False, close_reason
     return True, "ok"
 
 
-def main(argv: list[str] | None = None) -> int:
-    configure_stdio()
-    parser = argparse.ArgumentParser(description="Report reimbursement workflow status.")
-    parser.add_argument("--process-dir", default="process")
-    parser.add_argument("--output-root", default="output")
-    args = parser.parse_args(argv)
-    pdir = Path(args.process_dir)
+FINAL_UNIT_STATUSES = {"confirmed", "fixed", "dropped", "excluded", "non_reimbursable"}
+ANSWER_ACTION_FIELDS = (
+    "unit_updates",
+    "expense_hint_resolutions",
+    "question_updates",
+    "project_contexts",
+    "confirm_units",
+    "drop_units",
+    "exclude_units",
+)
 
+
+def next_step(
+    kind: str,
+    stage: str,
+    summary: str,
+    *,
+    operation: str | None = None,
+    parameters: dict[str, Any] | None = None,
+    missing: list[str] | None = None,
+) -> dict[str, Any]:
+    """Build a machine-readable next action without embedding a shell command."""
+    return {
+        "kind": kind,
+        "stage": stage,
+        "summary": summary,
+        "operation": operation,
+        "parameters": parameters or {},
+        "missing": missing or [],
+        "argv": None,
+    }
+
+
+def inspect_workflow(
+    process_dir: str | Path = "process",
+    output_root: str | Path = "output",
+) -> dict[str, Any]:
+    """Inspect all four stages once and return the shared workflow state.
+
+    This function is the single state source for both the legacy status CLI and
+    chief_orchestrator.py. It is read-only and never repairs process artifacts.
+    """
+    pdir = Path(process_dir)
+    root = Path(output_root)
     lines: list[str] = []
-    next_action = ""
+    pending_next: dict[str, Any] | None = None
+    pending_priority = -1
     integrity_blocked = False
+    stages: dict[str, dict[str, Any]] = {}
+    artifacts: dict[str, dict[str, Any]] = {}
+    subagents: dict[str, Any] = {"recommended": []}
+
+    def set_next(candidate: dict[str, Any], *, priority: int = 0) -> None:
+        nonlocal pending_next, pending_priority
+        if pending_next is None or priority > pending_priority:
+            pending_next = candidate
+            pending_priority = priority
 
     # Stage 1
-    extraction = load(pdir / "invoice-extraction.json")
+    extraction_path = pdir / "invoice-extraction.json"
+    extraction = load(extraction_path)
     extraction_fp = ""
     if not extraction:
-        lines.append("Stage 1 提取: ✗ 未运行 (no invoice-extraction.json)")
-        next_action = "run extract_invoices.py on ALL provided files"
+        if extraction_path.exists():
+            lines.append("Stage 1 提取: BLOCKED invoice-extraction.json 无法解析")
+            stages["extraction"] = {"number": 1, "status": "blocked", "reason": "malformed_json"}
+            integrity_blocked = True
+            set_next(next_step(
+                "blocked",
+                "extraction",
+                "invoice-extraction.json cannot be parsed; re-run extraction on all original inputs.",
+                missing=["all original invoice/support input paths"],
+            ), priority=100)
+        else:
+            lines.append("Stage 1 提取: ✗ 未运行 (no invoice-extraction.json)")
+            stages["extraction"] = {"number": 1, "status": "not_started"}
+            set_next(next_step(
+                "needs_user",
+                "extraction",
+                "Provide all invoice, trip-report, approval, and payment-evidence files or folders.",
+                operation="extract",
+                missing=["source invoice/support file paths"],
+            ))
     else:
         ok, reason = integrity.check(extraction)
         extraction_fp = str((extraction.get("integrity") or {}).get("fingerprint", "")) if ok else ""
         docs = extraction.get("documents", [])
         excluded = [d for d in docs if d.get("excluded_by_user")]
+        docs_by_sha: dict[str, list[dict[str, Any]]] = {}
+        for doc in docs:
+            source_sha = str(doc.get("sha256", "")).strip().lower()
+            if source_sha:
+                docs_by_sha.setdefault(source_sha, []).append(doc)
+        duplicate_group_errors = []
+        for source_sha, group in docs_by_sha.items():
+            if len(group) < 2:
+                continue
+            active = [doc for doc in group if not doc.get("excluded_by_user")]
+            if len(active) == 1:
+                continue
+            duplicate_group_errors.append({
+                "sha256": source_sha,
+                "active_count": len(active),
+                "filenames": [Path(str(doc.get("source_file", "?"))).name for doc in group],
+            })
         pending = [d for d in docs if not d.get("excluded_by_user")
                    and (d.get("needs_review") or d.get("document_role") == "unknown")]
         unresolved_inputs = [
             item for item in extraction.get("unresolved_input_files", [])
             if item.get("status", "open") == "open"
         ]
-        state = "✓" if ok else "BLOCKED"
+        state = "BLOCKED" if not ok else (
+            "…" if unresolved_inputs or pending or duplicate_group_errors else "✓"
+        )
         stamp_note = "" if ok else f" [INTEGRITY FAILED: {reason}]"
         lines.append(f"Stage 1 提取: {state} {len(docs)} 份文档，排除 {len(excluded)}，待识别/复核 {len(pending)}{stamp_note}")
         if unresolved_inputs:
             lines.append(f"  - BLOCKED: {len(unresolved_inputs)} 个不支持的输入文件尚未记录用户处理决定")
             for item in unresolved_inputs[:10]:
                 lines.append(f"    * {item.get('filename', '?')}")
+        for group in duplicate_group_errors[:10]:
+            lines.append(
+                "  - 重复凭证组未恰好保留一份: "
+                f"{group['sha256'][:8]} ({group['active_count']} active) - "
+                + ", ".join(group["filenames"])
+            )
         for d in pending[:10]:
-            lines.append(f"  - 待识别: {Path(str(d.get('source_file', '?'))).name}")
+            duplicate = any(
+                "duplicate" in str(issue.get("problem", "")).lower()
+                for issue in (d.get("issues") or [])
+            )
+            label = "重复凭证待 Stage 1 排除确认" if duplicate else "待识别"
+            lines.append(f"  - {label}: {Path(str(d.get('source_file', '?'))).name}")
+        stage1_status = "ready" if ok and not unresolved_inputs and not pending and not duplicate_group_errors else (
+            "blocked" if not ok else "needs_user"
+        )
+        stages["extraction"] = {
+            "number": 1,
+            "status": stage1_status,
+            "document_count": len(docs),
+            "excluded_count": len(excluded),
+            "review_count": len(pending),
+            "duplicate_group_error_count": len(duplicate_group_errors),
+            "unresolved_input_count": len(unresolved_inputs),
+            "integrity_valid": ok,
+        }
+        artifacts["extraction"] = {
+            "path": str(extraction_path),
+            "integrity_fingerprint": extraction_fp,
+        }
         if not ok:
             integrity_blocked = True
-            next_action = "re-run extract_invoices.py; make changes only through apply_extraction_corrections.py"
+            set_next(next_step(
+                "blocked",
+                "extraction",
+                "Extraction integrity failed; re-run extraction and use only the sanctioned corrections flow.",
+                missing=["all original invoice/support input paths"],
+            ), priority=100)
         elif unresolved_inputs:
-            next_action = "ask the user to exclude or convert every unsupported input, apply input_resolutions, then re-run extract_invoices.py"
-        elif pending and not next_action:
-            next_action = "resolve unidentified documents (vision/OCR/ask user + apply_extraction_corrections.py)"
+            set_next(next_step(
+                "needs_user",
+                "extraction",
+                "Ask the applicant to exclude or replace every unsupported input, then apply the recorded resolutions.",
+                operation="correct-extraction",
+                missing=[f"resolution for {item.get('filename', '?')}" for item in unresolved_inputs],
+            ))
+        elif duplicate_group_errors:
+            set_next(next_step(
+                "needs_user",
+                "extraction",
+                "Every exact-SHA duplicate group must retain exactly one canonical active copy. "
+                "If an older SHA-only correction excluded every copy, re-run extraction with the "
+                "current scripts; then exclude only the named duplicate using sha256 plus its exact source_file.",
+                operation="correct-extraction",
+                missing=[
+                    f"{group['sha256'][:8]}: {group['active_count']} active among "
+                    + ", ".join(group["filenames"])
+                    for group in duplicate_group_errors
+                ],
+            ))
+        elif pending:
+            duplicate_names = [
+                Path(str(item.get("source_file", "?"))).name
+                for item in pending
+                if any(
+                    "duplicate" in str(issue.get("problem", "")).lower()
+                    for issue in (item.get("issues") or [])
+                )
+            ]
+            set_next(next_step(
+                "needs_user",
+                "extraction",
+                (
+                    "Resolve every unidentified or review-required document through vision/OCR or applicant confirmation. "
+                    "Duplicate files must be excluded in Stage 1 through apply_extraction_corrections.py; "
+                    "do not drop their Stage 2 expense units instead."
+                    if duplicate_names else
+                    "Resolve every unidentified or review-required document through vision/OCR or applicant confirmation."
+                ),
+                operation="correct-extraction",
+                missing=[Path(str(item.get("source_file", "?"))).name for item in pending],
+            ))
+
+    stage1_ready = stages.get("extraction", {}).get("status") == "ready"
 
     # Stage 2
-    allocation = load(pdir / "expense-allocation.json")
+    allocation_path = pdir / "expense-allocation.json"
+    allocation = load(allocation_path)
     alloc_fp = ""
+    answers_current = False
+    current_answer_count = 0
+    rebase_current = False
+    rebase_action_count = 0
+    rebase_available = False
+    rebase_source_path = ""
+    rebase_source_fingerprint = ""
+    rebase_selection_reason = "not evaluated"
+    rebase_decisions_status = "missing"
+    rebase_decisions_reason = "no rebase-decisions.json is present"
+    rebase_declared_source = ""
+    rebase_target_fingerprint = ""
+    rebase_target_matches = False
+    rebase_lineage_error = ""
+    rebase_removed_evidence: list[dict[str, Any]] = []
+    rebase_removed_open: list[dict[str, Any]] = []
+    rebase_removed_pending_restore: list[dict[str, Any]] = []
+    rebase_removal_template = str(pdir / "rebase-removal-resolutions.json")
     if not allocation:
-        lines.append("Stage 2 归集: ✗ 未运行")
-        if not next_action:
-            next_action = "run allocate_expenses.py with project context"
+        if allocation_path.exists():
+            lines.append("Stage 2 归集: BLOCKED expense-allocation.json 无法解析")
+            stages["allocation"] = {"number": 2, "status": "blocked", "reason": "malformed_json"}
+            integrity_blocked = True
+            set_next(next_step(
+                "blocked",
+                "allocation",
+                "expense-allocation.json cannot be parsed; regenerate Stage 2 from the current extraction.",
+                missing=["project context file"],
+            ), priority=100)
+        else:
+            lines.append("Stage 2 归集: ✗ 未运行")
+            stages["allocation"] = {"number": 2, "status": "not_started"}
+            if stage1_ready:
+                context_path = pdir.parent / "project-context.json"
+                if context_path.is_file():
+                    context_ok, context_reason = validate_project_context(context_path)
+                    if context_ok:
+                        set_next(next_step(
+                            "command",
+                            "allocation",
+                            "Run Stage 2 with the current extraction and canonical project context.",
+                            operation="allocate",
+                            parameters={"context": str(context_path)},
+                        ))
+                    else:
+                        lines.append(f"  - BLOCKED: project-context.json 结构无效：{context_reason}")
+                        stages["allocation"]["status"] = "blocked"
+                        stages["allocation"]["context_schema_valid"] = False
+                        set_next(next_step(
+                            "blocked",
+                            "allocation",
+                            "Rewrite project-context.json internally using assets/project-context-template.json; "
+                            "do not ask the applicant to write JSON or run allocation with an invalid context.",
+                            missing=["canonical project-context.json"],
+                        ))
+                else:
+                    set_next(next_step(
+                        "needs_user",
+                        "allocation",
+                        "Collect the consultant's project dates, cities, clients, and charge codes, "
+                        "then create project-context.json.",
+                        operation="allocate",
+                        missing=["project context (date range, city, client, charge code)"],
+                    ))
     else:
         ok, reason = integrity.check(allocation)
         alloc_fp = (allocation.get("integrity") or {}).get("fingerprint", "") if ok else ""
         units = allocation.get("allocation_units", [])
         confirmed = [u for u in units if u.get("status") in {"confirmed", "fixed"}]
         closed = [u for u in units if u.get("status") in {"dropped", "excluded", "non_reimbursable"}]
+        unconfirmed = [u for u in units if u.get("status") not in FINAL_UNIT_STATUSES]
         open_qs = [q for q in allocation.get("questions", []) if q.get("status", "open") == "open"]
+        contexts_have_hints = any(
+            context.get(field)
+            for context in allocation.get("project_contexts", [])
+            for field in ("meal_hints", "expense_hints")
+        )
+        hint_ledger_missing = contexts_have_hints and "expense_hint_reconciliation" not in allocation
+        unresolved_hints = [
+            record for record in allocation.get("expense_hint_reconciliation", [])
+            if record.get("resolution_status") not in {"not_required", "resolved"}
+        ]
+        answers_path = pdir / "allocation-answers.json"
+        answers = load(answers_path)
+        if answers:
+            answers_schema_valid = answers.get("schema_version") == "allocation_answers.v1"
+            answer_action_counts = {
+                field: len(answers.get(field, []))
+                if isinstance(answers.get(field, []), list) else 0
+                for field in ANSWER_ACTION_FIELDS
+            }
+            answer_action_counts["lineage_rebase"] = (
+                1 if isinstance(answers.get("lineage_rebase"), dict) and answers.get("lineage_rebase") else 0
+            )
+            current_answer_count = sum(answer_action_counts.values())
+            answers_current = bool(
+                alloc_fp
+                and current_answer_count
+                and answers_schema_valid
+                and str(answers.get("source_allocation_fingerprint", "")) == str(alloc_fp)
+            )
+            artifacts["allocation_answers"] = {
+                "path": str(answers_path),
+                "source_allocation_fingerprint": str(answers.get("source_allocation_fingerprint", "")),
+                "action_count": current_answer_count,
+                "action_counts": answer_action_counts,
+                "schema_valid": answers_schema_valid,
+                "current": answers_current,
+            }
+        rebase_path = pdir / "rebase-decisions.json"
+        rebase_decisions = load(rebase_path)
+        if rebase_decisions:
+            rebase_metadata = rebase_decisions.get("rebase_metadata", {})
+            rebase_integrity_ok, rebase_integrity_reason = integrity.check(rebase_decisions)
+            raw_removed_evidence = rebase_decisions.get("removed_evidence")
+            removed_evidence_schema_valid = bool(
+                isinstance(raw_removed_evidence, list)
+                and all(isinstance(item, dict) for item in raw_removed_evidence)
+            )
+            if removed_evidence_schema_valid:
+                rebase_removed_evidence = [dict(item) for item in raw_removed_evidence]
+                rebase_removed_open = [
+                    item for item in rebase_removed_evidence
+                    if item.get("resolution_status") == "open"
+                ]
+                rebase_removed_pending_restore = [
+                    item for item in rebase_removed_evidence
+                    if item.get("resolution_status") == "pending_restore"
+                ]
+            if isinstance(rebase_metadata, dict):
+                rebase_removal_template = str(
+                    rebase_metadata.get("removal_resolution_template")
+                    or rebase_removal_template
+                )
+            rebase_action_count = sum(
+                len(rebase_decisions.get(field, []))
+                if isinstance(rebase_decisions.get(field, []), list) else 0
+                for field in ("decisions", "expense_hint_resolutions")
+            )
+            declared_generation = str(
+                rebase_decisions.get("for_allocation_fingerprint", "")
+            ).strip().lower()
+            rebase_target_fingerprint = str(
+                (rebase_metadata if isinstance(rebase_metadata, dict) else {}).get(
+                    "target_allocation_fingerprint", ""
+                )
+            ).strip().lower()
+            rebase_declared_source = str(
+                (rebase_metadata if isinstance(rebase_metadata, dict) else {}).get(
+                    "source_allocation_fingerprint", ""
+                )
+            ).strip().lower()
+            rebase_target_matches = bool(
+                alloc_fp
+                and rebase_integrity_ok
+                and str(rebase_decisions.get("integrity", {}).get("stamped_by", "")) == "rebase_allocation_decisions.py"
+                and len(declared_generation) >= 8
+                and str(alloc_fp).lower().startswith(declared_generation)
+                and rebase_target_fingerprint == str(alloc_fp).lower()
+            )
+            if not rebase_integrity_ok:
+                rebase_decisions_status = "invalid"
+                rebase_decisions_reason = f"integrity failed: {rebase_integrity_reason}"
+            elif str(rebase_decisions.get("integrity", {}).get("stamped_by", "")) != "rebase_allocation_decisions.py":
+                rebase_decisions_status = "invalid"
+                rebase_decisions_reason = "file was not stamped by rebase_allocation_decisions.py"
+            elif not rebase_target_matches:
+                rebase_decisions_status = "stale"
+                rebase_decisions_reason = (
+                    "target allocation fingerprint does not match the current allocation generation"
+                )
+            elif not removed_evidence_schema_valid:
+                rebase_decisions_status = "invalid"
+                rebase_decisions_reason = (
+                    "rebase packet lacks the structured removed_evidence ledger; rerun Chief rebase"
+                )
+            else:
+                rebase_decisions_status = "pending_source_validation"
+                rebase_decisions_reason = "target matches; validating the selected lineage source"
+        elif rebase_path.exists():
+            rebase_decisions_status = "invalid"
+            rebase_decisions_reason = "rebase-decisions.json cannot be parsed"
+        if ok and not allocation.get("change_log"):
+            source_path, source_alloc, rebase_reason = allocation_generations.discover_rebase_source(
+                allocation_path, allocation
+            )
+            rebase_selection_reason = rebase_reason
+            if source_path is not None:
+                rebase_available = True
+                rebase_source_path = str(source_path)
+                rebase_source_fingerprint = str(
+                    (source_alloc or {}).get("integrity", {}).get("fingerprint", "")
+                ).strip().lower()
+            elif allocation_generations.is_lineage_integrity_error(rebase_reason):
+                rebase_lineage_error = rebase_reason
+        elif ok:
+            rebase_selection_reason = "current allocation already contains applied decisions"
+
+        if rebase_target_matches and rebase_decisions_status == "pending_source_validation":
+            if not rebase_available:
+                rebase_decisions_status = "stale"
+                rebase_decisions_reason = (
+                    "current allocation has no eligible lineage source for this rebase file"
+                )
+            elif not rebase_declared_source:
+                rebase_decisions_status = "invalid"
+                rebase_decisions_reason = "rebase metadata is missing source_allocation_fingerprint"
+            elif rebase_declared_source != rebase_source_fingerprint:
+                rebase_decisions_status = "stale"
+                rebase_decisions_reason = (
+                    "declared source fingerprint differs from Chief's nearest eligible lineage source"
+                )
+            else:
+                rebase_current = True
+                rebase_decisions_status = "current"
+                rebase_decisions_reason = "source and target generations match Chief's lineage selection"
+                # Even a zero-carry rebase must pass through Composer/updater
+                # once to record that lineage review has been completed.
+                rebase_action_count += 1
+
+        if rebase_path.exists():
+            artifacts["rebase_decisions"] = {
+                "path": str(rebase_path),
+                "status": rebase_decisions_status,
+                "reason": rebase_decisions_reason,
+                "declared_source_allocation_fingerprint": rebase_declared_source,
+                "selected_source_allocation_fingerprint": rebase_source_fingerprint,
+                "target_allocation_fingerprint": rebase_target_fingerprint,
+                "action_count": rebase_action_count if rebase_current else 0,
+                "current": rebase_current,
+                "removed_evidence_count": len(rebase_removed_evidence),
+                "removed_evidence_open_count": len(rebase_removed_open),
+                "removed_evidence_pending_restore_count": len(rebase_removed_pending_restore),
+                "removed_evidence": rebase_removed_evidence,
+                "removal_resolution_template": rebase_removal_template,
+            }
         generation_mismatch = bool(extraction_fp) and (
             str(allocation.get("source_extraction_fingerprint", "")) != extraction_fp
         )
-        stage2_state = "BLOCKED" if not ok or generation_mismatch else ("✓" if not open_qs else "…")
+        context_path = recorded_project_context_path(allocation, pdir)
+        expected_context_sha = str(allocation.get("source_project_context_sha256", "")).strip()
+        context_ok, context_reason = validate_project_context(context_path)
+        actual_context_sha = ""
+        if context_ok:
+            try:
+                actual_context_sha = sha256_file(context_path)
+            except OSError as exc:
+                context_ok = False
+                context_reason = f"project context cannot be hashed: {exc}"
+        context_mismatch = bool(expected_context_sha) and (
+            not context_ok or actual_context_sha != expected_context_sha
+        )
+        upstream_unavailable = not stage1_ready
+        stage2_state = "BLOCKED" if not ok or generation_mismatch or context_mismatch or upstream_unavailable or hint_ledger_missing or rebase_lineage_error else (
+            "✓" if not open_qs and not unconfirmed and not answers_current and not unresolved_hints
+            and not rebase_available and not (rebase_current and rebase_action_count) else "…"
+        )
         stamp_note = "" if ok else f" [INTEGRITY FAILED: {reason}]"
         if generation_mismatch:
             stamp_note += " [STALE: extraction changed after allocation]"
+        if context_mismatch:
+            stamp_note += " [STALE: project context changed, disappeared, or became invalid]"
+        if upstream_unavailable and not generation_mismatch:
+            stamp_note += " [BLOCKED: extraction is not ready]"
+        if hint_ledger_missing:
+            stamp_note += " [STALE: user expense-record reconciliation ledger missing]"
+        if rebase_lineage_error:
+            stamp_note += f" [BLOCKED: {rebase_lineage_error}]"
+        answer_note = f"，待应用答案 {current_answer_count} 项" if answers_current else ""
+        rebase_note = (
+            f"，待确认移除证据 {len(rebase_removed_open)} 项" if rebase_current and rebase_removed_open
+            else f"，待恢复移除证据 {len(rebase_removed_pending_restore)} 项" if rebase_current and rebase_removed_pending_restore
+            else f"，待迁移决定 {rebase_action_count} 项" if rebase_current and rebase_action_count
+            else ("，检测到可迁移的上一代决定" if rebase_available and not rebase_current else "")
+        )
+        hint_count_text = "未知（台账缺失）" if hint_ledger_missing else f"{len(unresolved_hints)} 条"
         lines.append(f"Stage 2 归集: {stage2_state} 单元 {len(confirmed)}/{len(units)} 已确认"
-                     f"（另排除 {len(closed)}），阻断问题 {len(open_qs)} 个{stamp_note}")
+                     f"（另排除 {len(closed)}），阻断问题 {len(open_qs)} 个，未对应用户记录 {hint_count_text}"
+                     f"{answer_note}{rebase_note}{stamp_note}")
+        stage2_ready = (
+            ok and not generation_mismatch and not context_mismatch and not upstream_unavailable and not rebase_lineage_error
+            and not hint_ledger_missing and not unresolved_hints
+            and not open_qs and not unconfirmed and not answers_current
+            and not rebase_available and not (rebase_current and rebase_action_count)
+        )
+        stages["allocation"] = {
+            "number": 2,
+            "status": "ready" if stage2_ready else (
+                "blocked" if not ok or generation_mismatch or context_mismatch or upstream_unavailable or rebase_lineage_error else (
+                    "command_ready" if answers_current or rebase_available or (
+                        rebase_current and rebase_action_count
+                        and not rebase_removed_open and not rebase_removed_pending_restore
+                    ) else "needs_user"
+                )
+            ),
+            "unit_count": len(units),
+            "confirmed_count": len(confirmed),
+            "closed_count": len(closed),
+            "unconfirmed_count": len(unconfirmed),
+            "open_question_count": len(open_qs),
+            "unresolved_expense_hint_count": len(unresolved_hints),
+            "expense_hint_ledger_missing": hint_ledger_missing,
+            "unapplied_answer_count": current_answer_count if answers_current else 0,
+            "rebase_available": rebase_available,
+            "rebase_source_path": rebase_source_path,
+            "rebase_source_fingerprint": rebase_source_fingerprint,
+            "rebase_selection_reason": rebase_selection_reason,
+            "rebase_decisions_current": rebase_current,
+            "rebase_decisions_status": rebase_decisions_status,
+            "rebase_decisions_reason": rebase_decisions_reason,
+            "rebase_action_count": rebase_action_count if rebase_current else 0,
+            "removed_evidence_count": len(rebase_removed_evidence) if rebase_current else 0,
+            "removed_evidence_open_count": len(rebase_removed_open) if rebase_current else 0,
+            "removed_evidence_pending_restore_count": (
+                len(rebase_removed_pending_restore) if rebase_current else 0
+            ),
+            "removal_resolution_template": rebase_removal_template,
+            "rebase_lineage_error": rebase_lineage_error,
+            "integrity_valid": ok,
+            "generation_mismatch": generation_mismatch,
+            "context_mismatch": context_mismatch,
+            "context_schema_valid": context_ok,
+        }
+        artifacts["allocation"] = {
+            "path": str(allocation_path),
+            "integrity_fingerprint": str(alloc_fp),
+            "source_extraction_fingerprint": str(allocation.get("source_extraction_fingerprint", "")),
+            "source_project_context_file": str(context_path),
+            "source_project_context_sha256": expected_context_sha,
+            "actual_project_context_sha256": actual_context_sha,
+            "allocation_engine_revision": str(allocation.get("allocation_engine_revision", "")),
+            "previous_allocation_file": str(allocation.get("previous_allocation_file", "")),
+            "selected_rebase_source_path": rebase_source_path,
+            "selected_rebase_source_fingerprint": rebase_source_fingerprint,
+            "rebase_selection_rule": (
+                "nearest same-basis ancestor containing official user decisions"
+            ),
+        }
         if not ok:
             integrity_blocked = True
-        if not ok and not next_action:
-            next_action = "re-run allocate_expenses.py; make changes only through the allocation answers updater"
-        elif generation_mismatch and not next_action:
-            next_action = "re-run allocate_expenses.py because extraction changed; regenerate the answers template before applying answers"
-        elif open_qs and not next_action:
-            next_action = f"relay the {len(open_qs)} blocking question(s) to the user verbatim (re-run allocate_expenses.py to reprint them)"
+        if rebase_lineage_error:
+            integrity_blocked = True
+        if not ok:
+            set_next(next_step(
+                "blocked",
+                "allocation",
+                "Allocation integrity failed; regenerate Stage 2 and use only composer/updater for later changes.",
+                missing=["current project context file"],
+            ), priority=100)
+        elif rebase_lineage_error:
+            set_next(next_step(
+                "blocked",
+                "allocation",
+                "The immutable allocation generation chain is missing, cyclic, or failed integrity. "
+                "Recover the referenced stamped archive or use the documented clean sibling-batch rebuild; "
+                "do not continue with ordinary answers.",
+                missing=[rebase_lineage_error],
+            ), priority=100)
+        elif generation_mismatch:
+            if context_ok:
+                set_next(next_step(
+                    "command",
+                    "allocation",
+                    "Extraction changed; regenerate allocation and all answers from the current extraction.",
+                    operation="allocate",
+                    parameters={"context": str(context_path)},
+                ))
+            else:
+                set_next(next_step(
+                    "blocked",
+                    "allocation",
+                    "Extraction changed, but the project context is missing or invalid. Rewrite it internally "
+                    "from the applicant's notes using assets/project-context-template.json.",
+                    missing=[f"canonical project context: {context_reason}"],
+                ))
+        elif context_mismatch:
+            if context_ok:
+                set_next(next_step(
+                    "command",
+                    "allocation",
+                    "Project context changed after allocation; regenerate Stage 2 and recompose all answers.",
+                    operation="allocate",
+                    parameters={"context": str(context_path)},
+                ))
+            else:
+                set_next(next_step(
+                    "blocked",
+                    "allocation",
+                    "The recorded project context disappeared or is invalid. Rewrite the canonical context "
+                    "internally before rerunning allocation.",
+                    missing=[f"canonical project context: {context_reason}"],
+                ))
+        elif hint_ledger_missing:
+            if context_ok:
+                set_next(next_step(
+                    "command",
+                    "allocation",
+                    "User expense hints exist but the reverse reconciliation ledger is missing; regenerate Stage 2.",
+                    operation="allocate",
+                    parameters={"context": str(context_path)},
+                ))
+            else:
+                set_next(next_step(
+                    "blocked",
+                    "allocation",
+                    "The expense-record ledger is missing and project context is unavailable; restore the canonical context first.",
+                    missing=[f"canonical project context: {context_reason}"],
+                ))
+        elif answers_current:
+            set_next(next_step(
+                "command",
+                "allocation",
+                f"Apply the {current_answer_count} current fingerprint-bound answer action(s) "
+                "through the official updater.",
+                operation="apply",
+                parameters={"answers": str(answers_path)},
+            ))
+        elif rebase_current and rebase_removed_open:
+            set_next(next_step(
+                "needs_user",
+                "allocation",
+                "A prior confirmed/fixed expense item disappeared after evidence files changed. "
+                "Ask the applicant to confirm each M@ref item as intentional_removal, "
+                "replacement_provided (with exact current N@ref), or restore_required. "
+                "Record the answers in the generated UTF-8 removal-resolution template.",
+                operation="rebase",
+                parameters={
+                    "old": rebase_source_path,
+                    "resolutions": rebase_removal_template,
+                },
+                missing=[
+                    f"{item.get('removal_ref')}: {item.get('source_filename') or '?'} | "
+                    f"{value_utils.display_value(item.get('amount'), missing='?')} | "
+                    f"{item.get('expense_date') or item.get('source_category') or '?'}"
+                    for item in rebase_removed_open
+                ],
+            ))
+        elif rebase_current and rebase_removed_pending_restore:
+            set_next(next_step(
+                "needs_user",
+                "allocation",
+                "The applicant said removed evidence must be restored. Add/restore those source files, "
+                "then rerun extraction, allocation, and rebase; this generation cannot proceed.",
+                missing=[
+                    f"{item.get('removal_ref')}: restore {item.get('source_filename') or 'the cited evidence'}"
+                    for item in rebase_removed_pending_restore
+                ],
+            ))
+        elif rebase_current and rebase_action_count:
+            set_next(next_step(
+                "command",
+                "allocation",
+                f"Compile the {rebase_action_count} lineage-rebased decision action(s) through Composer.",
+                operation="compose",
+                parameters={"decisions": str(rebase_path)},
+            ))
+        elif rebase_available and not rebase_current:
+            stale_detail = (
+                f" Existing rebase-decisions.json is {rebase_decisions_status}: "
+                f"{rebase_decisions_reason}."
+                if rebase_path.exists()
+                else ""
+            )
+            set_next(next_step(
+                "command",
+                "allocation",
+                "A prior same-basis allocation contains official user decisions. "
+                f"Chief selected source {rebase_source_fingerprint[:8]} at {rebase_source_path}."
+                f"{stale_detail} Regenerate the rebase packet before asking repeated questions.",
+                operation="rebase",
+                parameters={
+                    "old": rebase_source_path,
+                    "source_fingerprint": rebase_source_fingerprint,
+                    "target_fingerprint": str(alloc_fp),
+                },
+            ))
+        elif open_qs:
+            set_next(next_step(
+                "needs_user",
+                "allocation",
+                f"Relay and answer the {len(open_qs)} blocking allocation question(s), "
+                "then compose/apply the decisions.",
+                operation="compose",
+                missing=["applicant answers to open allocation questions"],
+            ))
+        elif unconfirmed:
+            set_next(next_step(
+                "needs_user",
+                "allocation",
+                f"Confirm or close the {len(unconfirmed)} remaining draft allocation unit(s), "
+                "then compose/apply the decisions.",
+                operation="compose",
+                missing=["confirmation for remaining draft allocation units"],
+            ))
+
+
+    stage2_ready = stages.get("allocation", {}).get("status") == "ready"
+
+    AUDIT_ROLES = (
+        ("mirror_warden", "Otako - Mirror Warden",
+         "precision-first factual reconciliation against claimed evidence before Stage 3"),
+        ("gate_challenger", "Kaede - Gate Challenger",
+         "narrow explicit-policy and required-approval gate before Stage 3"),
+    )
+    audit_states = {}
+    for _role, _display, _reason in AUDIT_ROLES:
+        if allocation and alloc_fp:
+            _st = subagent_protocol.audit_state(_role, pdir, allocation, allocation_path, extraction_path)
+        else:
+            _st = {
+                "status": "unavailable",
+                "current": False,
+                "outcome": "not_run",
+                "blocking_count": 0,
+                "advisory_count": 0,
+                "result_fingerprint": "",
+                "findings": [],
+                "reason": "allocation is not ready for audit",
+                "path": str(pdir / f"{_role}-audit.json"),
+            }
+        subagents[_role] = _st
+        audit_states[_role] = _st
+
+    audit_blocking_findings = [
+        finding
+        for _role, _, _ in AUDIT_ROLES
+        if audit_states[_role].get("current") and audit_states[_role].get("outcome") == "block"
+        for finding in audit_states[_role].get("findings", [])
+        if finding.get("severity") == "blocking"
+    ]
+    audit_blocks_stage3 = bool(stage2_ready and audit_blocking_findings)
+    combined_audit_fp = "|".join(
+        f"{_role}:{audit_states[_role].get('result_fingerprint', '')}" for _role, _, _ in AUDIT_ROLES
+    )
+    both_audits_current = all(audit_states[_role].get("current") for _role, _, _ in AUDIT_ROLES)
+    artifacts["subagent_audits"] = {
+        _role: {
+            "path": audit_states[_role].get("path", str(pdir / f"{_role}-audit.json")),
+            "status": audit_states[_role].get("status", "missing"),
+            "outcome": audit_states[_role].get("outcome", "not_run"),
+            "result_fingerprint": audit_states[_role].get("result_fingerprint", ""),
+        }
+        for _role, _, _ in AUDIT_ROLES
+    }
+    if stage2_ready:
+        for _role, _display, _reason in AUDIT_ROLES:
+            _st = audit_states[_role]
+            if _st.get("current"):
+                _advisory_note = (
+                    "; advisory is informational only and needs no applicant reply"
+                    if int(_st.get("advisory_count", 0) or 0)
+                    and not int(_st.get("blocking_count", 0) or 0)
+                    else ""
+                )
+                lines.append(
+                    f"{_display} audit: {_st.get('outcome')} "
+                    f"({_st.get('blocking_count', 0)} blocking / {_st.get('advisory_count', 0)} advisory)"
+                    f"{_advisory_note}"
+                )
+            else:
+                lines.append(
+                    f"{_display} audit: {_st.get('status', 'missing')} - run before Stage 3 via a fresh "
+                    "Agent (Task tool); deterministic Stage 3 preflight is the fail-open fallback"
+                )
+                subagents["recommended"].append({
+                    "role": _role,
+                    "display_name": _display,
+                    "reason": _reason,
+                })
+    if audit_blocks_stage3:
+        set_next(next_step(
+            "needs_user",
+            "workbook",
+            "Resolve the blocking findings from the subagent audit(s) through the normal "
+            "Composer/Updater flow, then run a fresh audit before Stage 3.",
+            operation="compose",
+            missing=[
+                f"{finding.get('code', 'audit finding')}: {finding.get('message', '')}"
+                for finding in audit_blocking_findings
+            ],
+        ), priority=30)
 
     # Stage 3
-    rows = load(pdir / "final-expense-rows.json")
+    rows_path = pdir / "final-expense-rows.json"
+    rows = load(rows_path)
     rows_ready = False
     rows_fingerprint = ""
     if not rows:
-        lines.append("Stage 3 报销表: ✗ 未运行（餐费/酒店上限检查尚未发生）")
-        if not next_action:
-            next_action = "run write_reimbursement_template.py"
+        if rows_path.exists():
+            lines.append("Stage 3 报销表: BLOCKED final-expense-rows.json 无法解析")
+            stages["workbook"] = {"number": 3, "status": "blocked", "reason": "malformed_json"}
+            integrity_blocked = True
+            set_next(next_step(
+                "blocked",
+                "workbook",
+                "final-expense-rows.json cannot be parsed; regenerate Stage 3 from the confirmed allocation.",
+                missing=["requester and workbook output path"],
+            ), priority=100)
+        else:
+            lines.append("Stage 3 报销表: ✗ 未运行（餐费/酒店上限检查尚未发生）")
+            stages["workbook"] = {"number": 3, "status": "not_started"}
+            if stage2_ready:
+                set_next(next_step(
+                    "needs_user",
+                    "workbook",
+                    "Provide the requester and desired workbook path, then run Stage 3.",
+                    operation="write",
+                    missing=["requester", "workbook output path"],
+                ))
     else:
         rows_ok, rows_reason = integrity.check(rows)
         rows_fp = str(rows.get("source_allocation_fingerprint", ""))
-        rows_fingerprint = str((rows.get("integrity") or {}).get("fingerprint", ""))
+        rows_fingerprint = str((rows.get("integrity") or {}).get("fingerprint", "")) if rows_ok else ""
         workbook_sha = str(rows.get("workbook_sha256", ""))
-        blocking = int(rows.get("blocking_policy_checks", 0) or 0)
+        try:
+            blocking = int(rows.get("blocking_policy_checks", 0) or 0)
+        except (TypeError, ValueError):
+            blocking = 1
+        try:
+            preview_open_questions = int(rows.get("open_allocation_questions", 0) or 0)
+        except (TypeError, ValueError):
+            preview_open_questions = 1
+        hint_ledger_present = "expense_hint_reconciliation" in rows
+        try:
+            unresolved_hint_count = int(rows.get("unresolved_expense_hint_count", -1))
+        except (TypeError, ValueError):
+            unresolved_hint_count = -1
+        preview = bool(rows.get("generated_with_allow_unconfirmed")) or preview_open_questions > 0
         stale = bool(alloc_fp) and rows_fp != alloc_fp
+        upstream_unavailable = not stage2_ready
+        recorded_workbook = str(rows.get("workbook", ""))
+        template_workbook = str(rows.get("template_workbook", ""))
+        layout_file = str(rows.get("layout_file", ""))
+        workbook_source = str(rows.get("workbook_source", ""))
+        workbook_path = Path(recorded_workbook).expanduser() if recorded_workbook else None
+        workbook_exists = bool(workbook_path and workbook_path.is_file())
+        actual_workbook_sha = ""
+        if workbook_exists and workbook_path:
+            try:
+                actual_workbook_sha = sha256_file(workbook_path)
+            except OSError:
+                workbook_exists = False
+        workbook_mismatch = bool(workbook_sha and actual_workbook_sha and workbook_sha != actual_workbook_sha)
+        recorded_review = rows.get("subagent_audit", {})
+        if not isinstance(recorded_review, dict):
+            recorded_review = {}
+        recorded_review_fp = str(recorded_review.get("result_fingerprint", ""))
+        current_review_fp = combined_audit_fp
+        review_changed_after_workbook = bool(
+            both_audits_current
+            and not audit_blocks_stage3
+            and current_review_fp
+            and current_review_fp != recorded_review_fp
+        )
         if not rows_ok:
             state = f"✗ 完整性失败（{rows_reason}）"
+        elif upstream_unavailable:
+            state = "✗ 上游 allocation 未就绪"
+        elif audit_blocks_stage3:
+            state = "… 独立复核有阻断事项"
+        elif review_changed_after_workbook:
+            state = "✗ 独立复核结果晚于当前工作簿，需重跑 Stage 3"
         elif not workbook_sha:
             state = "✗ 缺少工作簿哈希，不能验证或打包"
+        elif not hint_ledger_present or unresolved_hint_count < 0:
+            state = "✗ 缺少用户费用记录完整性台账，需重跑 Stage 3"
         elif stale:
             state = "✗ 已过期（allocation 在其生成后被修改）"
+        elif preview:
+            state = "✗ 预览件越过了开放关卡，不能交付"
         elif blocking:
             state = "… 有阻断的政策检查"
+        elif unresolved_hint_count:
+            state = f"… 有 {unresolved_hint_count} 条用户费用记录尚未对应凭证/明确排除"
+        elif not workbook_exists:
+            state = "✗ 记录中的工作簿不存在"
+        elif workbook_mismatch:
+            state = "✗ 工作簿内容与 final rows 哈希不符"
         else:
             state = "✓"
             rows_ready = True
         lines.append(f"Stage 3 报销表: {state}，行数 {len(rows.get('rows', []))}，未决餐费/酒店检查 {blocking} 个")
-        if not rows_ok and not next_action:
-            next_action = "re-run write_reimbursement_template.py (final rows integrity failed)"
+        # Option 2: surface the writer's already-computed meal cap checks. The
+        # status engine never recomputes caps; it only relays what Stage 3 wrote,
+        # so event-declared meal standards (final-expense-rows.meal_daily_cap_checks)
+        # remain a single source of truth in write_reimbursement_template.py.
+        meal_cap_checks = rows.get("meal_daily_cap_checks", [])
+        if not isinstance(meal_cap_checks, list):
+            meal_cap_checks = []
+        event_meal_flags = [
+            check for check in meal_cap_checks
+            if isinstance(check, dict) and (
+                check.get("event_declared") or check.get("requires_user_confirmation")
+            )
+        ]
+        for check in event_meal_flags[:10]:
+            marker = "事件餐标" if check.get("event_declared") else "餐费上限"
+            confirm_note = "（需确认）" if check.get("requires_user_confirmation") else ""
+            lines.append(
+                f"  - {marker} {check.get('date', '?')} "
+                f"[{check.get('policy_name', '')}]: 合计 {check.get('total', '?')} / "
+                f"上限 {check.get('cap', '?')} / 超出 {check.get('over_by', '0.00')} / "
+                f"{check.get('status', '')}{confirm_note}"
+            )
+        if rows_ready:
+            stage3_status = "ready"
+        elif audit_blocks_stage3:
+            stage3_status = "needs_user"
+        elif not rows_ok or upstream_unavailable or review_changed_after_workbook or not workbook_sha or not hint_ledger_present or unresolved_hint_count < 0 or stale or preview:
+            stage3_status = "blocked"
+        elif blocking or unresolved_hint_count:
+            stage3_status = "needs_user"
+        else:
+            stage3_status = "blocked"
+        stages["workbook"] = {
+            "number": 3,
+            "status": stage3_status,
+            "row_count": len(rows.get("rows", [])),
+            "blocking_policy_check_count": blocking,
+            "event_meal_standard_flag_count": len(event_meal_flags),
+            "unresolved_expense_hint_count": max(unresolved_hint_count, 0),
+            "expense_hint_ledger_present": hint_ledger_present,
+            "preview": preview,
+            "integrity_valid": rows_ok,
+            "allocation_stale": stale,
+            "workbook_exists": workbook_exists,
+            "workbook_hash_matches": bool(actual_workbook_sha and actual_workbook_sha == workbook_sha),
+            "subagent_audit_blocking": audit_blocks_stage3,
+            "subagent_audit_changed_after_workbook": review_changed_after_workbook,
+            "subagent_audit_result_fingerprint": recorded_review_fp,
+        }
+        artifacts["final_rows"] = {
+            "path": str(rows_path),
+            "integrity_fingerprint": rows_fingerprint,
+            "source_allocation_fingerprint": rows_fp,
+        }
+        artifacts["workbook"] = {
+            "path": recorded_workbook,
+            "recorded_sha256": workbook_sha,
+            "actual_sha256": actual_workbook_sha,
+        }
         if not rows_ok:
             integrity_blocked = True
-        elif not workbook_sha and not next_action:
-            next_action = "re-run write_reimbursement_template.py (workbook hash is missing)"
-        elif stale and not next_action:
-            next_action = "re-run write_reimbursement_template.py (workbook is stale)"
-        elif blocking and not next_action:
-            next_action = "relay the stage 3 review summary to the user; resolve via updater, then re-run stage 3"
+        if not rows_ok:
+            set_next(next_step(
+                "blocked",
+                "workbook",
+                "Final rows integrity failed; regenerate Stage 3 instead of repairing the derived file.",
+                missing=["requester and workbook output path"],
+            ), priority=100)
+        elif upstream_unavailable:
+            set_next(next_step(
+                "blocked",
+                "workbook",
+                "The upstream allocation is not ready; resolve the earlier stage before regenerating Stage 3.",
+            ))
+        elif review_changed_after_workbook or not workbook_sha or not hint_ledger_present or unresolved_hint_count < 0 or stale or preview or not workbook_exists or workbook_mismatch:
+            requester = str(rows.get("requester", ""))
+            write_parameters = {"requester": requester, "output": recorded_workbook}
+            missing_write_source: list[str] = []
+            if template_workbook:
+                write_parameters["template"] = template_workbook
+            elif layout_file:
+                write_parameters["layout"] = layout_file
+            elif workbook_source == "template":
+                missing_write_source.append("original template workbook path")
+            if requester and recorded_workbook and stage2_ready and not missing_write_source:
+                set_next(next_step(
+                    "command",
+                    "workbook",
+                    "Regenerate the workbook and final rows from the current confirmed allocation.",
+                    operation="write",
+                    parameters=write_parameters,
+                ))
+            else:
+                set_next(next_step(
+                    "needs_user",
+                    "workbook",
+                    "Regenerate Stage 3 after confirming its requester and workbook output path.",
+                    operation="write",
+                    missing=["requester", "workbook output path", *missing_write_source],
+                ))
+        elif blocking or unresolved_hint_count:
+            if answers_current:
+                set_next(next_step(
+                    "command",
+                    "workbook",
+                    "Apply the current policy-check decisions through the updater, then rerun Stage 3.",
+                    operation="apply",
+                    parameters={"answers": str(pdir / "allocation-answers.json")},
+                ))
+            else:
+                set_next(next_step(
+                    "needs_user",
+                    "workbook",
+                    "Show the Stage 3 meal/hotel review summary, resolve every blocking check "
+                    "through the updater, then rerun Stage 3.",
+                    operation="compose",
+                    missing=["applicant decision for blocking meal/hotel policy checks"],
+                ))
 
     # Stage 4: require a current, stamped manifest and every listed package file.
-    root = Path(args.output_root)
-    candidates = sorted(p for p in root.glob("**/*.xlsx")) if root.exists() else []
+    candidates = sorted(
+        path for path in root.glob("**/*.xlsx")
+        if not is_hidden_package_artifact(path, root)
+    ) if root.exists() else []
     expected_sha = str((rows or {}).get("workbook_sha256", ""))
+    expected_hint_count = len((rows or {}).get("expense_hint_reconciliation", []))
     verified = None
     incomplete: tuple[Path, str] | None = None
     orphan: Path | None = None
@@ -237,9 +1157,18 @@ def main(argv: list[str] | None = None) -> int:
                     continue
             except OSError:
                 continue
-            mf = load(c.parent / "package-manifest.json")
-            if mf:
-                ok, reason = validate_package_manifest(mf, c, expected_sha, rows_fingerprint)
+            manifest_path = c.parent / "package-manifest.json"
+            mf = load(manifest_path)
+            if manifest_path.exists() and mf is None:
+                incomplete = (c, "manifest integrity failed: manifest JSON cannot be parsed")
+            elif mf is not None:
+                ok, reason = validate_package_manifest(
+                    mf,
+                    c,
+                    expected_sha,
+                    rows_fingerprint,
+                    expected_hint_count,
+                )
                 if ok:
                     verified = c
                     break
@@ -248,31 +1177,113 @@ def main(argv: list[str] | None = None) -> int:
                 orphan = c
     if verified:
         lines.append(f"Stage 4 打包: ✓ {verified.parent}（manifest、final rows 与全部包内文件已验证）")
+        stages["package"] = {"number": 4, "status": "ready", "package_root": str(verified.parent)}
+        manifest = load(verified.parent / "package-manifest.json") or {}
+        artifacts["package_manifest"] = {
+            "path": str(verified.parent / "package-manifest.json"),
+            "integrity_fingerprint": str((manifest.get("integrity") or {}).get("fingerprint", "")),
+        }
     elif incomplete:
         candidate, reason = incomplete
         lines.append(f"Stage 4 打包: ✗ {candidate.parent} 不可提交：{reason}")
-        if not next_action:
-            next_action = "resolve package issues or rebuild the package with package_reimbursement_files.py"
+        stages["package"] = {"number": 4, "status": "blocked", "reason": reason}
+        if reason.startswith("manifest integrity failed:"):
+            integrity_blocked = True
+            set_next(next_step(
+                "blocked",
+                "package",
+                "Package manifest integrity failed; rebuild Stage 4 from the current verified workbook.",
+            ), priority=100)
+        elif reason.startswith("package has "):
+            set_next(next_step(
+                "needs_user",
+                "package",
+                "Resolve every package manifest issue, then rebuild the package.",
+                operation="package",
+                missing=[reason],
+            ))
+        else:
+            set_next(next_step(
+                "command",
+                "package",
+                "Rebuild the package because its manifest or packaged files no longer validate.",
+                operation="package",
+            ))
     elif orphan:
         lines.append(f"Stage 4 打包: ? {orphan} 哈希匹配但无有效 package manifest —— 只是被复制的工作簿，不是完整打包")
-        if not next_action:
-            next_action = "run package_reimbursement_files.py to produce a real package (workbook alone is not a deliverable)"
+        stages["package"] = {"number": 4, "status": "not_started", "reason": "orphan_workbook"}
+        set_next(next_step(
+            "command",
+            "package",
+            "Build a complete package; a copied workbook without a valid manifest is not deliverable.",
+            operation="package",
+        ))
     elif candidates:
         lines.append(f"Stage 4 打包: ? 发现 {len(candidates)} 个 .xlsx 但均非本批 stage 3 产物（哈希不符/无法验证）")
-        if not next_action:
-            next_action = "re-run package_reimbursement_files.py with the latest stage 3 workbook"
+        stages["package"] = {"number": 4, "status": "not_started", "reason": "wrong_workbook_candidates"}
+        set_next(next_step(
+            "command",
+            "package",
+            "Package the exact workbook recorded by the latest final rows.",
+            operation="package",
+        ))
     elif rows and not rows_ready:
         lines.append("Stage 4 打包: ✗ Stage 3 产物不可验证，不能判断打包状态")
+        stages["package"] = {"number": 4, "status": "blocked", "reason": "stage3_not_ready"}
     else:
         lines.append("Stage 4 打包: ✗ 未运行")
-        if not next_action:
-            next_action = "run package_reimbursement_files.py"
+        stages["package"] = {"number": 4, "status": "not_started"}
+        if rows_ready:
+            set_next(next_step(
+                "command",
+                "package",
+                "Build the final submission package from the current verified workbook.",
+                operation="package",
+            ))
 
-    print("WORKFLOW STATUS (relay to the user):")
-    for line in lines:
-        print(line)
-    print(f"NEXT: {next_action or 'workflow complete — deliver the package summary to the user'}")
-    return 2 if integrity_blocked else 0
+    if pending_next is None:
+        pending_next = next_step(
+            "complete",
+            "complete",
+            "Workflow complete; relay the verified Close Message from the current package manifest.",
+        )
+
+    return {
+        "schema_version": "reimbursement_workflow_state.v1",
+        "process_dir": str(pdir),
+        "output_root": str(root),
+        "stages": stages,
+        "artifacts": artifacts,
+        "subagents": subagents,
+        "lines": lines,
+        "next": pending_next,
+        "integrity_blocked": integrity_blocked,
+        "complete": pending_next.get("kind") == "complete",
+    }
+
+
+def render_status(state: dict[str, Any]) -> str:
+    lines = ["WORKFLOW STATUS (relay to the user):", *state.get("lines", [])]
+    lines.append(f"NEXT: {(state.get('next') or {}).get('summary', 'inspect workflow state')}")
+    return "\n".join(lines)
+
+
+def main(argv: list[str] | None = None) -> int:
+    configure_stdio()
+    parser = argparse.ArgumentParser(description="Report reimbursement workflow status.")
+    parser.add_argument("--process-dir", default="process")
+    parser.add_argument("--output-root", default="output")
+    parser.add_argument("--json", action="store_true", help="Print the shared machine-readable workflow state.")
+    args = parser.parse_args(argv)
+
+    state = inspect_workflow(args.process_dir, args.output_root)
+    if args.json:
+        print(json.dumps(state, ensure_ascii=False, indent=2))
+    else:
+        print(render_status(state))
+    # This is a read-only query: a successfully reported blocked state is not a
+    # CLI execution failure. Consumers inspect next.kind/integrity_blocked.
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

@@ -6,9 +6,7 @@ from __future__ import annotations
 import argparse
 import json
 import re
-import shutil
 import sys
-from datetime import datetime
 from pathlib import Path
 from typing import Any
 
@@ -19,8 +17,27 @@ CLOSED_UNIT_STATUSES = {"confirmed", "fixed", "dropped", "excluded", "non_reimbu
 ALLOWED_UNIT_STATUSES = OPEN_STATUSES | CLOSED_UNIT_STATUSES
 # Policy values come from assets/policy.toml; edit that file when policy changes.
 from policy_config import load_policy
+# Persistent place -> place-type memory: confirmed taxi endpoints are written back
+# so next month's allocation resolves them without re-asking.
+import place_config
+from place_config import PlaceBook
+import allocation_generations
+import evidence_paths
+from exit_codes import ExitCode
 import integrity
+from io_utils import configure_utf8_stdio as configure_stdio
+from json_io import read_json_object as load_json
 import text_safety
+from text_utils import strip_scalar as clean
+import time_utils
+from travel_ticket_utils import (
+    contains_raw_ticket_evidence,
+    is_flight_ticket,
+    is_rail_ticket,
+    route_from_text,
+    ticket_note,
+)
+import value_utils
 
 _POLICY = load_policy()
 ADMIN_CODE = _POLICY.admin_code
@@ -32,15 +49,51 @@ ALLOWED_ROOT_FIELDS = {
     "generated_at",
     "source_allocation_fingerprint",
     "source_allocation_file",
-    "fill_instructions",
-    "review_context",
     "unit_updates",
+    "expense_hint_resolutions",
     "question_updates",
     "project_contexts",
     "confirm_units",
     "drop_units",
     "exclude_units",
+    "lineage_rebase",
 }
+MONEY_FIELDS = {"amount", "invoice_amount", "reimbursable_amount"}
+
+HINT_RESOLUTION_ACTIONS = {
+    "matched_existing",
+    "covered_by_invoice",
+    "not_reimbursed",
+    "pending_invoice",
+}
+HINT_RESOLUTION_FIELDS = {
+    "question_id",
+    "record_ref",
+    "hint_id",
+    "action",
+    "unit_ids",
+    "note",
+}
+
+REMOVED_EVIDENCE_FIELDS = {
+    "removal_ref",
+    "unit_identity_sha256",
+    "prior_unit_ref",
+    "source_sha256",
+    "source_filename",
+    "amount",
+    "expense_date",
+    "source_category",
+    "prior_status",
+    "requires_confirmation",
+    "resolution_status",
+    "resolution_action",
+    "replacement_unit_ids",
+    "replacement_unit_identities",
+    "replacement_unit_refs",
+    "resolution_note",
+}
+INACTIVE_REBASE_STATUSES = {"dropped", "excluded", "non_reimbursable"}
 
 META_FIELDS = {
     "answer",
@@ -117,7 +170,7 @@ CORRECTION_META_FIELDS = {
 }
 
 
-# These are the fields a helper or user can change and that can later reach
+# These are the fields a decision or user answer can change and that can later reach
 # applicant-facing questions, final Notes, or workbook cells. Raw extraction
 # evidence is deliberately excluded because OCR uncertainty belongs in Stage 1
 # review rather than being mistaken for a terminal encoding failure here.
@@ -133,26 +186,9 @@ ENCODING_CHECK_CONTEXT_FIELDS = {
 }
 
 
-def load_json(path: Path) -> Any:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
-
-
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
-
-
-def clean(value: Any) -> str:
-    return "" if value is None else str(value).strip()
-
-
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(errors="replace")
-            except Exception:
-                pass
 
 
 def list_text(value: Any) -> str:
@@ -231,95 +267,6 @@ def contains_hotel_placeholder(note: Any) -> bool:
     return any(token in text for token in ["X晚", "入住日", "离店日"])
 
 
-def strip_route_place(value: Any) -> str:
-    text = clean(value)
-    text = re.sub(r"^[A-Z]{0,3}\d{1,5}\s*[,，]?\s*", "", text, flags=re.IGNORECASE)
-    text = re.sub(r"^(高铁|动车|火车|铁路|飞机|航班|机票)\s*", "", text)
-    text = re.sub(r"\s*(二等座|一等座|商务座|硬座|软座|硬卧|软卧|经济舱|公务舱|头等舱).*$", "", text)
-    return text.strip(" ,，;；。()（）")
-
-
-def route_from_text(value: Any) -> str:
-    text = clean(value)
-    if not text:
-        return ""
-    match = re.search(r"（([^（）]+)）", text)
-    if match:
-        text = match.group(1)
-    for piece in re.split(r"[,，;；]", text):
-        match = re.search(r"(.+?)\s*(?:->|—|~|至|到|-)\s*(.+)", piece)
-        if match:
-            origin = strip_route_place(match.group(1))
-            destination = strip_route_place(match.group(2))
-            if origin and destination:
-                return f"{origin}-{destination}"
-    match = re.search(r"(.+?)\s*(?:->|—|~|至|到|-)\s*(.+)", text)
-    if match:
-        origin = strip_route_place(match.group(1))
-        destination = strip_route_place(match.group(2))
-        if origin and destination:
-            return f"{origin}-{destination}"
-    return ""
-
-
-def is_refund_fee(unit: dict[str, Any]) -> bool:
-    text = clean(" ".join([
-        unit.get("final_note", ""),
-        unit.get("source_note", ""),
-        unit.get("expense_note", ""),
-        unit.get("raw_remarks", ""),
-        unit.get("line_item_name", ""),
-        unit.get("seller_name", ""),
-    ]))
-    return any(keyword in text for keyword in ["退票费", "退票", "退款", "refund", "Refund", "cancellation"])
-
-
-def is_rail_ticket(unit: dict[str, Any]) -> bool:
-    subtype = clean(unit.get("document_subtype"))
-    text = clean(" ".join([unit.get("source_note", ""), unit.get("expense_note", ""), unit.get("final_note", "")]))
-    return subtype == "railway_e_ticket" or bool(re.match(r"^[GCDKZT]\d{1,5}\b", text, flags=re.IGNORECASE))
-
-
-def is_flight_ticket(unit: dict[str, Any]) -> bool:
-    text = clean(" ".join([
-        unit.get("document_subtype", ""),
-        unit.get("source_note", ""),
-        unit.get("expense_note", ""),
-        unit.get("final_note", ""),
-        unit.get("raw_remarks", ""),
-    ])).lower()
-    return any(keyword in text for keyword in ["飞机", "机票", "航班", "flight"])
-
-
-def ticket_note(unit: dict[str, Any]) -> str:
-    if clean(unit.get("origin")):
-        return ""
-    route = (
-        route_from_text(unit.get("route"))
-        or route_from_text(unit.get("source_note"))
-        or route_from_text(unit.get("expense_note"))
-        or route_from_text(unit.get("final_note"))
-    )
-    if not route:
-        return ""
-    if is_rail_ticket(unit):
-        prefix = "高铁退票费" if is_refund_fee(unit) else "高铁"
-    elif is_flight_ticket(unit):
-        prefix = "飞机退票费" if is_refund_fee(unit) else "飞机"
-    else:
-        return ""
-    return f"{prefix}（{route}）"
-
-
-def contains_raw_ticket_evidence(note: Any) -> bool:
-    text = clean(note)
-    return bool(
-        "->" in text
-        or re.search(r"\b[GCDKZT]\d{1,5}\b", text, flags=re.IGNORECASE)
-        or any(keyword in text for keyword in ["二等座", "一等座", "商务座", "经济舱", "公务舱", "头等舱"])
-    )
-
-
 def refresh_ticket_note(unit: dict[str, Any], update: dict[str, Any]) -> None:
     note = ticket_note(unit)
     if not note:
@@ -390,7 +337,7 @@ def refresh_hotel_note(unit: dict[str, Any], update: dict[str, Any]) -> None:
         unit["final_note"] = note
 
 
-def note_placeholder_errors(unit: dict[str, Any]) -> list[str]:
+def decision_note_errors(unit: dict[str, Any]) -> list[str]:
     errors: list[str] = []
     if contains_place_type_placeholder(unit.get("final_note")):
         errors.append("taxi note still contains place-type placeholders")
@@ -505,15 +452,21 @@ def placeholder_paths(value: Any, path: str = "$") -> list[str]:
 def validate_answers_root(answers: Any) -> None:
     if isinstance(answers, list):
         raise ValueError(
-            "Answers must be a JSON object with top-level unit_updates/question_updates/project_contexts. "
-            "Run build_allocation_answers_template.py and fill the generated template instead of passing a bare list."
+            "Answers must be a JSON object with top-level unit_updates/question_updates/"
+            "project_contexts/expense_hint_resolutions. "
+            "Use compose_answers.py to compile allocation_decisions.v1 instead of passing a bare list."
         )
     if not isinstance(answers, dict):
         raise ValueError("Answers must be a JSON object.")
+    if answers.get("schema_version") != "allocation_answers.v1":
+        raise ValueError(
+            "schema_version must be 'allocation_answers.v1'. Generate this file with compose_answers.py; "
+            "diagnostic templates are intentionally not accepted as updater input."
+        )
     if "answers" in answers:
         raise ValueError(
             "Unsupported top-level key 'answers'. Use the canonical schema with 'unit_updates'. "
-            "Run build_allocation_answers_template.py to create a fill-in template."
+            "Use compose_answers.py to compile a canonical answers file."
         )
     unknown = sorted(set(answers) - ALLOWED_ROOT_FIELDS)
     if unknown:
@@ -537,6 +490,123 @@ def unit_no(unit: dict[str, Any]) -> str:
     return unit_id
 
 
+def validate_removed_evidence_reconciliation(
+    lineage_rebase: dict[str, Any],
+    current_allocation: dict[str, Any],
+    source_allocation: dict[str, Any],
+) -> list[dict[str, Any]]:
+    entries = lineage_rebase.get("removed_evidence")
+    if not isinstance(entries, list) or any(not isinstance(item, dict) for item in entries):
+        raise ValueError(
+            "lineage_rebase must contain Composer-validated removed_evidence; rerun Chief rebase and Composer"
+        )
+    current_units = [
+        unit for unit in current_allocation.get("allocation_units", []) if isinstance(unit, dict)
+    ]
+    source_units = [
+        unit for unit in source_allocation.get("allocation_units", []) if isinstance(unit, dict)
+    ]
+    current_by_identity = {
+        clean(unit.get("unit_identity_sha256")).lower(): unit for unit in current_units
+    }
+    current_by_token = {
+        f"{unit_no(unit)}@{clean(unit.get('unit_ref')).lower()}": unit for unit in current_units
+    }
+    source_by_identity = {
+        clean(unit.get("unit_identity_sha256")).lower(): unit for unit in source_units
+    }
+    expected_removed = {
+        identity for identity, unit in source_by_identity.items()
+        if identity
+        and identity not in current_by_identity
+    }
+    provided_identities: set[str] = set()
+    removal_refs: set[str] = set()
+    normalized: list[dict[str, Any]] = []
+    for index, raw in enumerate(entries, start=1):
+        unknown = sorted(set(raw) - REMOVED_EVIDENCE_FIELDS)
+        if unknown:
+            raise ValueError(
+                f"removed_evidence #{index} contains unsupported field(s): {', '.join(unknown)}"
+            )
+        entry = dict(raw)
+        identity = clean(entry.get("unit_identity_sha256")).lower()
+        removal_ref = clean(entry.get("removal_ref")).lower()
+        if not identity or identity in provided_identities or not removal_ref or removal_ref in removal_refs:
+            raise ValueError("removed_evidence identities and M@ref references must be present and unique")
+        provided_identities.add(identity)
+        removal_refs.add(removal_ref)
+        old_unit = source_by_identity.get(identity)
+        if old_unit is None or identity in current_by_identity:
+            raise ValueError(f"{entry.get('removal_ref')} is not evidence removed between these generations")
+        expected_old_values = {
+            "prior_unit_ref": f"{unit_no(old_unit)}@{clean(old_unit.get('unit_ref')).lower()}",
+            "source_sha256": clean(old_unit.get("source_sha256")).lower(),
+            "amount": clean(old_unit.get("amount")),
+            "expense_date": clean(old_unit.get("expense_date")),
+            "source_category": clean(old_unit.get("source_category")),
+            "prior_status": clean(old_unit.get("status")),
+        }
+        for field, expected_value in expected_old_values.items():
+            actual = clean(entry.get(field)).lower() if field == "source_sha256" else clean(entry.get(field))
+            if actual != expected_value:
+                raise ValueError(
+                    f"{entry.get('removal_ref')} {field} no longer matches the selected source generation"
+                )
+        old_source = clean(old_unit.get("source_filename") or old_unit.get("source_file"))
+        expected_filename = Path(old_source).name if old_source else ""
+        if clean(entry.get("source_filename")) != expected_filename:
+            raise ValueError(f"{entry.get('removal_ref')} source filename does not match the source generation")
+
+        requires_confirmation = clean(old_unit.get("status")) not in INACTIVE_REBASE_STATUSES
+        if entry.get("requires_confirmation") is not requires_confirmation:
+            raise ValueError(f"{entry.get('removal_ref')} has an invalid confirmation requirement")
+        action = clean(entry.get("resolution_action"))
+        if clean(entry.get("resolution_status")) != "resolved":
+            raise ValueError(f"{entry.get('removal_ref')} is unresolved or still pending evidence restoration")
+        if requires_confirmation:
+            if action not in {"intentional_removal", "replacement_provided"}:
+                raise ValueError(f"{entry.get('removal_ref')} lacks an explicit removal confirmation")
+            if not clean(entry.get("resolution_note")):
+                raise ValueError(f"{entry.get('removal_ref')} lacks its applicant/coordinator confirmation note")
+        elif action != "prior_closed_item_removed":
+            raise ValueError(f"{entry.get('removal_ref')} has an invalid auto-resolution action")
+
+        refs = entry.get("replacement_unit_refs")
+        ids = entry.get("replacement_unit_ids")
+        identities = entry.get("replacement_unit_identities")
+        if any(not isinstance(values, list) for values in (refs, ids, identities)):
+            raise ValueError(f"{entry.get('removal_ref')} replacement bindings must be arrays")
+        if action == "replacement_provided":
+            if not refs or not (len(refs) == len(ids) == len(identities)):
+                raise ValueError(f"{entry.get('removal_ref')} has incomplete replacement bindings")
+            seen_replacements: set[str] = set()
+            for position, raw_token in enumerate(refs):
+                token = clean(raw_token).lower()
+                unit = current_by_token.get(token)
+                if token in seen_replacements or unit is None:
+                    raise ValueError(f"{entry.get('removal_ref')} has a repeated or stale replacement token")
+                seen_replacements.add(token)
+                if (
+                    clean(unit.get("unit_id")) != clean(ids[position])
+                    or clean(unit.get("unit_identity_sha256")).lower() != clean(identities[position]).lower()
+                    or clean(unit.get("status")) in INACTIVE_REBASE_STATUSES
+                ):
+                    raise ValueError(f"{entry.get('removal_ref')} replacement binding is stale or inactive")
+        elif refs or ids or identities:
+            raise ValueError(f"{entry.get('removal_ref')} contains replacement bindings without a replacement action")
+        normalized.append(entry)
+
+    if provided_identities != expected_removed:
+        missing = sorted(expected_removed - provided_identities)
+        extra = sorted(provided_identities - expected_removed)
+        raise ValueError(
+            "removed_evidence does not exactly reconcile every source-generation item that disappeared; "
+            f"missing={missing}, extra={extra}. Rerun Chief rebase and Composer."
+        )
+    return normalized
+
+
 def units_by_no(payload: dict[str, Any]) -> dict[str, dict[str, Any]]:
     return {unit_no(unit): unit for unit in payload.get("allocation_units", [])}
 
@@ -556,7 +626,9 @@ def resolve_unit_ref(ref: Any, by_id: dict[str, dict[str, Any]], by_no: dict[str
     return None
 
 
-def normalize_answers(answers: Any) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
+def normalize_answers(
+    answers: Any,
+) -> tuple[list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]], list[dict[str, Any]]]:
     validate_answers_root(answers)
 
     unit_updates = [
@@ -578,10 +650,14 @@ def normalize_answers(answers: Any) -> tuple[list[dict[str, Any]], list[dict[str
         dict(item)
         for item in answers.get("project_contexts", [])
     ]
-    if not unit_updates and not question_updates and not context_updates:
+    hint_resolutions = [
+        dict(item)
+        for item in answers.get("expense_hint_resolutions", [])
+    ]
+    if not unit_updates and not question_updates and not context_updates and not hint_resolutions and not answers.get("lineage_rebase"):
         raise ValueError(
-            "Answers file contains no actionable updates. Fill a generated allocation-answers template "
-            "with unit_updates, or use confirm_units/drop_units/exclude_units."
+            "Answers file contains no actionable updates. Correct the allocation_decisions.v1 input and "
+            "rerun compose_answers.py."
         )
     for idx, update in enumerate(question_updates, start=1):
         paths = placeholder_paths(update, f"question_updates[{idx}]")
@@ -591,7 +667,21 @@ def normalize_answers(answers: Any) -> tuple[list[dict[str, Any]], list[dict[str
         paths = placeholder_paths(update, f"project_contexts[{idx}]")
         if paths:
             raise ValueError("Unfilled template placeholder(s): " + ", ".join(paths))
-    return unit_updates, question_updates, context_updates
+    for idx, update in enumerate(hint_resolutions, start=1):
+        paths = placeholder_paths(update, f"expense_hint_resolutions[{idx}]")
+        if paths:
+            raise ValueError("Unfilled template placeholder(s): " + ", ".join(paths))
+        unknown = sorted(set(update) - HINT_RESOLUTION_FIELDS)
+        if unknown:
+            raise ValueError(
+                f"expense_hint_resolutions[{idx}] unsupported field(s): {', '.join(unknown)}"
+            )
+        if clean(update.get("action")) not in HINT_RESOLUTION_ACTIONS:
+            raise ValueError(
+                f"expense_hint_resolutions[{idx}].action must be one of: "
+                + ", ".join(sorted(HINT_RESOLUTION_ACTIONS))
+            )
+    return unit_updates, question_updates, context_updates, hint_resolutions
 
 
 def add_issue(unit: dict[str, Any], field: str, problem: str) -> None:
@@ -607,18 +697,18 @@ def guard_meal_reclass_signal(unit: dict[str, Any], update: dict[str, Any], was_
     row cannot be placed in the right column."""
     if was_meal or clean(update.get("source_category")) != "meal":
         return None
+    meal_context = clean(unit.get("meal_context"))
     has_signal = (
-        clean(unit.get("city"))
-        or clean(unit.get("meal_context"))
+        meal_context in {"travel", "business_trip", "station_airport", "overtime"}
         or clean(unit.get("final_note")).startswith(("出差餐费", "加班餐费"))
     )
     if has_signal:
         return None
     return (
         f"{unit.get('unit_id')}: reclassified to meal, but there is no way to decide which "
-        "meal policy applies. Add ONE of: city (哪个城市吃的 — 决定 meal/travel 列和是否按 "
-        "150/天出差餐费检查), meal_context: \"overtime\" (加班餐, 60/天), or a final_note "
-        "starting with 出差餐费/加班餐费."
+        "meal policy applies. Add meal_context: business_trip/station_airport/overtime or a final_note "
+        "starting with 出差餐费/加班餐费. City is not a policy signal: it only determines the "
+        "meal/travel workbook column and Expense Nature."
     )
 
 
@@ -662,11 +752,12 @@ COMPUTED_FIELDS_TEACHING = {
     "final_template_column": (
         "final_template_column is COMPUTED, not settable: the writer derives the visible "
         "amount column from source_category + city (Shanghai restaurant -> meal column, "
-        "out-of-town trip meal -> travel column with the RMB150/day trip-meal cap; "
+        "non-Shanghai restaurant -> travel column; "
         "Shanghai ride -> taxi, out-of-town ride -> travel). Any value you set here is "
         "re-normalized away on apply. If the column looks wrong, fix the INPUT instead: "
         "set city (e.g. \u57ce\u5e02\u5199\u9519) or source_category (extraction error, "
-        "needs manual_correction + correction_note)."
+        "needs manual_correction + correction_note). For meals, this computed column never "
+        "selects the RMB150/60 policy; final_note/meal_context does."
     ),
 }
 
@@ -685,8 +776,36 @@ def validate_update(update: dict[str, Any], lenient: bool) -> list[str]:
         if lenient:
             continue
         errors.append(message)
+    for field, value in update.items():
+        if field not in ALLOWED_UNIT_FIELDS:
+            continue
+        if field in {"attendees", "corrected_fields"}:
+            if isinstance(value, (dict, tuple, set)):
+                errors.append(f"Invalid value type for {field}: expected text or a list of scalar values")
+            elif isinstance(value, list) and any(isinstance(item, (dict, list, tuple, set)) for item in value):
+                errors.append(f"Invalid nested value in {field}: expected a flat list of scalar values")
+            continue
+        if field == "issues":
+            if not isinstance(value, list) or any(
+                not isinstance(item, dict)
+                or set(item) - {"field", "problem"}
+                or not isinstance(item.get("field", ""), str)
+                or not isinstance(item.get("problem", ""), str)
+                for item in value
+            ):
+                errors.append("Invalid issues value: expected a list of {field, problem} text objects")
+            continue
+        if isinstance(value, (dict, list, tuple, set)):
+            errors.append(f"Invalid value type for {field}: nested objects/lists are not allowed")
+    for field in MONEY_FIELDS:
+        if field not in update or value_utils.is_blank(update.get(field)):
+            continue
+        try:
+            value_utils.parse_finite_decimal(update.get(field), field=field)
+        except ValueError as exc:
+            errors.append(str(exc))
     if not any(field in ALLOWED_UNIT_FIELDS for field in update):
-        errors.append("Unit update has no fields to apply; fill or remove this template entry.")
+        errors.append("Unit update has no fields to apply; correct or remove this decision entry.")
     column = update.get("final_template_column")
     if column and column not in ALLOWED_COLUMNS:
         errors.append(f"Invalid final_template_column: {column}")
@@ -696,13 +815,59 @@ def validate_update(update: dict[str, Any], lenient: bool) -> list[str]:
     return errors
 
 
-def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: bool) -> dict[str, Any]:
+def collect_place_memory(
+    unit: dict[str, Any], update: dict[str, Any], sink: list[dict[str, Any]]
+) -> None:
+    """Queue user-confirmed taxi endpoints for the persistent place memory.
+
+    Only when THIS answer explicitly set a place type (canonical field or the
+    `origin_type`/`destination_type` Composer alias) do we record the raw endpoint
+    text -> confirmed type. Model auto-guesses from create_units are never recorded.
+    """
+    endpoints = (
+        ("origin", "origin_place_type", ("origin_place_type", "origin_type")),
+        ("destination", "destination_place_type", ("destination_place_type", "destination_type")),
+    )
+    for text_field, type_field, answer_keys in endpoints:
+        if not any(key in update for key in answer_keys):
+            continue
+        name = clean(unit.get(text_field))
+        place_type = clean(unit.get(type_field))
+        if not name or not place_type:
+            continue
+        # Skip public places (airport/rail/hotel) — they are inferred without any
+        # memory, so memorizing 虹桥T2 -> 机场 would only clutter the file.
+        if place_config.public_place_type(name):
+            continue
+        sink.append({"name": name, "place_type": place_type})
+
+
+def apply_unit_update(
+    unit: dict[str, Any],
+    update: dict[str, Any],
+    lenient: bool,
+    process_dir: Path | None = None,
+) -> dict[str, Any]:
     errors = validate_update(update, lenient)
     if errors:
         raise ValueError("; ".join(errors))
 
-    before = {field: unit.get(field) for field in ALLOWED_UNIT_FIELDS if field in update}
-    for field, value in update.items():
+    effective_update = dict(update)
+    if clean(unit.get("source_category")) == "hotel" or clean(update.get("source_category")) == "hotel":
+        updated_city = clean(update.get("city")) if "city" in update else ""
+        updated_hotel_city = clean(update.get("hotel_city")) if "hotel_city" in update else ""
+        if updated_city and updated_hotel_city and updated_city != updated_hotel_city:
+            raise ValueError(
+                f"{unit.get('unit_id')} hotel city conflict: city={updated_city!r} but "
+                f"hotel_city={updated_hotel_city!r}; provide one consistent city."
+            )
+        if "city" in update and "hotel_city" not in update:
+            effective_update["hotel_city"] = update.get("city")
+        elif "hotel_city" in update and "city" not in update:
+            effective_update["city"] = update.get("hotel_city")
+
+    before = {field: unit.get(field) for field in ALLOWED_UNIT_FIELDS if field in effective_update}
+    for field, value in effective_update.items():
         if field in META_FIELDS:
             continue
         if field not in ALLOWED_UNIT_FIELDS:
@@ -728,9 +893,17 @@ def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: boo
 
     if unit.get("is_substitute_invoice"):
         unit["approval_required"] = unit.get("approval_required") or "partner_approval_screenshot"
-        approval_file = clean(unit.get("approval_file"))
+        approval_file = (
+            evidence_paths.normalize_approval_file(unit, process_dir)
+            if process_dir is not None
+            else clean(unit.get("approval_file"))
+        )
+        unit["issues"] = [
+            issue for issue in unit.get("issues", [])
+            if not isinstance(issue, dict) or issue.get("field") != "approval_file"
+        ]
         if approval_file:
-            unit["approval_file_status"] = "provided" if Path(approval_file).exists() else "missing"
+            unit["approval_file_status"] = "provided" if Path(approval_file).is_file() else "missing"
             if unit["approval_file_status"] == "missing":
                 add_issue(unit, "approval_file", f"Substitute approval file not found: {approval_file}")
         else:
@@ -742,11 +915,11 @@ def apply_unit_update(unit: dict[str, Any], update: dict[str, Any], lenient: boo
         unit["place_type_confidence"] = unit.get("place_type_confidence") or "confirmed"
 
     normalize_admin_client(unit)
-    accounting_errors = mobile_accounting_errors(unit) + note_placeholder_errors(unit)
+    accounting_errors = mobile_accounting_errors(unit) + decision_note_errors(unit)
     if accounting_errors:
         raise ValueError(f"{unit.get('unit_id')} accounting conflict: " + "; ".join(accounting_errors))
 
-    after = {field: unit.get(field) for field in ALLOWED_UNIT_FIELDS if field in update}
+    after = {field: unit.get(field) for field in ALLOWED_UNIT_FIELDS if field in effective_update}
     changed_fields = [
         field for field in after
         if before.get(field) != after.get(field) and field not in CORRECTION_META_FIELDS
@@ -795,9 +968,125 @@ def apply_question_updates(payload: dict[str, Any], updates: list[dict[str, Any]
         if question_id not in questions:
             continue
         question = questions[question_id]
-        question["status"] = update.get("status", "answered")
+        status = update.get("status", "answered")
+        answer = clean(update.get("answer"))
+        if question.get("question_type") == "expense_hint_reconciliation" and status not in OPEN_STATUSES:
+            raise ValueError(
+                f"{question_id} is an expense-record completeness question. Do not close it with free text; "
+                "use expense_hint_resolutions so matched, dropped, and pending-invoice outcomes remain distinct."
+            )
+        if question.get("requires_explicit_answer") and status not in OPEN_STATUSES and not answer:
+            raise ValueError(f"{question_id} cannot be closed without an explicit answer.")
+        question["status"] = status
         if "answer" in update:
             question["answer"] = update["answer"]
+
+
+def sync_expense_hint_questions(payload: dict[str, Any]) -> None:
+    records_by_question: dict[str, list[dict[str, Any]]] = {}
+    for record in payload.get("expense_hint_reconciliation", []):
+        question_id = clean(record.get("question_id"))
+        if question_id:
+            records_by_question.setdefault(question_id, []).append(record)
+    for question in payload.get("questions", []):
+        if question.get("question_type") != "expense_hint_reconciliation":
+            continue
+        records = records_by_question.get(clean(question.get("question_id")), [])
+        if not records:
+            continue
+        unresolved = [
+            record for record in records
+            if clean(record.get("resolution_status")) not in {"not_required", "resolved"}
+        ]
+        summaries = []
+        for record in records:
+            ref = clean(record.get("display_ref")) or clean(record.get("hint_id"))
+            action = clean(record.get("resolution_action")) or clean(record.get("resolution_status"))
+            note = clean(record.get("resolution_answer"))
+            summaries.append(f"{ref}: {action}" + (f" ({note})" if note else ""))
+        question["answer"] = "; ".join(summaries)
+        question["status"] = "open" if unresolved else "answered"
+
+
+def apply_expense_hint_resolutions(
+    payload: dict[str, Any],
+    resolutions: list[dict[str, Any]],
+) -> None:
+    if not resolutions:
+        return
+    records = [
+        item for item in payload.get("expense_hint_reconciliation", [])
+        if isinstance(item, dict)
+    ]
+    by_hint_id = {
+        clean(item.get("hint_id")): item for item in records if clean(item.get("hint_id"))
+    }
+    units = {
+        clean(unit.get("unit_id")): unit
+        for unit in payload.get("allocation_units", [])
+        if clean(unit.get("unit_id"))
+    }
+    seen_hints: set[str] = set()
+    for idx, resolution in enumerate(resolutions, start=1):
+        hint_id = clean(resolution.get("hint_id"))
+        record = by_hint_id.get(hint_id)
+        if record is None:
+            raise ValueError(f"expense_hint_resolutions[{idx}] references unknown hint_id {hint_id!r}")
+        if hint_id in seen_hints:
+            raise ValueError(f"expense_hint_resolutions[{idx}] duplicates hint_id {hint_id!r}")
+        seen_hints.add(hint_id)
+        question_id = clean(resolution.get("question_id"))
+        record_ref = clean(resolution.get("record_ref"))
+        if question_id != clean(record.get("question_id")) or record_ref != clean(record.get("display_ref")):
+            raise ValueError(
+                f"expense_hint_resolutions[{idx}] no longer matches the current question/record reference; "
+                "rerun Composer against the current allocation"
+            )
+        action = clean(resolution.get("action"))
+        unit_ids = [clean(value) for value in as_list(resolution.get("unit_ids")) if clean(value)]
+        note = clean(resolution.get("note"))
+        if action in {"matched_existing", "covered_by_invoice"}:
+            if not unit_ids:
+                raise ValueError(f"expense_hint_resolutions[{idx}] action {action!r} requires unit_ids")
+            inactive = [
+                unit_id for unit_id in unit_ids
+                if unit_id not in units or clean(units[unit_id].get("status")) in {
+                    "dropped", "excluded", "non_reimbursable"
+                }
+            ]
+            if inactive:
+                raise ValueError(
+                    f"expense_hint_resolutions[{idx}] references missing or inactive unit(s): "
+                    + ", ".join(inactive)
+                    + ". Remove closed units from a multi-unit match; if no active unit remains, "
+                    "omit this resolution so the applicant record stays open for confirmation."
+                )
+            record["match_status"] = "matched" if action == "matched_existing" else "covered"
+            record["matched_unit_ids"] = unit_ids
+            record["matched_user_nos"] = [unit_no(units[unit_id]) for unit_id in unit_ids]
+            record["resolution_status"] = "resolved"
+        elif action == "not_reimbursed":
+            if unit_ids:
+                raise ValueError(f"expense_hint_resolutions[{idx}] not_reimbursed must not reference units")
+            record["match_status"] = "not_reimbursed"
+            record["matched_unit_ids"] = []
+            record["matched_user_nos"] = []
+            record["resolution_status"] = "resolved"
+        elif action == "pending_invoice":
+            if unit_ids:
+                raise ValueError(f"expense_hint_resolutions[{idx}] pending_invoice must not reference units")
+            record["match_status"] = "pending_invoice"
+            record["matched_unit_ids"] = []
+            record["matched_user_nos"] = []
+            record["resolution_status"] = "pending_evidence"
+        else:
+            raise ValueError(
+                f"expense_hint_resolutions[{idx}].action must be one of: "
+                + ", ".join(sorted(HINT_RESOLUTION_ACTIONS))
+            )
+        record["resolution_action"] = action
+        record["resolution_answer"] = note or action
+    sync_expense_hint_questions(payload)
 
 
 def close_answered_questions(payload: dict[str, Any], touched_units: set[str]) -> None:
@@ -808,11 +1097,249 @@ def close_answered_questions(payload: dict[str, Any], touched_units: set[str]) -
     for question in payload.get("questions", []):
         if question.get("status", "open") not in OPEN_STATUSES:
             continue
+        if question.get("requires_explicit_answer"):
+            continue
         unit_ids = set(question.get("unit_ids", []))
         if not unit_ids or not unit_ids.intersection(touched_units):
             continue
         if all(unit_status.get(unit_id) in CLOSED_UNIT_STATUSES for unit_id in unit_ids):
             question["status"] = "answered"
+
+
+def refresh_expense_hint_reconciliation(payload: dict[str, Any], touched_units: set[str]) -> None:
+    if not touched_units:
+        return
+    units = {
+        clean(unit.get("unit_id")): unit
+        for unit in payload.get("allocation_units", [])
+        if clean(unit.get("unit_id"))
+    }
+    questions = payload.setdefault("questions", [])
+    known_question_ids = {clean(question.get("question_id")) for question in questions}
+    reopen_index = 1
+    for record in payload.get("expense_hint_reconciliation", []):
+        matched_ids = list(dict.fromkeys(
+            clean(value) for value in record.get("matched_unit_ids", []) if clean(value)
+        ))
+        if not set(matched_ids).intersection(touched_units):
+            continue
+        if (
+            record.get("resolution_status") == "resolved"
+            and record.get("resolution_action") == "not_reimbursed"
+        ):
+            continue
+        active_ids = [
+            unit_id for unit_id in matched_ids
+            if unit_id in units and clean(units[unit_id].get("status")) not in {
+                "dropped", "excluded", "non_reimbursable"
+            }
+        ]
+        if active_ids:
+            record["matched_unit_ids"] = active_ids
+            record["matched_user_nos"] = [unit_no(units[unit_id]) for unit_id in active_ids]
+            continue
+        while f"Q-HINT-REOPEN-{reopen_index:03d}" in known_question_ids:
+            reopen_index += 1
+        question_id = f"Q-HINT-REOPEN-{reopen_index:03d}"
+        reopen_index += 1
+        known_question_ids.add(question_id)
+        record["match_status"] = "matched_unit_closed"
+        record["resolution_status"] = "open"
+        record["question_id"] = question_id
+        record["resolution_answer"] = ""
+        record["resolution_action"] = ""
+        questions.append({
+            "question_id": question_id,
+            "question_type": "expense_hint_reconciliation",
+            "hint_id": record.get("hint_id", ""),
+            "unit_ids": sorted(matched_ids),
+            "user_nos": record.get("matched_user_nos", []),
+            "question": (
+                f"用户费用记录「{record.get('summary') or record.get('hint_id')}」原来对应的费用项已被 "
+                "drop/exclude，完整性对应关系失效。请明确它改为对应哪一项、是否会补票/被其他发票合并覆盖，"
+                "或确认这条记录本身不报销。"
+            ),
+            "why_it_matters": "删除费用项不能顺带静默删除用户原始费用记录，必须留下明确决定。",
+            "status": "open",
+            "blocking": True,
+            "requires_explicit_answer": True,
+        })
+
+
+def current_rail_chain_route(chain_units: list[dict[str, Any]]) -> str:
+    def position(unit: dict[str, Any]) -> int:
+        try:
+            return value_utils.parse_integer(
+                unit.get("journey_chain_position"),
+                field="journey_chain_position",
+                minimum=1,
+            )
+        except ValueError as exc:
+            raise ValueError(f"{unit.get('unit_id') or '<unknown unit>'}: {exc}") from exc
+
+    ordered = sorted(chain_units, key=position)
+    routes = [
+        route_from_text(unit.get("route"))
+        or route_from_text(unit.get("source_note"))
+        or route_from_text(unit.get("expense_note"))
+        or route_from_text(unit.get("final_note"))
+        for unit in ordered
+    ]
+    if not routes or any(not route or "-" not in route for route in routes):
+        return ""
+    first_origin = routes[0].split("-", 1)[0]
+    destinations = [route.split("-", 1)[1] for route in routes]
+    return " -> ".join([first_origin, *destinations])
+
+
+def clear_rail_chain_metadata(unit: dict[str, Any]) -> None:
+    unit.update({
+        "journey_chain_id": "",
+        "journey_chain_route": "",
+        "journey_chain_position": "",
+        "journey_chain_length": "",
+        "journey_chain_unit_ids": [],
+        "journey_chain_confidence": "",
+        "journey_chain_assignment_rule": "",
+        "journey_chain_match_reason": "",
+        "journey_chain_project_context_id": "",
+        "journey_chain_needs_confirmation": False,
+    })
+
+
+def split_rail_chain_on_user_assignments(chain_id: str, chain_units: list[dict[str, Any]]) -> bool:
+    """Split a chain when an updater decision assigns adjacent legs to different projects."""
+    try:
+        ordered = sorted(
+            chain_units,
+            key=lambda unit: value_utils.parse_integer(
+                unit.get("journey_chain_position"),
+                field="journey_chain_position",
+                minimum=1,
+            ),
+        )
+    except ValueError:
+        return False
+
+    assignments = [
+        (
+            clean(unit.get("project_context_id")),
+            clean(unit.get("client_name")),
+            clean(unit.get("client_charge_code")),
+        )
+        for unit in ordered
+    ]
+    if not all(client and code for _, client, code in assignments):
+        return False
+
+    def same_project(
+        left: tuple[str, str, str], right: tuple[str, str, str]
+    ) -> bool:
+        left_context, left_client, left_code = left
+        right_context, right_client, right_code = right
+        return (
+            left_client == right_client
+            and left_code == right_code
+            and (not left_context or not right_context or left_context == right_context)
+        )
+
+    segments: list[list[dict[str, Any]]] = [[ordered[0]]]
+    for unit, assignment, previous_assignment in zip(ordered[1:], assignments[1:], assignments):
+        if not same_project(assignment, previous_assignment):
+            segments.append([])
+        segments[-1].append(unit)
+    if len(segments) == 1:
+        return False
+
+    segment_routes = [current_rail_chain_route(segment) for segment in segments]
+    for unit in ordered:
+        clear_rail_chain_metadata(unit)
+        unit["status"] = "confirmed"
+        unit["confidence"] = "high"
+        unit["auto_project_match"] = "user_confirmed_project_stop"
+        unit["match_reason"] = f"User-declared project boundary split prior rail chain {chain_id}."
+
+    for segment_index, (segment, route) in enumerate(zip(segments, segment_routes), start=1):
+        if len(segment) < 2:
+            continue
+        segment_id = f"{chain_id}-S{segment_index}"
+        unit_ids = [clean(unit.get("unit_id")) for unit in segment]
+        project_context_id = clean(segment[0].get("project_context_id"))
+        for position, unit in enumerate(segment, start=1):
+            unit.update({
+                "journey_chain_id": segment_id,
+                "journey_chain_route": route,
+                "journey_chain_position": position,
+                "journey_chain_length": len(segment),
+                "journey_chain_unit_ids": unit_ids,
+                "journey_chain_confidence": "high",
+                "journey_chain_assignment_rule": "rail_transfer_chain_user_confirmed",
+                "journey_chain_match_reason": (
+                    f"User-declared project boundary split prior rail chain {chain_id}."
+                ),
+                "journey_chain_project_context_id": project_context_id,
+                "journey_chain_needs_confirmation": False,
+                "auto_project_match": "rail_transfer_chain_user_confirmed",
+            })
+    return True
+
+
+def refresh_rail_chain_assignments(payload: dict[str, Any], touched_units: set[str]) -> None:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for unit in payload.get("allocation_units", []):
+        chain_id = clean(unit.get("journey_chain_id"))
+        if chain_id:
+            groups.setdefault(chain_id, []).append(unit)
+
+    for chain_id, chain_units in groups.items():
+        chain_unit_ids = {clean(unit.get("unit_id")) for unit in chain_units}
+        if not chain_unit_ids.intersection(touched_units):
+            continue
+        refreshed_route = current_rail_chain_route(chain_units)
+        if refreshed_route:
+            for unit in chain_units:
+                unit["journey_chain_route"] = refreshed_route
+        active_units = [
+            unit for unit in chain_units
+            if clean(unit.get("status")) not in {"dropped", "excluded", "non_reimbursable"}
+        ]
+        if len(active_units) < 2:
+            for unit in chain_units:
+                clear_rail_chain_metadata(unit)
+            continue
+        if len(active_units) == len(chain_units) and split_rail_chain_on_user_assignments(chain_id, chain_units):
+            continue
+        assignments = {
+            (
+                clean(unit.get("project_context_id")),
+                clean(unit.get("client_name")),
+                clean(unit.get("client_charge_code")),
+            )
+            for unit in active_units
+        }
+        complete = (
+            len(assignments) == 1
+            and all(clean(unit.get("client_name")) and clean(unit.get("client_charge_code")) for unit in active_units)
+        )
+        if complete:
+            project_context_id, client_name, client_charge_code = next(iter(assignments))
+            for unit in chain_units:
+                unit["journey_chain_project_context_id"] = project_context_id
+                unit["journey_chain_needs_confirmation"] = False
+                unit["journey_chain_assignment_rule"] = "rail_transfer_chain_user_confirmed"
+                if unit in active_units:
+                    unit["status"] = "confirmed"
+                    unit["confidence"] = "high"
+                unit["journey_chain_match_reason"] = (
+                    f"User-confirmed whole-chain assignment to {client_name}/{client_charge_code}."
+                )
+        else:
+            for unit in chain_units:
+                unit["journey_chain_needs_confirmation"] = True
+                unit["journey_chain_match_reason"] = (
+                    f"{chain_id} was only partially updated or now has inconsistent project assignments; "
+                    "update every leg in the chain together."
+                )
 
 
 def sync_admin_client_advisories(payload: dict[str, Any]) -> None:
@@ -879,11 +1406,27 @@ def build_markdown(payload: dict[str, Any]) -> str:
         lines.append(
             f"| {unit_no(unit)} | {unit['unit_id']} | {unit.get('source_filename','')} | "
             f"{unit.get('source_document_id','')} {unit.get('source_item_id') or ''} | "
-            f"{unit.get('expense_date','')} | {city_route} | {unit.get('invoice_amount') or unit.get('amount','')} | "
-            f"{unit.get('reimbursable_amount') or unit.get('amount','')} | {unit.get('source_category','')} | "
+            f"{unit.get('expense_date','')} | {city_route} | "
+            f"{clean(value_utils.first_nonblank(unit.get('invoice_amount'), unit.get('amount')))} | "
+            f"{clean(value_utils.first_nonblank(unit.get('reimbursable_amount'), unit.get('amount')))} | "
             f"{unit.get('client_name','')} | {unit.get('client_charge_code','')} | {unit.get('final_template_column','')} | "
             f"{unit.get('confidence','')} | {unit.get('status','')} |"
         )
+    hint_records = payload.get("expense_hint_reconciliation", [])
+    if hint_records:
+        lines += [
+            "",
+            "## User Expense Record Reconciliation",
+            "",
+            "| Hint | Record | Match | Resolution | Answer |",
+            "| --- | --- | --- | --- | --- |",
+        ]
+        for record in hint_records:
+            lines.append(
+                f"| {record.get('hint_id', '')} | {record.get('summary', '')} | "
+                f"{record.get('match_status', '')} | {record.get('resolution_status', '')} | "
+                f"{record.get('resolution_answer', '')} |"
+            )
     lines += [
         "",
         "## Questions For User",
@@ -939,15 +1482,58 @@ def apply_answers(
             "answers file was generated against a DIFFERENT allocation generation "
             f"(fingerprint {provided[:8] or '<missing>'}... vs current {expected[:8]}...). "
             "Unit ids may have shifted after allocation was re-run — replaying old answers "
-            "would silently write data onto the wrong units. Regenerate the template against "
-            "the CURRENT allocation, re-fill it, then apply. Never reuse an old answers file."
+            "would silently write data onto the wrong units. Rerun Composer against the CURRENT "
+            "allocation and apply only its newly published answers. Never reuse an old answers file."
         )
-    unit_updates, question_updates, context_updates = normalize_answers(answers)
+    lineage_rebase = answers.get("lineage_rebase")
+    if lineage_rebase is not None and not isinstance(lineage_rebase, dict):
+        raise ValueError("lineage_rebase must be a Composer-generated object")
+    lineage_source_allocation: dict[str, Any] | None = None
+    if not payload.get("change_log"):
+        source_path, source_alloc, lineage_reason = allocation_generations.discover_rebase_source(
+            allocation_path, payload
+        )
+        if allocation_generations.is_lineage_integrity_error(lineage_reason):
+            raise ValueError(
+                f"{lineage_reason}. Recover the stamped generation archive or perform a clean "
+                "sibling-batch rebuild; updater refuses to erase lineage evidence"
+            )
+        if source_path is not None and source_alloc is not None:
+            lineage_source_allocation = source_alloc
+            expected_source = str(source_alloc.get("integrity", {}).get("fingerprint", ""))
+            if not lineage_rebase:
+                raise ValueError(
+                    "this allocation has pending lineage decisions. Run Chief rebase and Composer; "
+                    "ordinary answers cannot consume the fresh generation first"
+                )
+            if (
+                str(lineage_rebase.get("source_allocation_fingerprint", "")) != expected_source
+                or str(lineage_rebase.get("target_allocation_fingerprint", "")) != expected
+                or Path(str(lineage_rebase.get("source_allocation_file", ""))).resolve() != source_path.resolve()
+            ):
+                raise ValueError(
+                    "lineage_rebase does not match the source generation selected by the immutable "
+                    "history chain; rerun Chief rebase and Composer"
+                )
+        elif lineage_rebase:
+            raise ValueError("lineage_rebase was supplied but no eligible prior generation exists")
+    elif lineage_rebase:
+        raise ValueError("lineage_rebase cannot be replayed after this generation already has decisions")
+    removed_evidence_reconciliation: list[dict[str, Any]] = []
+    if lineage_rebase:
+        if lineage_source_allocation is None:
+            raise ValueError("lineage_rebase has no validated source allocation")
+        removed_evidence_reconciliation = validate_removed_evidence_reconciliation(
+            lineage_rebase, payload, lineage_source_allocation
+        )
+    unit_updates, question_updates, context_updates, hint_resolutions = normalize_answers(answers)
     answer_text_issues = text_safety.find_suspect_text(
         {
             "unit_updates": unit_updates,
             "question_updates": question_updates,
             "project_contexts": context_updates,
+            "expense_hint_resolutions": hint_resolutions,
+            "lineage_rebase": lineage_rebase or {},
         },
         path="answers",
     )
@@ -963,6 +1549,7 @@ def apply_answers(
     merge_contexts(payload, context_updates)
     changes = []
     touched_units: set[str] = set()
+    place_memory: list[dict[str, Any]] = []
     for update in unit_updates:
         unit_refs = as_list(update.get("unit_ids") or update.get("unit_id") or update.get("unit_nos") or update.get("unit_no"))
         if not unit_refs:
@@ -975,19 +1562,28 @@ def apply_answers(
             if flip_error:
                 raise ValueError(flip_error)
             was_meal = clean(unit.get("source_category")) == "meal"
-            changes.append(apply_unit_update(unit, update, lenient))
+            changes.append(apply_unit_update(
+                unit,
+                update,
+                lenient,
+                process_dir=allocation_path.parent,
+            ))
             mismatch = guard_meal_note_mismatch(unit)
             if mismatch:
                 raise ValueError(mismatch)
             signal_error = guard_meal_reclass_signal(unit, update, was_meal)
             if signal_error:
                 raise ValueError(signal_error)
+            collect_place_memory(unit, update, place_memory)
             touched_units.add(unit["unit_id"])
 
+    refresh_rail_chain_assignments(payload, touched_units)
+    refresh_expense_hint_reconciliation(payload, touched_units)
     for unit in payload.get("allocation_units", []):
         normalize_admin_client(unit)
 
     apply_question_updates(payload, question_updates)
+    apply_expense_hint_resolutions(payload, hint_resolutions)
     close_answered_questions(payload, touched_units)
     sync_admin_client_advisories(payload)
     allocation_text_issues = text_safety.find_suspect_text(
@@ -998,15 +1594,18 @@ def apply_answers(
             "project_contexts": text_safety.pick_fields(
                 payload.get("project_contexts", []), ENCODING_CHECK_CONTEXT_FIELDS
             ),
+            "expense_hint_reconciliation": payload.get("expense_hint_reconciliation", []),
         },
         path="allocation",
     )
     if allocation_text_issues:
         raise ValueError(
             "the applied allocation would contain encoding-damaged user-visible text. Nothing was written. "
-            "Fix the UTF-8 helper input and rerun. Findings: " + "; ".join(allocation_text_issues)
+            "Fix the UTF-8 decisions input and rerun Composer. Findings: " + "; ".join(allocation_text_issues)
         )
-    payload["generated_at"] = datetime.now().replace(microsecond=0).isoformat()
+    if lineage_rebase:
+        payload["removed_evidence_reconciliation"] = removed_evidence_reconciliation
+    payload["generated_at"] = time_utils.iso_now()
     payload.setdefault("change_log", []).append({
         "timestamp": payload["generated_at"],
         "script": "apply_allocation_answers.py",
@@ -1014,54 +1613,49 @@ def apply_answers(
         "unit_update_count": len(unit_updates),
         "question_update_count": len(question_updates),
         "context_update_count": len(context_updates),
+        "expense_hint_resolution_count": len(hint_resolutions),
+        "lineage_rebase": lineage_rebase or {},
         "changes": changes,
     })
 
     if write_output:
         if output_path.resolve() == allocation_path.resolve():
-            backup = allocation_path.with_suffix(allocation_path.suffix + ".bak")
-            shutil.copy2(allocation_path, backup)
+            archived = allocation_generations.archive_current_generation(allocation_path)
+            allocation_generations.record_previous_generation(payload, archived)
         integrity.stamp(payload, "apply_allocation_answers.py")
         write_json(output_path, payload)
         markdown_path.write_text(build_markdown(payload), encoding="utf-8")
+        # Fail-open write-back: remember user-confirmed taxi endpoints for next month.
+        # A memory-write failure prints an advisory and never changes the exit code.
+        if place_memory:
+            added = PlaceBook.load().remember(place_memory)
+            if added:
+                print(f"NOTE: memorized {added} confirmed place->type mapping(s) for future runs.")
         remaining = [q for q in payload.get("questions", []) if q.get("status", "open") == "open"]
         if remaining:
             print(f"NEXT: {len(remaining)} blocking question(s) still open — relay them to the user "
                   "verbatim and wait; do not run stage 3 yet.")
         else:
             print("NEXT: no blocking questions remain — run write_reimbursement_template.py "
-                  "(stage 3). If allocation was re-generated since this template was built, "
-                  "regenerate the template first.")
+                  "(stage 3). If allocation was regenerated, rerun Composer before applying any "
+                  "additional decisions.")
     return payload
 
 
 def print_answers_schema_help(allocation_path: Path) -> None:
-    """Printed on every validation failure.
-
-    Do not guess field names or invent a schema — that is what caused this
-    error. The fastest fix is always to regenerate the canonical template.
-    """
+    """Keep every validation failure on the Composer/updater path."""
     print("", file=sys.stderr)
-    print("HOW TO FIX (do not guess the schema, do not write a patch script):", file=sys.stderr)
-    print("1. Regenerate the canonical answers template for the CURRENT allocation state:", file=sys.stderr)
-    print(f"   python scripts/build_allocation_answers_template.py --allocation {allocation_path} "
-          "--output process/allocation-answers.template.json", file=sys.stderr)
-    print("2. Fill ONLY the generated unit_updates entries. A valid entry looks like:", file=sys.stderr)
-    print(json.dumps({
-        "unit_updates": [{
-            "unit_id": "<UNIT-XXX>",
-            "status": "confirmed",
-            "client_name": "<客户名称或事项名称>",
-            "client_charge_code": "<Client Charge Code>",
-            "expense_date": "<YYYY-MM-DD>",
-            "final_note": "<最终备注>",
-        }]
-    }, ensure_ascii=False, indent=2), file=sys.stderr)
-    print("NOTE: every <> value above is a placeholder — copy the STRUCTURE, replace every", file=sys.stderr)
-    print("value with real data; unreplaced placeholders are rejected by validation.", file=sys.stderr)
-    print("3. Top-level keys allowed: " + ", ".join(sorted(ALLOWED_ROOT_FIELDS)), file=sys.stderr)
-    print("4. unit_update fields allowed: " + ", ".join(sorted(ALLOWED_UNIT_FIELDS)), file=sys.stderr)
-    print("5. Validate with --dry-run first, then apply without it.", file=sys.stderr)
+    print("HOW TO FIX (stay on the canonical Composer/updater path):", file=sys.stderr)
+    print("1. Correct the same UTF-8 allocation_decisions.v1 file that was passed to Composer.", file=sys.stderr)
+    print(f"2. Rerun compose_answers.py against the CURRENT allocation: {allocation_path}", file=sys.stderr)
+    print("3. Apply only the allocation-answers.json that Composer publishes after its dry-run passes.", file=sys.stderr)
+    print(
+        "Do not fill an allocation-answers template, create fill_answers.py/patch scripts, or edit "
+        "expense-allocation.json directly.",
+        file=sys.stderr,
+    )
+    print("Canonical answers root fields: " + ", ".join(sorted(ALLOWED_ROOT_FIELDS)), file=sys.stderr)
+    print("Canonical unit update fields: " + ", ".join(sorted(ALLOWED_UNIT_FIELDS)), file=sys.stderr)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -1069,7 +1663,10 @@ def main(argv: list[str] | None = None) -> int:
     parser = argparse.ArgumentParser(description="Apply user answers to process/expense-allocation.json.")
     parser.add_argument("--allocation", required=True, help="Path to process/expense-allocation.json.")
     parser.add_argument("--answers", required=True, help="JSON file with unit_updates/question_updates.")
-    parser.add_argument("--output", help="Output allocation JSON. Defaults to overwriting --allocation with a .bak backup.")
+    parser.add_argument(
+        "--output",
+        help="Output allocation JSON. In-place writes archive the prior stamped generation by fingerprint.",
+    )
     parser.add_argument("--md-output", help="Output allocation Markdown. Defaults to output JSON sibling expense-allocation.md.")
     parser.add_argument("--lenient", action="store_true", help="Ignore unknown update fields instead of failing.")
     parser.add_argument("--dry-run", action="store_true", help="Validate and apply in memory without writing files.")
@@ -1090,7 +1687,7 @@ def main(argv: list[str] | None = None) -> int:
     except ValueError as exc:
         print(f"ERROR: {exc}", file=sys.stderr)
         print_answers_schema_help(allocation_path)
-        return 2
+        return ExitCode.COMMAND_ERROR
     if args.dry_run:
         print("Dry run OK. No files were written.")
     else:
@@ -1098,7 +1695,7 @@ def main(argv: list[str] | None = None) -> int:
         print(f"Wrote {markdown_path}")
     print_open_questions(payload)
     print_advisory_questions(payload)
-    return 0
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

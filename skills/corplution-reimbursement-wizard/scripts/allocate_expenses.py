@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import argparse
 import calendar
+import hashlib
 import json
 import re
 import sys
@@ -15,10 +16,35 @@ from typing import Any
 
 # Policy numbers and year-coded charge codes come from assets/policy.toml;
 # edit that file (not this one) when company policy changes.
-from policy_config import load_policy
+from policy_config import load_policy, policy_path
+# Persistent, cross-run place -> place-type memory (assets/place-definitions.json).
+import place_config
+from place_config import PlaceBook
+import allocation_generations
+from exit_codes import ExitCode
+import hint_refs
 import integrity
+from io_utils import configure_utf8_stdio as configure_stdio
+from json_io import read_json_object as load_json
+import text_utils
+import time_utils
+import travel_ticket_utils
+import unit_refs
+import value_utils
 
 _POLICY = load_policy()
+_PLACE_BOOK: PlaceBook | None = None
+
+
+def get_place_book() -> PlaceBook:
+    """Lazily load the place-definitions memory (fails open to built-ins)."""
+    global _PLACE_BOOK
+    if _PLACE_BOOK is None:
+        _PLACE_BOOK = PlaceBook.load()
+    return _PLACE_BOOK
+
+RAIL_CHAIN_MAX_DEPARTURE_GAP_HOURS = 6
+RAIL_CHAIN_HIGH_CONFIDENCE_HOURS = 3
 
 
 C = {
@@ -66,26 +92,12 @@ EXPENSE_ORDER = {
 }
 
 
-def load_json(path: Path) -> dict[str, Any]:
-    return json.loads(path.read_text(encoding="utf-8-sig"))
-
-
 def write_json(path: Path, payload: dict[str, Any]) -> None:
     path.parent.mkdir(parents=True, exist_ok=True)
     path.write_text(json.dumps(payload, ensure_ascii=False, indent=2), encoding="utf-8")
 
 
-def clean(value: Any) -> str:
-    return re.sub(r"\s+", " ", "" if value is None else str(value)).strip()
-
-
-def configure_stdio() -> None:
-    for stream in (sys.stdout, sys.stderr):
-        if hasattr(stream, "reconfigure"):
-            try:
-                stream.reconfigure(errors="replace")
-            except Exception:
-                pass
+clean = text_utils.normalize_text
 
 
 def is_admin_code(value: Any) -> bool:
@@ -120,7 +132,7 @@ def mobile_accounting_errors(unit: dict[str, Any]) -> list[str]:
     return errors
 
 
-def note_placeholder_errors(unit: dict[str, Any]) -> list[str]:
+def allocation_note_errors(unit: dict[str, Any]) -> list[str]:
     note = clean(unit.get("final_note"))
     errors: list[str] = []
     if "\u51fa\u53d1\u5730\u7c7b\u578b" in note or "\u76ee\u7684\u5730\u7c7b\u578b" in note:
@@ -153,14 +165,7 @@ def normalize_admin_client(unit: dict[str, Any]) -> None:
         unit["admin_client_review_needed"] = False
 
 
-def money(value: Any) -> str:
-    if value in (None, ""):
-        return ""
-    try:
-        return f"{Decimal(str(value).replace(',', '')):.2f}"
-    except InvalidOperation:
-        match = re.search(r"-?\d+(?:\.\d+)?", str(value))
-        return f"{Decimal(match.group(0)):.2f}" if match else ""
+money = value_utils.format_optional_amount
 
 
 def parse_date(value: str) -> date | None:
@@ -272,6 +277,117 @@ def reliable_invoice_expense_date(
     return "", "needs_user_date", True, "普通发票开票日期不能直接作为报销发生日期。"
 
 
+PROJECT_CONTEXT_SCHEMA_VERSION = "project_context.v1"
+PROJECT_CONTEXT_REQUIRED_FIELDS = {
+    "date_start",
+    "date_end",
+    "city",
+    "client_name",
+    "client_charge_code",
+}
+PROJECT_CONTEXT_OPTIONAL_FIELDS = {
+    "context_id",
+    "project_description",
+    "user_notes",
+    "project_scope",
+    "travel_buffer_days",
+    "status",
+    "meal_hints",
+    "expense_hints",
+    "meal_standards",
+}
+PROJECT_CONTEXT_FIELDS = PROJECT_CONTEXT_REQUIRED_FIELDS | PROJECT_CONTEXT_OPTIONAL_FIELDS
+PROJECT_CONTEXT_ROOT_FIELDS = {"schema_version", "project_contexts"}
+
+
+def project_context_template_path() -> Path:
+    return Path(__file__).resolve().parents[1] / "assets" / "project-context-template.json"
+
+
+def context_schema_errors(payload: Any) -> list[str]:
+    if not isinstance(payload, dict):
+        return ["root must be an object with schema_version and project_contexts; root arrays are not accepted"]
+
+    errors: list[str] = []
+    unknown_root = sorted(set(payload) - PROJECT_CONTEXT_ROOT_FIELDS)
+    if unknown_root:
+        errors.append(
+            "unsupported root field(s): " + ", ".join(unknown_root)
+            + "; use only schema_version and project_contexts"
+        )
+    if payload.get("schema_version") != PROJECT_CONTEXT_SCHEMA_VERSION:
+        errors.append(f"schema_version must be {PROJECT_CONTEXT_SCHEMA_VERSION!r}")
+
+    contexts = payload.get("project_contexts")
+    if not isinstance(contexts, list) or not contexts:
+        alias_note = " Found 'projects'; rename it to 'project_contexts'." if "projects" in payload else ""
+        errors.append("project_contexts must be a non-empty array." + alias_note)
+        return errors
+
+    seen_context_ids: set[str] = set()
+    for index, context in enumerate(contexts, start=1):
+        label = f"project_contexts[{index - 1}]"
+        if not isinstance(context, dict):
+            errors.append(f"{label} must be an object")
+            continue
+        unknown_fields = sorted(set(context) - PROJECT_CONTEXT_FIELDS)
+        if unknown_fields:
+            errors.append(
+                f"{label} unsupported field(s): {', '.join(unknown_fields)}; "
+                f"allowed fields: {', '.join(sorted(PROJECT_CONTEXT_FIELDS))}"
+            )
+        missing = sorted(
+            field for field in PROJECT_CONTEXT_REQUIRED_FIELDS
+            if not clean(context.get(field))
+        )
+        if missing:
+            errors.append(f"{label} missing required canonical field(s): {', '.join(missing)}")
+        context_id = clean(context.get("context_id"))
+        if context_id:
+            if context_id in seen_context_ids:
+                errors.append(f"{label}.context_id duplicates {context_id!r}")
+            seen_context_ids.add(context_id)
+        for field in PROJECT_CONTEXT_REQUIRED_FIELDS | {"project_description", "context_id"}:
+            value = clean(context.get(field))
+            if value.startswith("<") and value.endswith(">"):
+                errors.append(f"{label}.{field} still contains template placeholder {value!r}")
+        start_text = clean(context.get("date_start"))
+        end_text = clean(context.get("date_end"))
+        start = parse_date(start_text) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", start_text) else None
+        end = parse_date(end_text) if re.fullmatch(r"\d{4}-\d{2}-\d{2}", end_text) else None
+        if start_text and start is None:
+            errors.append(f"{label}.date_start must be YYYY-MM-DD")
+        if end_text and end is None:
+            errors.append(f"{label}.date_end must be YYYY-MM-DD")
+        if start and end and end < start:
+            errors.append(f"{label}.date_end cannot be earlier than date_start")
+        try:
+            buffer_days = int(context.get("travel_buffer_days", 1))
+            if buffer_days < 0:
+                raise ValueError
+        except (TypeError, ValueError):
+            errors.append(f"{label}.travel_buffer_days must be a non-negative integer")
+        for hints_field in ("meal_hints", "expense_hints"):
+            hints = context.get(hints_field, [])
+            if not isinstance(hints, list) or any(not isinstance(item, dict) for item in hints):
+                errors.append(f"{label}.{hints_field} must be an array of objects")
+        standards = context.get("meal_standards", [])
+        if not isinstance(standards, list) or any(not isinstance(item, dict) for item in standards):
+            errors.append(f"{label}.meal_standards must be an array of objects")
+        else:
+            for s_index, standard in enumerate(standards):
+                s_label = f"{label}.meal_standards[{s_index}]"
+                if not re.fullmatch(r"\d{4}-\d{2}-\d{2}", clean(standard.get("date"))):
+                    errors.append(f"{s_label}.date must be YYYY-MM-DD")
+                cap_text = clean(standard.get("daily_cap"))
+                try:
+                    if Decimal(cap_text) < 0:
+                        raise ValueError
+                except (InvalidOperation, ValueError):
+                    errors.append(f"{s_label}.daily_cap must be a non-negative decimal amount")
+    return errors
+
+
 def load_context(path: Path | None) -> tuple[list[dict[str, Any]], str, list[dict[str, Any]]]:
     if not path:
         return [], "", [{
@@ -281,29 +397,32 @@ def load_context(path: Path | None) -> tuple[list[dict[str, Any]], str, list[dic
             "why_it_matters": "没有项目上下文时，只能生成费用清单，不能可靠匹配 Client 和 Client Charge Code。",
             "status": "open",
         }]
-    text = path.read_text(encoding="utf-8-sig")
-    if path.suffix.lower() == ".json":
-        payload = json.loads(text)
-        contexts = payload.get("project_contexts", payload if isinstance(payload, list) else [])
-        normalized = []
-        for idx, ctx in enumerate(contexts, start=1):
-            item = dict(ctx)
-            item.setdefault("context_id", f"CTX-{idx:03d}")
-            item.setdefault("travel_buffer_days", 1)
-            item.setdefault("status", "draft")
-            normalized.append(item)
-        return normalized, "", []
-    return [], text, [{
-        "question_id": "Q-CONTEXT-001",
-        "unit_ids": [],
-        "question": (
-            f"已收到自然语言项目说明：{text[:200]}。我会把它整理成项目上下文用于匹配；"
-            "请确认这段说明是否覆盖报销周期、城市、客户名称和 Client Charge Code。"
-            "如果缺任何一项，请直接补充。"
-        ),
-        "why_it_matters": "脚本保留原文；agent 应把自然语言整理成结构化项目上下文，用户只需要确认或补充缺项。",
-        "status": "open",
-    }]
+    if path.suffix.lower() != ".json":
+        raise ValueError(
+            "project context must be canonical UTF-8 JSON; convert natural-language notes internally "
+            "instead of passing a text file to allocation"
+        )
+    try:
+        payload = json.loads(path.read_text(encoding="utf-8-sig"))
+    except (OSError, UnicodeError, json.JSONDecodeError) as exc:
+        raise ValueError(f"project context JSON cannot be read: {exc}") from exc
+    errors = context_schema_errors(payload)
+    if errors:
+        raise ValueError("invalid project context schema:\n- " + "\n- ".join(errors))
+
+    normalized = []
+    for idx, ctx in enumerate(payload["project_contexts"], start=1):
+        item = dict(ctx)
+        item.setdefault("context_id", f"CTX-{idx:03d}")
+        item.setdefault("project_description", "")
+        item.setdefault("user_notes", "")
+        item.setdefault("travel_buffer_days", 1)
+        item.setdefault("status", "draft")
+        item.setdefault("meal_hints", [])
+        item.setdefault("expense_hints", [])
+        item.setdefault("meal_standards", [])
+        normalized.append(item)
+    return normalized, "", []
 
 
 def doc_by_id(extraction: dict[str, Any]) -> dict[str, dict[str, Any]]:
@@ -400,18 +519,26 @@ def normalize_taxi_column(unit: dict[str, Any]) -> None:
         unit["final_template_column"] = formal_taxi_column(unit)
 
 
-def classify_place_type(place: str, contexts: list[dict[str, Any]]) -> tuple[str, str, bool]:
+def classify_place_type(
+    place: str,
+    contexts: list[dict[str, Any]],
+    place_book: PlaceBook | None = None,
+) -> tuple[str, str, bool]:
     text = clean(place)
     if not text:
         return "", "low", True
-    if any(k in text for k in ["\u6c5f\u5b81\u8def", "\u53cb\u529b\u56fd\u9645\u5927\u53a6"]):
-        return C["company"], "high", False
-    if any(k in text for k in ["\u673a\u573a", "\u822a\u7ad9\u697c", "T1", "T2", "T3", "3F", "\u51fa\u53d1", "\u5230\u8fbe"]):
-        return C["airport"], "high", False
-    if any(k in text for k in ["\u706b\u8f66\u7ad9", "\u9ad8\u94c1\u7ad9", "\u8f66\u7ad9", "\u8679\u6865\u7ad9"]):
-        return C["railway_station"], "high", False
-    if any(k in text for k in ["\u9152\u5e97", "\u5bbe\u9986", "\u4e9a\u6735", "\u5168\u5b63", "\u559c\u6765\u767b", "\u6c49\u5ead"]):
-        return C["hotel"], "high", False
+    # Consult the persistent place memory first: a user-declared private place
+    # (office, home, a client's site) is authoritative \u2014 high confidence, no
+    # confirmation. No private facts are hard-coded here anymore; they live in
+    # assets/place-definitions.json.
+    remembered = (place_book or get_place_book()).lookup(text)
+    if remembered is not None:
+        return remembered
+    # Public places (airport/rail station/hotel) are general knowledge \u2014 inferred
+    # without any memory (\u8679\u6865T2 -> \u673a\u573a), so they are neither stored nor asked.
+    public = place_config.public_place_type(text)
+    if public is not None:
+        return public, "high", False
     for ctx in contexts:
         client = clean(ctx.get("client_name"))
         if client and client in text:
@@ -422,29 +549,23 @@ def classify_place_type(place: str, contexts: list[dict[str, Any]]) -> tuple[str
 
 
 def route_from_note(note: str) -> str:
-    match = re.search(r"([^,，]+?)\s*->\s*([^,，]+)", note or "")
-    return f"{clean(match.group(1))}-{clean(match.group(2))}" if match else ""
+    return travel_ticket_utils.route_from_text(note)
 
 
 def is_refund_fee(unit: dict[str, Any]) -> bool:
-    text = clean(" ".join([
-        unit.get("source_note", ""),
-        unit.get("expense_note", ""),
-        unit.get("raw_remarks", ""),
-        unit.get("line_item_name", ""),
-        unit.get("seller_name", ""),
-    ]))
-    return any(keyword in text for keyword in ["退票费", "退票", "退款", "refund", "Refund", "cancellation"])
+    return travel_ticket_utils.is_refund_fee(unit)
 
 
 def normal_note(unit: dict[str, Any]) -> str:
     category = unit.get("source_category", "")
-    subtype = unit.get("document_subtype", "")
     source = clean(unit.get("source_note"))
-    if subtype == "railway_e_ticket" or "G" in source[:12]:
-        route = route_from_note(source) or clean(unit.get("route"))
-        note_type = C["rail_refund"] if is_refund_fee(unit) else C["rail"]
-        return f"{note_type}\uff08{route}\uff09" if route else note_type
+    normalized_ticket_note = travel_ticket_utils.ticket_note(unit)
+    if normalized_ticket_note:
+        return normalized_ticket_note
+    if travel_ticket_utils.is_rail_ticket(unit):
+        return C["rail_refund"] if is_refund_fee(unit) else C["rail"]
+    if travel_ticket_utils.is_flight_ticket(unit):
+        return C["flight_refund"] if is_refund_fee(unit) else C["flight"]
     if category == "hotel":
         nights = unit.get("hotel_nights") or "X"
         checkin = unit.get("check_in_date") or "\u5165\u4f4f\u65e5"
@@ -477,7 +598,13 @@ def print_document_reconciliation(extraction: dict[str, Any], units: list[dict[s
     docs = extraction.get("documents", [])
     _, schedule_to_invoice = ride_schedule_links(extraction)
     linked_invoices = set(schedule_to_invoice.values())
-    unit_doc_ids = {u.get("source_doc_id") for u in units if u.get("source_doc_id")}
+    unit_doc_ids = {
+        doc_id
+        for unit in units
+        if (doc_id := value_utils.first_nonblank(
+            unit.get("source_document_id"), unit.get("source_doc_id")
+        ))
+    }
     excluded = [d for d in docs if d.get("excluded_by_user")]
     supporting = [d for d in docs if not d.get("excluded_by_user")
                   and d.get("document_role") == "supporting_document"]
@@ -494,6 +621,16 @@ def print_document_reconciliation(extraction: dict[str, Any], units: list[dict[s
           f" + supporting documents {len(supporting)} + excluded by user {len(excluded)}")
     for d in excluded:
         print(f"  * excluded: {Path(str(d.get('source_file',''))).name} ({d.get('exclusion_reason','')})")
+    unassociated_support = [
+        d for d in supporting if not clean(d.get("supports_document_id"))
+    ]
+    if unassociated_support:
+        print(f"- Supporting documents not yet tied to an invoice: {len(unassociated_support)} "
+              "(each must name the invoice it backs via supports_document_id, or be excluded, "
+              "before Stage 3/packaging — this is a hard block):")
+        for d in unassociated_support:
+            print(f"  * {d['document_id']}: {Path(str(d.get('source_file',''))).name} "
+                  f"(support_type={clean(d.get('support_type')) or '<unset>'})")
     if unknown_units:
         print(f"- Unidentified documents held as BLOCKING questions: {len(unknown_units)} (resolve via chat + apply_extraction_corrections.py)")
     if unaccounted:
@@ -608,6 +745,16 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
             city = infer_city_from_text(text_for_city)
             col = final_column(source_category, city)
             source_note = classification.get("expense_note", "")
+            railway_leg = classification.get("railway_leg") or {}
+            if not isinstance(railway_leg, dict):
+                railway_leg = {}
+            railway_refund_fee_amount = money(railway_leg.get("refund_fee_amount"))
+            railway_is_refund = bool(railway_leg.get("is_refund_fee") or railway_refund_fee_amount)
+            invoice_amount = (
+                railway_refund_fee_amount
+                if railway_is_refund and railway_refund_fee_amount
+                else money(invoice.get("total_amount"))
+            )
             billing_period = ""
             match = re.search(r"(\d{6})", invoice.get("raw_remarks", "") + " " + source_note)
             if source_category == "mobile" and match:
@@ -637,8 +784,8 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
                 "supporting_schedule_file": "",
                 "supporting_schedule_filename": "",
                 "invoice_no": invoice.get("invoice_no", ""),
-                "amount": money(invoice.get("total_amount")),
-                "invoice_amount": money(invoice.get("total_amount")),
+                "amount": invoice_amount,
+                "invoice_amount": invoice_amount,
                 "reimbursable_amount": "",
                 "issue_date": invoice.get("issue_date", ""),
                 "expense_date": expense_date,
@@ -650,7 +797,24 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
                 "document_subtype": subtype,
                 "final_template_column": col,
                 "city": city,
-                "route": route_from_note(source_note),
+                "route": clean(railway_leg.get("route")) or route_from_note(source_note),
+                "train_no": clean(railway_leg.get("train_no")),
+                "origin_station": clean(railway_leg.get("origin_station")),
+                "destination_station": clean(railway_leg.get("destination_station")),
+                "rail_departure_time": clean(railway_leg.get("departure_time")),
+                "rail_departure_datetime": clean(railway_leg.get("departure_datetime")),
+                "is_refund_fee": railway_is_refund,
+                "refund_fee_amount": railway_refund_fee_amount,
+                "journey_chain_id": "",
+                "journey_chain_route": "",
+                "journey_chain_position": "",
+                "journey_chain_length": "",
+                "journey_chain_unit_ids": [],
+                "journey_chain_confidence": "",
+                "journey_chain_assignment_rule": "",
+                "journey_chain_match_reason": "",
+                "journey_chain_project_context_id": "",
+                "journey_chain_needs_confirmation": False,
                 "origin": "",
                 "destination": "",
                 "origin_place_type": "",
@@ -696,7 +860,11 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
 
         if role == "supporting_document":
             # Legitimate evidence with no expense row of its own (approval
-            # screenshots, payment receipts); packaging picks it up later.
+            # screenshots, payment receipts). It has no allocation unit; Stage 3
+            # (write) mounts it onto the proof group of the invoice named by its
+            # `supports_document_id` and packages it under that proof number.
+            # A supporting_document that names no invoice is a hard block at
+            # Stage 3 (see mount_support_documents in write_reimbursement_template).
             continue
 
         # Catch-all: every document the pipeline does not recognize becomes a
@@ -708,8 +876,8 @@ def create_units(extraction: dict[str, Any], contexts: list[dict[str, Any]]) -> 
         amount = clean((doc.get("invoice") or {}).get("total_amount"))
         unit = {
             "unit_id": f"UNIT-{unit_idx:03d}",
-            "unit_no": unit_idx,
-            "source_doc_id": doc_id,
+            "user_no": unit_idx,
+            "source_document_id": doc_id,
             "source_filename": filename,
             "source_category": "unknown",
             "amount": amount,
@@ -978,6 +1146,335 @@ def normalize_taxi_column_for_context(unit: dict[str, Any], ctx: dict[str, Any],
     normalize_taxi_column(unit)
 
 
+def is_rail_unit(unit: dict[str, Any]) -> bool:
+    return clean(unit.get("document_subtype")) == "railway_e_ticket" or bool(clean(unit.get("train_no")))
+
+
+def rail_station_key(value: Any) -> str:
+    text = clean(value).lower().replace(" ", "")
+    for suffix in ["火车站", "高铁站", "铁路站", "站"]:
+        if text.endswith(suffix):
+            text = text[: -len(suffix)]
+            break
+    return text
+
+
+def rail_station_city_key(value: Any) -> str:
+    text = rail_station_key(value)
+    if len(text) >= 3 and text[-1:] in {"东", "西", "南", "北"}:
+        text = text[:-1]
+    return text.replace("市", "")
+
+
+def rail_stations_connect(destination: Any, origin: Any) -> bool:
+    destination_station = rail_station_key(destination)
+    origin_station = rail_station_key(origin)
+    if not destination_station or not origin_station:
+        return False
+    return (
+        destination_station == origin_station
+        or rail_station_city_key(destination_station) == rail_station_city_key(origin_station)
+    )
+
+
+def rail_leg_endpoints(unit: dict[str, Any]) -> tuple[str, str]:
+    origin = clean(unit.get("origin_station"))
+    destination = clean(unit.get("destination_station"))
+    if origin and destination:
+        return origin, destination
+    return route_endpoints(unit)
+
+
+def rail_leg_departure_datetime(unit: dict[str, Any]) -> datetime | None:
+    values = [
+        clean(unit.get("rail_departure_datetime")),
+        clean(unit.get("source_note")),
+        clean(unit.get("expense_note")),
+    ]
+    date_value = clean(unit.get("expense_date"))
+    time_value = clean(unit.get("rail_departure_time"))
+    if date_value and time_value:
+        values.insert(0, f"{date_value} {time_value}")
+    for value in values:
+        match = re.search(r"(\d{4})[-/.](\d{1,2})[-/.](\d{1,2})\s+(\d{1,2}):(\d{2})", value)
+        if not match:
+            continue
+        try:
+            return datetime(*(int(part) for part in match.groups()))
+        except ValueError:
+            continue
+    return None
+
+
+def rail_temporal_link(first: dict[str, Any], second: dict[str, Any]) -> tuple[bool, str]:
+    first_date = parse_date(clean(first.get("expense_date")))
+    second_date = parse_date(clean(second.get("expense_date")))
+    if not first_date or not second_date:
+        return False, ""
+    date_gap = (second_date - first_date).days
+    if date_gap < 0 or date_gap > 1:
+        return False, ""
+
+    first_dt = rail_leg_departure_datetime(first)
+    second_dt = rail_leg_departure_datetime(second)
+    if first_dt and second_dt:
+        gap_hours = (second_dt - first_dt).total_seconds() / 3600
+        if gap_hours <= 0 or gap_hours > RAIL_CHAIN_MAX_DEPARTURE_GAP_HOURS:
+            return False, ""
+        confidence = "high" if gap_hours <= RAIL_CHAIN_HIGH_CONFIDENCE_HOURS else "medium"
+        return True, confidence
+
+    return False, ""
+
+
+def rail_user_declared_context(unit: dict[str, Any]) -> str:
+    if clean(unit.get("auto_project_match")) == "user_context_expense_hint":
+        return clean(unit.get("project_context_id"))
+    if unit.get("corrected_by_user") and clean(unit.get("status")) in {"confirmed", "fixed"}:
+        return clean(unit.get("project_context_id"))
+    return ""
+
+
+def rail_link_conflicts_with_user_declaration(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    first_context = rail_user_declared_context(first)
+    second_context = rail_user_declared_context(second)
+    return bool(first_context and second_context and first_context != second_context)
+
+
+def rail_leg_sort_key(unit: dict[str, Any]) -> tuple[str, str, int]:
+    departure = rail_leg_departure_datetime(unit)
+    departure_key = departure.isoformat() if departure else clean(unit.get("expense_date"))
+    try:
+        user_no = int(unit.get("user_no") or 0)
+    except (TypeError, ValueError):
+        user_no = 0
+    return clean(unit.get("expense_date")), departure_key, user_no
+
+
+def build_rail_journey_chains(units: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    legs = [
+        unit for unit in units
+        if is_rail_unit(unit)
+        and all(rail_leg_endpoints(unit))
+        and parse_date(clean(unit.get("expense_date")))
+    ]
+    legs.sort(key=rail_leg_sort_key)
+    by_id = {clean(unit.get("unit_id")): unit for unit in legs}
+    outgoing: dict[str, list[tuple[str, str]]] = {unit_id: [] for unit_id in by_id}
+    incoming: dict[str, list[tuple[str, str]]] = {unit_id: [] for unit_id in by_id}
+
+    for first in legs:
+        first_id = clean(first.get("unit_id"))
+        _, first_destination = rail_leg_endpoints(first)
+        for second in legs:
+            second_id = clean(second.get("unit_id"))
+            if first_id == second_id:
+                continue
+            # A cancelled itinerary may coexist with replacement tickets.
+            # Build refund chains and travelled chains independently so their
+            # identical stations/times cannot create branching ambiguity.
+            if is_refund_fee(first) != is_refund_fee(second):
+                continue
+            # Explicit per-leg applicant assignments are authoritative. Two
+            # adjacent tickets declared for different projects represent a
+            # project stop, not a transfer chain.
+            if rail_link_conflicts_with_user_declaration(first, second):
+                continue
+            second_origin, _ = rail_leg_endpoints(second)
+            if not rail_stations_connect(first_destination, second_origin):
+                continue
+            linked, confidence = rail_temporal_link(first, second)
+            if not linked:
+                continue
+            outgoing[first_id].append((second_id, confidence))
+            incoming[second_id].append((first_id, confidence))
+
+    unique_next: dict[str, tuple[str, str]] = {}
+    for unit_id, candidates in outgoing.items():
+        if len(candidates) != 1:
+            continue
+        next_id, confidence = candidates[0]
+        if len(incoming.get(next_id, [])) == 1:
+            unique_next[unit_id] = (next_id, confidence)
+
+    linked_targets = {next_id for next_id, _ in unique_next.values()}
+    starts = [
+        unit_id for unit_id in by_id
+        if unit_id in unique_next
+        and unit_id not in linked_targets
+        and not incoming.get(unit_id)
+    ]
+    starts.sort(key=lambda unit_id: rail_leg_sort_key(by_id[unit_id]))
+    chains: list[dict[str, Any]] = []
+    consumed: set[str] = set()
+    for start_id in starts:
+        if start_id in consumed:
+            continue
+        chain_ids = [start_id]
+        link_confidences: list[str] = []
+        cursor = start_id
+        seen = {start_id}
+        while cursor in unique_next:
+            next_id, confidence = unique_next[cursor]
+            if next_id in seen:
+                break
+            chain_ids.append(next_id)
+            link_confidences.append(confidence)
+            seen.add(next_id)
+            cursor = next_id
+        if len(chain_ids) < 2:
+            continue
+        if outgoing.get(cursor):
+            # The apparent final leg has multiple plausible continuations, so
+            # this is only a partial path rather than a safely closed journey.
+            continue
+        consumed.update(chain_ids)
+        chains.append({
+            "units": [by_id[unit_id] for unit_id in chain_ids],
+            "confidence": "high" if link_confidences and all(value == "high" for value in link_confidences) else "medium",
+        })
+    return chains
+
+
+def rail_chain_route(chain_units: list[dict[str, Any]]) -> str:
+    if not chain_units:
+        return ""
+    first_origin, _ = rail_leg_endpoints(chain_units[0])
+    stations = [first_origin]
+    for unit in chain_units:
+        _, destination = rail_leg_endpoints(unit)
+        stations.append(destination)
+    return " -> ".join(station for station in stations if station)
+
+
+def rail_context_date_matches(chain_units: list[dict[str, Any]], ctx: dict[str, Any]) -> bool:
+    start = context_start(ctx)
+    end = context_end(ctx)
+    if not start or not end:
+        return False
+    buffer = max(int(ctx.get("travel_buffer_days") or 0), 1)
+    return any(
+        start - timedelta(days=buffer) <= unit_date <= end + timedelta(days=buffer)
+        for unit_date in (parse_date(clean(unit.get("expense_date"))) for unit in chain_units)
+        if unit_date
+    )
+
+
+def rail_station_contexts(
+    station: str,
+    chain_units: list[dict[str, Any]],
+    contexts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    return [
+        ctx for ctx in non_admin_contexts(contexts)
+        if not is_local_context(ctx)
+        and rail_context_date_matches(chain_units, ctx)
+        and context_city_in_text(ctx, station)
+    ]
+
+
+def unique_rail_station_context(
+    station: str,
+    chain_units: list[dict[str, Any]],
+    contexts: list[dict[str, Any]],
+) -> dict[str, Any] | None:
+    candidates = rail_station_contexts(station, chain_units, contexts)
+    context_ids = {clean(ctx.get("context_id")) for ctx in candidates}
+    return candidates[0] if len(context_ids) == 1 else None
+
+
+def rail_chain_context(
+    chain_units: list[dict[str, Any]],
+    contexts: list[dict[str, Any]],
+) -> tuple[dict[str, Any] | None, str, str]:
+    contexts_by_id = {clean(ctx.get("context_id")): ctx for ctx in contexts}
+    hinted_ids = {
+        clean(unit.get("project_context_id"))
+        for unit in chain_units
+        if unit.get("auto_project_match") == "user_context_expense_hint"
+        and clean(unit.get("project_context_id"))
+    }
+    if len(hinted_ids) > 1:
+        return None, "rail_transfer_chain_conflicting_user_hints", "Different user hints assign connected rail legs to different projects."
+    if len(hinted_ids) == 1:
+        context_id = next(iter(hinted_ids))
+        ctx = contexts_by_id.get(context_id)
+        if ctx:
+            return ctx, "rail_transfer_chain_user_hint", f"A user-provided expense hint assigns this connected rail journey to {context_id}."
+
+    origin, _ = rail_leg_endpoints(chain_units[0])
+    _, destination = rail_leg_endpoints(chain_units[-1])
+    destination_ctx = unique_rail_station_context(destination, chain_units, contexts)
+    destination_context_id = clean(destination_ctx.get("context_id")) if destination_ctx else ""
+    intermediate_contexts: dict[str, dict[str, Any]] = {}
+    for unit in chain_units[:-1]:
+        _, intermediate_station = rail_leg_endpoints(unit)
+        for ctx in rail_station_contexts(intermediate_station, chain_units, contexts):
+            context_id = clean(ctx.get("context_id"))
+            if context_id and context_id != destination_context_id:
+                intermediate_contexts[context_id] = ctx
+    if intermediate_contexts:
+        labels = ", ".join(
+            f"{context_id} ({clean(ctx.get('city')) or clean(ctx.get('client_name'))})"
+            for context_id, ctx in sorted(intermediate_contexts.items())
+        )
+        return (
+            None,
+            "rail_transfer_chain_intermediate_project_review",
+            "A connected rail route passes through an intermediate city with an active "
+            f"project context: {labels}. Confirm transfer versus an actual project stop.",
+        )
+    if destination_ctx:
+        return (
+            destination_ctx,
+            "rail_transfer_chain_destination",
+            f"The connected rail journey terminates in project context {destination_ctx.get('context_id', '')}; intermediate stations are transfers.",
+        )
+
+    if is_shanghai_city(destination):
+        origin_ctx = unique_rail_station_context(origin, chain_units, contexts)
+        if origin_ctx:
+            return (
+                origin_ctx,
+                "rail_transfer_chain_return",
+                f"The connected rail journey returns to Shanghai from project context {origin_ctx.get('context_id', '')}.",
+            )
+
+    return None, "rail_transfer_chain_unresolved", "Connected rail legs were detected, but the whole journey does not point to one unique project."
+
+
+def apply_rail_journey_chain_matches(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -> None:
+    for index, chain in enumerate(build_rail_journey_chains(units), start=1):
+        chain_units = chain["units"]
+        chain_id = f"RAIL-CHAIN-{index:03d}"
+        route = rail_chain_route(chain_units)
+        unit_ids = [clean(unit.get("unit_id")) for unit in chain_units]
+        ctx, rule, reason = rail_chain_context(chain_units, contexts)
+        unresolved = ctx is None
+        for position, unit in enumerate(chain_units, start=1):
+            unit.update({
+                "journey_chain_id": chain_id,
+                "journey_chain_route": route,
+                "journey_chain_position": position,
+                "journey_chain_length": len(chain_units),
+                "journey_chain_unit_ids": unit_ids,
+                "journey_chain_confidence": chain["confidence"],
+                "journey_chain_assignment_rule": rule,
+                "journey_chain_match_reason": reason,
+                "journey_chain_project_context_id": clean(ctx.get("context_id")) if ctx else "",
+                "journey_chain_needs_confirmation": unresolved,
+            })
+            if ctx:
+                apply_context_match(
+                    unit,
+                    ctx,
+                    confidence="high",
+                    status="confirmed",
+                    auto_project_match=rule,
+                    reason=f"Rail journey chain {chain_id}: {reason}",
+                )
+
+
 def match_hotel(unit: dict[str, Any], contexts: list[dict[str, Any]]) -> dict[str, Any] | None:
     contexts = non_admin_contexts(contexts)
     city = clean(unit.get("hotel_city") or unit.get("city"))
@@ -1235,14 +1732,92 @@ def decimal_amount(value: Any) -> Decimal | None:
         return None
 
 
+def cross_field_hint_key(hint: dict[str, Any]) -> tuple[str, str, str, str, str] | None:
+    category = clean(hint.get("source_category") or hint.get("category"))
+    date_value = date_hint_value(hint)
+    amount = money(value_utils.first_nonblank(hint.get("amount"), hint.get("recorded_amount")))
+    unit_no = clean(hint.get("unit_no") or hint.get("user_no"))
+    invoice_no = clean(hint.get("invoice_no"))
+    if unit_no or invoice_no:
+        return category, date_value, amount, unit_no, invoice_no
+    if date_value and amount:
+        return category, date_value, amount, "", ""
+    return None
+
+
+def cross_field_hint_merchants_compatible(first: dict[str, Any], second: dict[str, Any]) -> bool:
+    first_terms = [compact_merchant_text(term) for term in merchant_terms(first)]
+    second_terms = [compact_merchant_text(term) for term in merchant_terms(second)]
+    first_terms = [term for term in first_terms if term]
+    second_terms = [term for term in second_terms if term]
+    if not first_terms or not second_terms:
+        return True
+    return any(
+        first_term == second_term or first_term in second_term or second_term in first_term
+        for first_term in first_terms
+        for second_term in second_terms
+    )
+
+
+RAIL_MEAL_TRANSPORT_TERMS = ("高铁", "动车", "火车", "列车")
+RAIL_MEAL_CONSUMPTION_TERMS = (
+    "餐车",
+    "列车餐",
+    "高铁餐",
+    "动车餐",
+    "火车餐",
+    "点餐",
+    "用餐",
+    "吃饭",
+    "就餐",
+    "餐饮",
+    "餐费",
+)
+
+
+def is_rail_meal_hint(hint: dict[str, Any]) -> bool:
+    """Recognize a meal consumed during rail travel, not a rail ticket."""
+    text = clean(" ".join(
+        clean(hint.get(field))
+        for field in ("description", "note", "purpose", "business_reason", "merchant", "seller_name")
+    ))
+    return (
+        any(term in text for term in RAIL_MEAL_TRANSPORT_TERMS)
+        and any(term in text for term in RAIL_MEAL_CONSUMPTION_TERMS)
+    )
+
+
+def normalize_hint_source_category(hint: dict[str, Any], source_field: str) -> dict[str, Any]:
+    """Keep meal-array semantics and rail-meal wording from becoming travel tickets."""
+    declared = clean(hint.get("source_category") or hint.get("category"))
+    normalized = ""
+    reason = ""
+    if source_field == "meal_hints":
+        normalized = "meal"
+        reason = "meal_hints entry"
+    elif is_rail_meal_hint(hint):
+        normalized = "meal"
+        reason = "rail-travel meal wording"
+    if not normalized:
+        return hint
+    if declared and declared != normalized:
+        hint["_source_category_normalized_from"] = declared
+        hint["_source_category_normalization_reason"] = reason
+    hint["source_category"] = normalized
+    if "category" in hint:
+        hint["category"] = normalized
+    return hint
+
+
 def expense_hints_from_contexts(contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
     hints: list[dict[str, Any]] = []
     for ctx in contexts:
+        context_hints: list[dict[str, Any]] = []
         for field, default_category in [("meal_hints", "meal"), ("expense_hints", "")]:
             for index, raw_hint in enumerate(list_value(ctx.get(field)), start=1):
                 if not isinstance(raw_hint, dict):
                     continue
-                hint = dict(raw_hint)
+                hint = normalize_hint_source_category(dict(raw_hint), field)
                 hint.setdefault("hint_id", f"{clean(ctx.get('context_id')) or 'CTX'}:{field}:{index}")
                 if default_category and not hint.get("source_category") and not hint.get("category"):
                     hint["source_category"] = default_category
@@ -1250,7 +1825,29 @@ def expense_hints_from_contexts(contexts: list[dict[str, Any]]) -> list[dict[str
                 hint.setdefault("client_name", ctx.get("client_name", ""))
                 hint.setdefault("client_charge_code", ctx.get("client_charge_code", ""))
                 hint.setdefault("city", ctx.get("city", ""))
-                hints.append(hint)
+                hint.setdefault("_source_field", field)
+                hint.setdefault("_source_index", index)
+                hint.setdefault("_source_fields", [field])
+                if field == "expense_hints":
+                    dedupe_key = cross_field_hint_key(hint)
+                    matches = [
+                        existing for existing in context_hints
+                        if existing.get("_source_field") == "meal_hints"
+                        and dedupe_key is not None
+                        and cross_field_hint_key(existing) == dedupe_key
+                        and cross_field_hint_merchants_compatible(existing, hint)
+                    ]
+                    if len(matches) == 1:
+                        existing = matches[0]
+                        for key, value in hint.items():
+                            if key.startswith("_"):
+                                continue
+                            if not existing.get(key) and value not in (None, "", []):
+                                existing[key] = value
+                        existing["_source_fields"] = ["meal_hints", "expense_hints"]
+                        continue
+                context_hints.append(hint)
+        hints.extend(context_hints)
     return hints
 
 
@@ -1313,7 +1910,9 @@ def unit_hint_text(unit: dict[str, Any]) -> str:
 
 
 def amount_hint_score(hint: dict[str, Any], unit: dict[str, Any]) -> tuple[int, str]:
-    hint_amount = decimal_amount(hint.get("amount") or hint.get("recorded_amount"))
+    hint_amount = decimal_amount(
+        value_utils.first_nonblank(hint.get("amount"), hint.get("recorded_amount"))
+    )
     if hint_amount is None:
         return 0, ""
     unit_amount = decimal_amount(unit.get("amount"))
@@ -1417,12 +2016,20 @@ def hint_summary(hint: dict[str, Any]) -> str:
     merchants = merchant_terms(hint)
     if merchants:
         parts.append("/".join(merchants[:2]))
-    amount = money(hint.get("amount") or hint.get("recorded_amount"))
+    amount = money(value_utils.first_nonblank(hint.get("amount"), hint.get("recorded_amount")))
     if amount:
         parts.append(f"RMB {amount}")
     attendees = list_text(hint.get("attendees"))
     if attendees:
         parts.append(f"with {attendees}")
+    description = clean(
+        hint.get("description")
+        or hint.get("note")
+        or hint.get("purpose")
+        or hint.get("business_reason")
+    )
+    if description:
+        parts.append(description)
     return " ".join(parts) or clean(hint.get("hint_id")) or "user expense hint"
 
 
@@ -1471,6 +2078,10 @@ def apply_hint_to_unit(unit: dict[str, Any], hint: dict[str, Any], score: int, r
     unit["hint_match_score"] = score
     unit["hint_match_summary"] = hint_summary(hint)
     unit["hint_match_reasons"] = reasons[:6]
+    matched_hint_ids = unit.setdefault("matched_expense_hint_ids", [])
+    hint_id = clean(hint.get("hint_id"))
+    if hint_id and hint_id not in matched_hint_ids:
+        matched_hint_ids.append(hint_id)
     if unit.get("client_charge_code") and (unit.get("expense_date") or clean(unit.get("source_category")) != "meal"):
         unit["confidence"] = "high"
         unit["status"] = "confirmed"
@@ -1494,12 +2105,59 @@ def scored_hint_candidates(
     return candidates
 
 
-def apply_expense_hints(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -> None:
+def hint_candidate_record(
+    score: int,
+    unit: dict[str, Any],
+    reasons: list[str],
+) -> dict[str, Any]:
+    return {
+        "unit_id": clean(unit.get("unit_id")),
+        "user_no": unit_user_no(unit),
+        "source_filename": clean(unit.get("source_filename") or unit.get("supporting_invoice_filename")),
+        "seller_name": clean(unit.get("seller_name")),
+        "amount": clean(unit.get("amount")),
+        "score": score,
+        "reasons": reasons[:4],
+    }
+
+
+def hint_reconciliation_record(hint: dict[str, Any]) -> dict[str, Any]:
+    return {
+        "hint_id": clean(hint.get("hint_id")),
+        "hint_ref": clean(hint.get("_hint_ref")),
+        "hint_identity_sha256": clean(hint.get("_hint_identity_sha256")),
+        "source_field": clean(hint.get("_source_field")),
+        "source_fields": list_value(hint.get("_source_fields")),
+        "source_index": hint.get("_source_index", ""),
+        "project_context_id": clean(hint.get("project_context_id")),
+        "client_name": clean(hint.get("client_name")),
+        "client_charge_code": clean(hint.get("client_charge_code")),
+        "source_category": clean(hint.get("source_category") or hint.get("category")),
+        "summary": hint_summary(hint),
+        "match_status": "unmatched",
+        "resolution_status": "open",
+        "matched_unit_ids": [],
+        "matched_user_nos": [],
+        "candidate_units": [],
+        "question_id": "",
+        "resolution_answer": "",
+        "resolution_action": "",
+    }
+
+
+def apply_expense_hints(
+    units: list[dict[str, Any]],
+    contexts: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
     hints = expense_hints_from_contexts(contexts)
     if not hints:
-        return
+        return []
+    hint_refs.assign_hint_refs(hints)
+    reconciliation = [hint_reconciliation_record(hint) for hint in hints]
+    records = {id(hint): record for hint, record in zip(hints, reconciliation)}
     for unit in units:
         unit.pop("hint_candidates", None)
+        unit.pop("matched_expense_hint_ids", None)
     assigned_units: set[str] = set()
     pending = list(hints)
     while pending:
@@ -1508,6 +2166,7 @@ def apply_expense_hints(units: list[dict[str, Any]], contexts: list[dict[str, An
         for hint in pending:
             candidates = scored_hint_candidates(hint, units, assigned_units)
             if not candidates:
+                next_pending.append(hint)
                 continue
             top_score = candidates[0][0]
             top = [item for item in candidates if item[0] == top_score]
@@ -1515,6 +2174,12 @@ def apply_expense_hints(units: list[dict[str, Any]], contexts: list[dict[str, An
                 _, unit, reasons, _ = top[0]
                 apply_hint_to_unit(unit, hint, top_score, reasons)
                 assigned_units.add(unit["unit_id"])
+                record = records[id(hint)]
+                record["match_status"] = "matched"
+                record["resolution_status"] = "not_required"
+                record["matched_unit_ids"] = [clean(unit.get("unit_id"))]
+                record["matched_user_nos"] = [unit_user_no(unit)]
+                record["candidate_units"] = [hint_candidate_record(top_score, unit, reasons)]
                 changed = True
             else:
                 next_pending.append(hint)
@@ -1523,13 +2188,29 @@ def apply_expense_hints(units: list[dict[str, Any]], contexts: list[dict[str, An
             break
         pending = next_pending
     for hint in pending:
-        for score, unit, reasons, _ in scored_hint_candidates(hint, units, assigned_units)[:3]:
+        candidates = scored_hint_candidates(hint, units, assigned_units)[:3]
+        record = records[id(hint)]
+        record["match_status"] = "ambiguous" if candidates else "unmatched"
+        record["candidate_units"] = [
+            hint_candidate_record(score, unit, reasons)
+            for score, unit, reasons, _ in candidates
+        ]
+        for score, unit, reasons, _ in candidates:
             add_hint_candidate(unit, hint, score, reasons)
+    return reconciliation
 
 
-def apply_matches(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def apply_matches(
+    units: list[dict[str, Any]],
+    contexts: list[dict[str, Any]],
+    *,
+    hint_reconciliation: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     contexts_by_id = {clean(ctx.get("context_id")): ctx for ctx in contexts if clean(ctx.get("context_id"))}
-    apply_expense_hints(units, contexts)
+    hint_records = apply_expense_hints(units, contexts)
+    if hint_reconciliation is not None:
+        hint_reconciliation.extend(hint_records)
+    apply_rail_journey_chain_matches(units, contexts)
     for unit in units:
         if unit.get("source_category") == "mobile":
             unit.update({
@@ -1543,6 +2224,11 @@ def apply_matches(units: list[dict[str, Any]], contexts: list[dict[str, Any]]) -
             normalize_admin_client(unit)
             continue
         if unit.get("auto_project_match") == "user_context_expense_hint" and unit.get("client_charge_code"):
+            normalize_admin_client(unit)
+            continue
+        if unit.get("journey_chain_id"):
+            # Connected rail legs are allocated as one journey. Do not let the
+            # ordinary per-ticket destination matcher split them at a transfer.
             normalize_admin_client(unit)
             continue
         if unit.get("source_category") in {"other", "unknown"}:
@@ -1614,7 +2300,10 @@ def _legacy_build_questions(units: list[dict[str, Any]], existing: list[dict[str
                 "question_id": f"Q-{qidx:03d}",
                 "unit_ids": [unit_id],
                 "question": f"{unit_id} 是餐费。请确认实际就餐日期、归属项目、同行/招待对象，以及应写出差餐费、出差餐费（高铁站/机场）还是加班餐费。",
-                "why_it_matters": "餐费开票日期不一定等于就餐日期，且本地/出差影响最终填表列。",
+                "why_it_matters": (
+                    "餐费开票日期不一定等于就餐日期。餐厅/发票城市只决定填表列和 Expense Nature；"
+                    "出差餐费或加班餐费的实际用途另行决定每日 150/60 元政策，二者不能互相推断。"
+                ),
                 "status": "open",
             })
             qidx += 1
@@ -1835,7 +2524,8 @@ def batch_item_line(unit: dict[str, Any]) -> str:
 def batch_prompt_for_key(key: str) -> str:
     if key == "meal":
         return (
-            "以下餐费请批量确认或修正实际就餐日期、归属项目、同行人/招待对象，以及 Note 类型。开票日期不能直接当就餐日期。"
+            "以下餐费请批量确认或修正实际就餐日期、归属项目、同行人/招待对象，以及实际用途是出差餐费还是明确的加班餐费。"
+            "开票日期不能直接当就餐日期；餐厅/发票城市只决定 Excel 列，不能用上海/外地判断 150/60 元政策。"
             "可以按项目和日期一起回复，例如：1/3/5/7 属于山西信托，日期分别是 6/3、6/4、6/5、6/6；"
             "2/4/6 属于广联达，日期分别是 6/10、6/11、6/12。"
         )
@@ -1964,6 +2654,155 @@ def add_provisional_other_date_review(questions: list[dict[str, Any]], units: li
     })
 
 
+def rail_chain_groups(units: list[dict[str, Any]]) -> dict[str, list[dict[str, Any]]]:
+    groups: dict[str, list[dict[str, Any]]] = {}
+    for unit in units:
+        chain_id = clean(unit.get("journey_chain_id"))
+        if chain_id:
+            groups.setdefault(chain_id, []).append(unit)
+    for chain_units in groups.values():
+        chain_units.sort(key=lambda unit: value_utils.parse_integer(
+            unit.get("journey_chain_position"),
+            field="journey_chain_position",
+            minimum=1,
+        ))
+    return groups
+
+
+def rail_chain_summary_line(chain_id: str, chain_units: list[dict[str, Any]]) -> str:
+    numbers = "/".join(str(unit_user_no(unit)) for unit in chain_units)
+    files = " / ".join(clean(unit.get("source_filename")) or "-" for unit in chain_units)
+    first = chain_units[0]
+    client = clean(first.get("client_name")) or "待确认"
+    code = clean(first.get("client_charge_code")) or "待确认"
+    confidence = clean(first.get("journey_chain_confidence")) or "-"
+    return (
+        f"{chain_id} | 第{numbers}项 | 文件 {files} | 日期 {display_date(first) or '-'} | "
+        f"连续路线 {clean(first.get('journey_chain_route')) or '-'} | 整体归属 {client}/{code} | 链置信度 {confidence}"
+    )
+
+
+def add_unresolved_rail_chain_questions(
+    questions: list[dict[str, Any]],
+    units: list[dict[str, Any]],
+) -> set[str]:
+    unresolved_ids: set[str] = set()
+    for chain_id, chain_units in rail_chain_groups(units).items():
+        if not any(unit.get("journey_chain_needs_confirmation") for unit in chain_units):
+            continue
+        unresolved_ids.add(chain_id)
+        questions.append({
+            "question_id": f"Q-RAIL-CHAIN-{len(questions) + 1:03d}",
+            "question_type": "rail_journey_chain_assignment",
+            "unit_ids": [clean(unit.get("unit_id")) for unit in chain_units],
+            "user_nos": [unit_user_no(unit) for unit in chain_units],
+            "question": (
+                "以下高铁票已识别为一条连续换乘行程，但整条行程仍有多个可能项目。"
+                "请按整条路线确认归属；如果中间站不是换乘而是实际停留/项目活动，也请说明从哪一段开始拆开。\n"
+                + rail_chain_summary_line(chain_id, chain_units)
+            ),
+            "why_it_matters": (
+                "连续换乘票段必须整体判断；中间站默认只是交通节点，不能机械地按每张票的目的地拆成不同项目。"
+            ),
+            "status": "open",
+            "blocking": True,
+        })
+    return unresolved_ids
+
+
+def add_auto_matched_rail_chain_review(questions: list[dict[str, Any]], units: list[dict[str, Any]]) -> None:
+    resolved = [
+        (chain_id, chain_units)
+        for chain_id, chain_units in rail_chain_groups(units).items()
+        if not any(unit.get("journey_chain_needs_confirmation") for unit in chain_units)
+        and all(clean(unit.get("client_charge_code")) for unit in chain_units)
+    ]
+    if not resolved:
+        return
+    questions.append({
+        "question_id": f"Q-ADV-RAIL-CHAIN-{len(questions) + 1:03d}",
+        "question_type": "auto_matched_rail_journey_chain_review",
+        "unit_ids": [clean(unit.get("unit_id")) for _, chain_units in resolved for unit in chain_units],
+        "user_nos": [unit_user_no(unit) for _, chain_units in resolved for unit in chain_units],
+        "question": (
+            "以下多张高铁票已按日期、时间顺序和车站衔接识别为连续换乘行程，并按整条行程统一归属。"
+            "中间站按换乘节点处理，不需要逐段确认；如果实际在中间城市停留办事或项目归属不对，请按编号更正。\n"
+            + "\n".join(rail_chain_summary_line(chain_id, chain_units) for chain_id, chain_units in resolved)
+        ),
+        "why_it_matters": "每张票仍保留独立金额、编号和高铁 Note，但同一换乘行程的全部票段共享项目归属。",
+        "status": "advisory",
+        "blocking": False,
+    })
+
+
+def add_expense_hint_reconciliation_questions(
+    questions: list[dict[str, Any]],
+    reconciliation: list[dict[str, Any]],
+) -> None:
+    grouped: dict[str, list[dict[str, Any]]] = {}
+    for record in reconciliation:
+        if record.get("resolution_status") == "open":
+            grouped.setdefault(clean(record.get("source_category")) or "unknown", []).append(record)
+    for question_index, (category, records) in enumerate(grouped.items(), start=1):
+        question_id = f"Q-HINT-{question_index:03d}"
+        record_lines: list[str] = []
+        unit_ids: list[str] = []
+        user_nos: list[Any] = []
+        required_tokens: list[str] = []
+        for record_index, record in enumerate(records, start=1):
+            display_ref = f"R{record_index}"
+            display_token = f"{display_ref}@{clean(record.get('hint_ref'))}"
+            required_tokens.append(display_token)
+            record["question_id"] = question_id
+            record["display_ref"] = display_ref
+            record["display_token"] = display_token
+            candidates = record.get("candidate_units") or []
+            for candidate in candidates:
+                unit_id = clean(candidate.get("unit_id"))
+                if unit_id and unit_id not in unit_ids:
+                    unit_ids.append(unit_id)
+                user_no = candidate.get("user_no", "")
+                if user_no not in user_nos:
+                    user_nos.append(user_no)
+            if candidates:
+                candidate_text = "；".join(
+                    f"第{candidate.get('user_no')}项 {candidate.get('source_filename') or '-'} "
+                    f"{candidate.get('seller_name') or ''} RMB "
+                    f"{value_utils.display_value(candidate.get('amount'), missing='?')} "
+                    f"(score {candidate.get('score')}: {'; '.join(candidate.get('reasons') or [])})"
+                    for candidate in candidates
+                )
+                match_text = "候选：" + candidate_text
+            else:
+                match_text = "无可信候选"
+            record_lines.append(
+                f"- {display_token} | {record.get('summary') or record.get('hint_id')} | "
+                f"项目 {record.get('client_name') or '?'} / {record.get('client_charge_code') or '?'} | {match_text}"
+            )
+        questions.append({
+            "question_id": question_id,
+            "question_type": "expense_hint_reconciliation",
+            "hint_ids": [record.get("hint_id", "") for record in records],
+            "unit_ids": unit_ids,
+            "user_nos": user_nos,
+            "required_answer_tokens": required_tokens,
+            "question": (
+                f"你提供的以下 {category} 费用记录没有找到唯一对应发票，不能静默忽略。\n"
+                + "\n".join(record_lines)
+                + "\n请逐条保留完整 R@ref 令牌回复：它对应第几项/哪张发票，是否被某张汇总发票合并覆盖，"
+                "是否稍后补票，还是这条记录不报销、可以排除。稍后补票会保留为待补凭证并继续阻断写表；"
+                "确认不报销则关闭这条记录，不会强制要求补票。"
+            ),
+            "why_it_matters": (
+                "用户费用记录是本批应有费用的完整性清单。每条记录必须与凭证对应，或留下明确的合并/不报销决定；"
+                "待补票记录可以保存，但凭证补齐或改为不报销前不能进入最终交付。"
+            ),
+            "status": "open",
+            "blocking": True,
+            "requires_explicit_answer": True,
+        })
+
+
 def date_prompt_for_unit(unit: dict[str, Any]) -> tuple[str, str] | None:
     if not unit.get("date_required") or unit.get("expense_date") or is_mobile_admin_unit(unit):
         return None
@@ -1992,8 +2831,13 @@ def date_prompt_for_unit(unit: dict[str, Any]) -> tuple[str, str] | None:
     )
 
 
-def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]]) -> list[dict[str, Any]]:
+def build_questions(
+    units: list[dict[str, Any]],
+    existing: list[dict[str, Any]],
+    hint_reconciliation: list[dict[str, Any]] | None = None,
+) -> list[dict[str, Any]]:
     questions = [normalize_existing_question(q) for q in existing]
+    unresolved_rail_chains = add_unresolved_rail_chain_questions(questions, units)
     for unit in units:
         source_category = unit.get("source_category")
         has_project = bool(unit.get("client_charge_code"))
@@ -2006,7 +2850,7 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
                     "这是硬性防呆规则，用于防止未匹配交通费被错误丢进通讯费/Admin。",
                 )
             )
-        placeholder_errors = note_placeholder_errors(unit)
+        placeholder_errors = allocation_note_errors(unit)
         if placeholder_errors:
             prompts.append(
                 (
@@ -2019,12 +2863,13 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
             prompts.append(date_prompt)
 
         if not has_project and source_category != "mobile":
-            prompts.append(
-                (
-                    "这张/这笔费用暂未匹配到项目。请直接回复应归属的客户、项目编号、城市和日期范围；如果不用报销，也请说明 drop。",
-                    "Excel 必须填写 Client 和 Client Charge Code；无法确认时不能直接进最终表。",
+            if clean(unit.get("journey_chain_id")) not in unresolved_rail_chains:
+                prompts.append(
+                    (
+                        "这张/这笔费用暂未匹配到项目。请直接回复应归属的客户、项目编号、城市和日期范围；如果不用报销，也请说明 drop。",
+                        "Excel 必须填写 Client 和 Client Charge Code；无法确认时不能直接进最终表。",
+                    )
                 )
-            )
         elif unit.get("status") == "needs_confirmation" or unit.get("confidence") == "medium":
             admin_matter_only = (
                 source_category == "other"
@@ -2068,7 +2913,10 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
                         "这是餐费。请确认实际就餐日期、归属项目/客户、同行人或招待对象，"
                         "以及 Note 应写出差餐费、出差餐费（高铁站/机场）还是加班餐费。"
                     ),
-                    "餐费开票日期经常不等于就餐日期，并且本地/出差会影响最终填表列。",
+                    (
+                        "餐费开票日期经常不等于就餐日期。餐厅/发票城市只决定填表列和 Expense Nature；"
+                        "实际用途决定出差餐费 150 元/天或明确加班餐费 60 元/天，不能按上海/外地互相推断。"
+                    ),
                 )
             )
 
@@ -2115,9 +2963,16 @@ def build_questions(units: list[dict[str, Any]], existing: list[dict[str, Any]])
                 "Admin 的 Client 列用于说明事项，不能笼统写 Admin；但事项名称缺失不是阻塞项。",
             )
     questions = group_open_questions(questions, units)
+    add_expense_hint_reconciliation_questions(questions, hint_reconciliation or [])
     add_auto_matched_meal_review(questions, units)
+    add_auto_matched_rail_chain_review(questions, units)
     add_provisional_other_date_review(questions, units)
     return questions
+
+
+def unit_ref_token(unit: dict[str, Any]) -> str:
+    no = unit.get("user_no") or unit.get("unit_no") or "?"
+    return f"{no}@{unit.get('unit_ref', '????????')}"
 
 
 def unit_review_line(unit: dict[str, Any]) -> str:
@@ -2142,10 +2997,17 @@ def unit_review_line(unit: dict[str, Any]) -> str:
             status = "待确认"
     if category == "other" and not (is_admin_code(code) and unit.get("status") == "confirmed"):
         status = "待确认"
-    return (
+    line = (
         f"{unit_label(unit)} | 文件 {source} | 开具方/服务方 {seller} | 日期 {date_value} | "
         f"金额 {amount} | 分类 {category}->{column} | 归属 {client}/{code} | 状态 {status}"
     )
+    if clean(unit.get("journey_chain_id")):
+        line += (
+            f" | 换乘链 {clean(unit.get('journey_chain_id'))} "
+            f"({unit.get('journey_chain_position')}/{unit.get('journey_chain_length')}: "
+            f"{clean(unit.get('journey_chain_route'))})"
+        )
+    return line
 
 
 def print_applicant_review_list(payload: dict[str, Any]) -> None:
@@ -2156,7 +3018,7 @@ def print_applicant_review_list(payload: dict[str, Any]) -> None:
     print("APPLICANT REVIEW LIST TO SHOW IN CHAT:")
     print("Copy or summarize this list before asking questions, so the user can correct items by number and source filename.")
     for unit in units:
-        print(unit_review_line(unit))
+        print(f"[{unit_ref_token(unit)}] " + unit_review_line(unit))
 
 
 def add_trip_window_advisories(payload: dict[str, Any]) -> None:
@@ -2188,7 +3050,7 @@ def print_open_questions(payload: dict[str, Any]) -> None:
     open_questions = [q for q in payload.get("questions", []) if q.get("status", "open") == "open"]
     if not open_questions:
         print("No open allocation questions. Stage 2 is ready for Excel output.")
-        print("NEXT: run build_allocation_answers_template.py if draft units remain, "
+        print("NEXT: if draft units remain, write allocation_decisions.v1 and run compose_answers.py; "
               "otherwise run write_reimbursement_template.py.")
     else:
         print("")
@@ -2225,6 +3087,7 @@ def build_markdown(payload: dict[str, Any]) -> str:
         "",
         f"Generated at: {payload['generated_at']}",
         f"Source extraction file: {payload['source_extraction_file']}",
+        f"Allocation generation: {payload.get('integrity', {}).get('fingerprint', '')[:8]}",
         f"Allocation units: {len(payload['allocation_units'])}",
         f"Questions remaining: {sum(1 for q in payload['questions'] if q.get('status') == 'open')}",
         "",
@@ -2250,18 +3113,57 @@ def build_markdown(payload: dict[str, Any]) -> str:
         lines.append(
             f"| {unit.get('user_no') or unit_user_no(unit)} | {unit['unit_id']} | {unit.get('source_filename','')} | "
             f"{unit.get('source_document_id','')} {unit.get('source_item_id') or ''} | "
-            f"{unit.get('expense_date','')} | {city_route} | {unit.get('invoice_amount') or unit.get('amount','')} | "
-            f"{unit.get('reimbursable_amount') or unit.get('amount','')} | {unit.get('source_category','')} | "
+            f"{unit.get('expense_date','')} | {city_route} | "
+            f"{clean(value_utils.first_nonblank(unit.get('invoice_amount'), unit.get('amount')))} | "
+            f"{clean(value_utils.first_nonblank(unit.get('reimbursable_amount'), unit.get('amount')))} | {unit.get('source_category','')} | "
             f"{unit.get('client_name','')} | {unit.get('client_charge_code','')} | {unit.get('final_template_column','')} | "
             f"{unit.get('confidence','')} | {unit.get('status','')} |"
         )
+    hint_records = payload.get("expense_hint_reconciliation", [])
+    if hint_records:
+        lines += [
+            "",
+            "## User Expense Record Reconciliation",
+            "",
+            "| Record Token | Record | Project | Match | Resolution | Matched/Candidate Items |",
+            "| --- | --- | --- | --- | --- | --- |",
+        ]
+        for record in hint_records:
+            matched = record.get("matched_user_nos") or []
+            candidates = [item.get("user_no", "") for item in record.get("candidate_units", [])]
+            numbers = matched or candidates
+            lines.append(
+                f"| {record.get('display_token') or (str(record.get('hint_id', '')) + '@' + str(record.get('hint_ref', '')))} | {record.get('summary', '')} | "
+                f"{record.get('client_name', '')}/{record.get('client_charge_code', '')} | "
+                f"{record.get('match_status', '')} | {record.get('resolution_status', '')} | "
+                f"{', '.join(str(value) for value in numbers)} |"
+            )
+    chains = rail_chain_groups(payload["allocation_units"])
+    if chains:
+        lines += [
+            "",
+            "## Railway Journey Chains",
+            "",
+            "| Chain | Items | Route | Project | Code | Confidence | Needs Confirmation |",
+            "| --- | --- | --- | --- | --- | --- | --- |",
+        ]
+        for chain_id, chain_units in chains.items():
+            first = chain_units[0]
+            lines.append(
+                f"| {chain_id} | {', '.join(str(unit_user_no(unit)) for unit in chain_units)} | "
+                f"{clean(first.get('journey_chain_route'))} | {clean(first.get('client_name'))} | "
+                f"{clean(first.get('client_charge_code'))} | {clean(first.get('journey_chain_confidence'))} | "
+                f"{'Yes' if first.get('journey_chain_needs_confirmation') else 'No'} |"
+            )
     lines += [
         "",
         "## Applicant Review List",
         "",
+        f"Allocation generation: {payload.get('integrity', {}).get('fingerprint', '')[:8]}",
+        "",
     ]
     for unit in payload["allocation_units"]:
-        lines.append(f"- {unit_review_line(unit)}")
+        lines.append(f"- [{unit_ref_token(unit)}] {unit_review_line(unit)}")
     lines += [
         "",
         "## Questions For User",
@@ -2280,7 +3182,16 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument("--extraction", required=True, help="Path to process/invoice-extraction.json.")
     parser.add_argument("--context", help="Optional project context JSON or text file.")
     parser.add_argument("--output", "-o", default="process", help="Output folder.")
+    parser.add_argument(
+        "--place-definitions",
+        help="Optional override path for the place -> place-type memory JSON "
+        "(default: assets/place-definitions.json).",
+    )
     args = parser.parse_args(argv)
+
+    if args.place_definitions:
+        global _PLACE_BOOK
+        _PLACE_BOOK = PlaceBook.load(Path(args.place_definitions))
 
     extraction_path = Path(args.extraction)
     extraction = load_json(extraction_path)
@@ -2297,27 +3208,104 @@ def main(argv: list[str] | None = None) -> int:
         print("NEXT: ask the user whether each file should be excluded or converted to a readable PDF/image, "
               "record that decision with apply_extraction_corrections.py (input_resolutions), then re-run "
               "extract_invoices.py before allocation.", file=sys.stderr)
-        return 2
-    contexts, raw_context, context_questions = load_context(Path(args.context) if args.context else None)
+        return ExitCode.COMMAND_ERROR
+    pending_documents = [
+        document for document in extraction.get("documents", [])
+        if not document.get("excluded_by_user")
+        and (document.get("needs_review") or document.get("document_role") == "unknown")
+    ]
+    if pending_documents:
+        print(
+            "ERROR: allocation is blocked because Stage 1 still has unidentified/review-required documents:",
+            file=sys.stderr,
+        )
+        for document in pending_documents:
+            issues = document.get("issues") or []
+            duplicate = any(
+                "duplicate" in clean(issue.get("problem")).lower()
+                for issue in issues
+            )
+            suffix = " [duplicate decision required at Stage 1]" if duplicate else ""
+            print(
+                f"  - {document.get('document_id', '?')}: "
+                f"{Path(str(document.get('source_file', '?'))).name}{suffix}",
+                file=sys.stderr,
+            )
+        print(
+            "NEXT: resolve these documents with vision/OCR or apply_extraction_corrections.py. "
+            "For a duplicate, keep one source document and record action=exclude with the user's reason "
+            "against the duplicate SHA-256. Do not run Stage 2 and drop the resulting expense unit; "
+            "that does not resolve the extraction evidence ledger.",
+            file=sys.stderr,
+        )
+        return ExitCode.COMMAND_ERROR
+    context_path = Path(args.context) if args.context else None
+    try:
+        contexts, raw_context, context_questions = load_context(context_path)
+    except ValueError as exc:
+        print(f"ERROR: {exc}", file=sys.stderr)
+        print("", file=sys.stderr)
+        print("CANONICAL PROJECT CONTEXT TEMPLATE (copy the structure; replace every placeholder):", file=sys.stderr)
+        print(project_context_template_path().read_text(encoding="utf-8"), file=sys.stderr)
+        print(
+            "NEXT: rewrite the same project-context.json in this exact schema, using one context object "
+            "per distinct project/travel date window, then rerun allocation. Do not ask the applicant "
+            "to write JSON and do not bypass this check with a launcher or patch script.",
+            file=sys.stderr,
+        )
+        return ExitCode.COMMAND_ERROR
+    print(f"PROJECT CONTEXT VALIDATED: {len(contexts)} canonical context window(s).")
     units, link_questions = create_units(extraction, contexts)
     print_document_reconciliation(extraction, units)
-    apply_matches(units, contexts)
-    questions = build_questions(units, context_questions + link_questions)
+    hint_reconciliation: list[dict[str, Any]] = []
+    try:
+        apply_matches(units, contexts, hint_reconciliation=hint_reconciliation)
+    except ValueError as exc:
+        print(f"ERROR: allocation matching/identity generation failed: {exc}", file=sys.stderr)
+        return ExitCode.COMMAND_ERROR
+    questions = build_questions(units, context_questions + link_questions, hint_reconciliation)
 
     payload = {
         "schema_version": "expense_allocation.v1",
-        "generated_at": datetime.now().replace(microsecond=0).isoformat(),
+        "allocation_engine_revision": allocation_generations.ALLOCATION_ENGINE_REVISION,
+        "generated_at": time_utils.iso_now(),
         "source_extraction_file": str(extraction_path),
         "source_extraction_fingerprint": extraction["integrity"]["fingerprint"],
+        "source_project_context_file": str(context_path.resolve()) if context_path else "",
+        "source_project_context_sha256": (
+            hashlib.sha256(context_path.read_bytes()).hexdigest() if context_path else ""
+        ),
+        "source_policy_file": str(policy_path().resolve()),
+        "source_policy_sha256": hashlib.sha256(policy_path().read_bytes()).hexdigest(),
         "raw_project_context": raw_context,
         "project_contexts": contexts,
         "allocation_units": units,
+        "expense_hint_reconciliation": hint_reconciliation,
         "questions": questions,
         "change_log": [],
     }
     output = Path(args.output)
+    try:
+        unit_refs.assign_unit_refs(extraction, payload.get("allocation_units", []))
+    except ValueError as exc:
+        print(f"ERROR: allocation evidence identity generation failed: {exc}", file=sys.stderr)
+        return ExitCode.COMMAND_ERROR
+    allocation_out = output / "expense-allocation.json"
+    try:
+        archived = allocation_generations.archive_current_generation(allocation_out)
+    except ValueError as exc:
+        # Allocation is a derived artifact, so a broken current copy must not
+        # prevent trusted regeneration from extraction + project context.
+        print(f"WARNING: {exc} The invalid current allocation was not archived.", file=sys.stderr)
+        archived = None
+    allocation_generations.record_previous_generation(payload, archived)
+    if archived:
+        print(f"Previous allocation archived as immutable generation {archived[1]} at {archived[0]}.")
     integrity.stamp(payload, "allocate_expenses.py")
     write_json(output / "expense-allocation.json", payload)
+    generation = payload["integrity"]["fingerprint"][:8]
+    print(f"Allocation generation: {generation} — decisions files must set "
+          f"for_allocation_fingerprint to this generation and reference items as N@ref.")
     (output / "expense-allocation.md").write_text(build_markdown(payload), encoding="utf-8")
     print(f"Wrote {output / 'expense-allocation.json'}")
     print(f"Wrote {output / 'expense-allocation.md'}")
@@ -2325,7 +3313,7 @@ def main(argv: list[str] | None = None) -> int:
     add_trip_window_advisories(payload)
     print_open_questions(payload)
     print_advisory_questions(payload)
-    return 0
+    return ExitCode.SUCCESS
 
 
 if __name__ == "__main__":

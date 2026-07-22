@@ -7,9 +7,9 @@ identify — an invoice photo, a partner approval screenshot, an Alipay payment
 receipt — often land as role "unknown". The sanctioned way to fix that is a
 correction entry here, NOT hand-editing invoice-extraction.json: hand edits
 are wiped whenever extract_invoices.py re-runs. Corrections live in their own
-overlay file (process/extraction-corrections.json) keyed by content sha256,
-and the extractor REPLAYS the overlay automatically after every re-run, so a
-correction survives any number of re-extractions.
+overlay file (process/extraction-corrections.json) keyed by durable evidence
+selectors, and the extractor REPLAYS the overlay automatically after every
+re-run, so a correction survives any number of re-extractions.
 
 Every file is evidence until the user explicitly says to drop it. A drop is a
 correction entry too ({"action": "exclude", "reason": ...}) so the exclusion
@@ -19,9 +19,9 @@ and its reason stay on the audit trail.
 from __future__ import annotations
 
 import json
-from datetime import datetime
 
 import integrity
+import time_utils
 from pathlib import Path
 from typing import Any
 
@@ -34,6 +34,11 @@ ALLOWED_SET_FIELDS = {
     "needs_review",
     "invoice",
     "classification",
+    # Support-document packaging metadata. A supporting_document (payment
+    # receipt, partner approval screenshot, or other user-provided evidence)
+    # is packaged only when it names the invoice it backs.
+    "support_type",            # free-text label shown in the package (付款小票/审批截图/…)
+    "supports_document_id",    # document_id of the invoice/proof this evidence supports
 }
 ALLOWED_ACTIONS = {"correct", "exclude"}
 ALLOWED_SOURCES = {"agent_vision", "agent_ocr", "user", "user_transcription"}
@@ -87,6 +92,13 @@ def validate_correction(entry: dict[str, Any]) -> list[str]:
         role = set_fields.get("document_role")
         if role is not None and role not in ALLOWED_ROLES:
             errors.append(f"document_role must be one of {sorted(ALLOWED_ROLES)}, got {role!r}")
+        for key in ("support_type", "supports_document_id"):
+            value = set_fields.get(key)
+            if value is not None and not isinstance(value, str):
+                errors.append(f"{key} must be a string, got {type(value).__name__}")
+        # Whether supports_document_id resolves to a real invoice is validated at
+        # Stage 3 (write), where the final proof groups exist; an unresolved link
+        # surfaces there as a hard block rather than a correction-time error.
     source = entry.get("corrected_by", "user")
     if source not in ALLOWED_SOURCES:
         errors.append(f"corrected_by must be one of {sorted(ALLOWED_SOURCES)}, got {source!r}")
@@ -117,24 +129,34 @@ def validate_input_resolution(entry: dict[str, Any]) -> list[str]:
     return errors
 
 
+def _source_file_matches(recorded: Any, requested: Any) -> bool:
+    recorded_path = Path(str(recorded or ""))
+    requested_path = Path(str(requested or ""))
+    if requested_path.is_absolute():
+        return recorded_path.resolve(strict=False) == requested_path.resolve(strict=False)
+    return recorded_path.name == requested_path.name
+
+
 def _match_doc(entry: dict[str, Any], doc: dict[str, Any]) -> bool:
     match = entry.get("match") or {}
+    checks: list[bool] = []
     if match.get("sha256"):
-        return doc.get("sha256") == match["sha256"]
-    if match.get("document_id") and doc.get("document_id") == match["document_id"]:
-        return True
+        checks.append(doc.get("sha256") == match["sha256"])
+    if match.get("document_id"):
+        checks.append(doc.get("document_id") == match["document_id"])
     if match.get("source_file"):
-        return Path(str(doc.get("source_file", ""))).name == Path(str(match["source_file"])).name
-    return False
+        checks.append(_source_file_matches(doc.get("source_file"), match["source_file"]))
+    return bool(checks) and all(checks)
 
 
 def _match_input(entry: dict[str, Any], item: dict[str, Any]) -> bool:
     match = entry.get("match") or {}
+    checks: list[bool] = []
     if match.get("sha256"):
-        return item.get("sha256") == match["sha256"]
+        checks.append(item.get("sha256") == match["sha256"])
     if match.get("source_file"):
-        return Path(str(item.get("source_file", ""))).name == Path(str(match["source_file"])).name
-    return False
+        checks.append(_source_file_matches(item.get("source_file"), match["source_file"]))
+    return bool(checks) and all(checks)
 
 
 def apply_overlay(payload: dict[str, Any], overlay: dict[str, Any]) -> list[str]:
@@ -150,11 +172,12 @@ def apply_overlay(payload: dict[str, Any], overlay: dict[str, Any]) -> list[str]
             log.append(f"WARNING: correction {entry.get('match')} matched no document (file removed or renamed?)")
             continue
         match = entry.get("match") or {}
-        if len(matched) > 1 and not (match.get("sha256") or match.get("document_id")):
+        if len(matched) > 1:
             log.append(
-                f"ERROR: correction by source_file {match.get('source_file')!r} matched "
-                f"{len(matched)} documents — refusing to apply to all of them. Re-submit this "
-                "correction with the sha256 (or document_id) of the intended document."
+                f"ERROR: correction selector {match!r} matched {len(matched)} documents; "
+                "nothing was applied. SHA-256 identifies byte content, not one physical copy. "
+                "For exact duplicates, combine the shared sha256 with the intended copy's exact "
+                "source_file (preferred), or use a unique current document_id."
             )
             continue
         for doc in matched:
@@ -173,11 +196,20 @@ def apply_overlay(payload: dict[str, Any], overlay: dict[str, Any]) -> list[str]
                 else:
                     doc[key] = value
             doc["corrected_by"] = entry.get("corrected_by", "user")
-            doc["corrected_at"] = entry.get("corrected_at", datetime.now().replace(microsecond=0).isoformat())
+            doc["corrected_at"] = entry.get("corrected_at", time_utils.iso_now())
             if entry.get("reason"):
                 doc["correction_note"] = str(entry["reason"]).strip()
             if "needs_review" not in set_fields and set_fields.get("document_role") in ALLOWED_ROLES - {"unknown"}:
                 doc["needs_review"] = False
+            if doc.get("needs_review"):
+                # Filling missing fields (e.g. invoice number/date/seller) does NOT
+                # auto-clear needs_review unless the correction also (re)sets a known
+                # document_role. Tell the caller how to clear it explicitly.
+                log.append(
+                    f"{doc.get('document_id')}: still flagged needs_review after this correction. "
+                    "If the required fields are now complete, add \"needs_review\": false to this "
+                    "correction's set to clear it."
+                )
             log.append(f"{doc.get('document_id')}: corrected -> role={doc.get('document_role')} ({doc.get('corrected_by')})")
     return log
 
@@ -191,11 +223,11 @@ def apply_input_resolutions(payload: dict[str, Any], overlay: dict[str, Any]) ->
             log.append(f"WARNING: input resolution {entry.get('match')} matched no unsupported input")
             continue
         match = entry.get("match") or {}
-        if len(matched) > 1 and not match.get("sha256"):
+        if len(matched) > 1:
             log.append(
-                f"ERROR: input resolution by source_file {match.get('source_file')!r} matched "
-                f"{len(matched)} files - refusing to apply to all of them. Re-submit this "
-                "resolution with the sha256 from invoice-extraction.md."
+                f"ERROR: input resolution selector {match!r} matched {len(matched)} files; "
+                "nothing was applied. For byte-identical inputs, combine the shared sha256 "
+                "with the intended copy's exact source_file."
             )
             continue
         for item in matched:
@@ -203,7 +235,7 @@ def apply_input_resolutions(payload: dict[str, Any], overlay: dict[str, Any]) ->
             item["status"] = action
             item["resolution"] = str(entry["reason"]).strip()
             item["resolved_by"] = entry.get("corrected_by", "user")
-            item["resolved_at"] = entry.get("corrected_at", datetime.now().replace(microsecond=0).isoformat())
+            item["resolved_at"] = entry.get("corrected_at", time_utils.iso_now())
             if action == "converted":
                 item["replacement_file"] = str(entry["replacement_file"]).strip()
             log.append(f"unsupported input {item.get('filename')}: {action} ({item['resolution']})")

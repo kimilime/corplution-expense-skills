@@ -15,7 +15,8 @@ from __future__ import annotations
 import hashlib
 import json
 import sys
-from datetime import datetime
+from exit_codes import ExitCode
+import time_utils
 from pathlib import Path
 from typing import Any
 
@@ -33,7 +34,7 @@ def stamp(payload: dict[str, Any], stamped_by: str) -> None:
     payload[INTEGRITY_KEY] = {
         "fingerprint": _canonical_digest(payload),
         "stamped_by": stamped_by,
-        "stamped_at": datetime.now().replace(microsecond=0).isoformat(),
+        "stamped_at": time_utils.iso_now(),
     }
 
 
@@ -72,10 +73,11 @@ def _recovery_message(path: Path, reason: str, kind: str) -> str:
         f"INTEGRITY CHECK FAILED for {path}: {reason}.\n"
         "This file was modified outside the sanctioned flow (ad hoc patch script, manual edit,\n"
         "or regenerated with the wrong tool). Do NOT keep patching it. Recover by ONE of:\n"
-        f"  1. Restore the last valid backup: cp {bak} {path}  (then redo your change properly), or\n"
+        "  1. Restore a verified fingerprinted generation from process/allocation-generations/ "
+        "only when its lineage is known, or\n"
         "  2. Re-run scripts/allocate_expenses.py to regenerate allocation from extraction + context.\n"
         "Then apply changes ONLY via:\n"
-        "  python scripts/build_allocation_answers_template.py --allocation <file> --output process/allocation-answers.template.json\n"
+        "  python scripts/compose_answers.py --allocation <file> --decisions <allocation_decisions.v1.json>\n"
         "  python scripts/apply_allocation_answers.py --allocation <file> --answers process/allocation-answers.json\n"
         "This is the only route that preserves change history and runs the accounting checks."
     )
@@ -86,7 +88,7 @@ def require_valid(payload: dict[str, Any], path: Path, kind: str = "allocation")
     ok, reason = check(payload)
     if not ok:
         print(_recovery_message(path, reason, kind), file=sys.stderr)
-        raise SystemExit(4)
+        raise SystemExit(ExitCode.INTEGRITY_ERROR)
 
 
 def warn_if_invalid(payload: dict[str, Any], path: Path) -> None:

@@ -17,6 +17,11 @@ try:
 except ModuleNotFoundError:  # pragma: no cover - Python < 3.11 fallback
     import tomli as tomllib
 
+# Year-coded BD/ADMIN codes may be overridden by an agent/user-writable definition
+# file (assets/special-code-definitions.json); precedence: that file > policy.toml >
+# defaults. Loading fails open to {} so policy.toml stays the fallback.
+from special_codes import load_codes as _load_special_codes
+
 
 _DEFAULTS = {
     "caps": {
@@ -64,8 +69,10 @@ class Policy:
         self.first_tier_hotel_cap = Decimal(str(_get(raw, "caps", "first_tier_hotel_per_night")))
         self.other_city_hotel_cap = Decimal(str(_get(raw, "caps", "other_city_hotel_per_night")))
         self.first_tier_cities = {str(city).lower() for city in _get(raw, "caps", "first_tier_cities")}
-        self.admin_code = str(_get(raw, "charge_codes", "admin"))
-        self.shared_bd_code = str(_get(raw, "charge_codes", "shared_bd"))
+        # Definition file wins over policy.toml for the year-coded charge codes.
+        special = _load_special_codes()
+        self.admin_code = str(special.get("admin") or _get(raw, "charge_codes", "admin"))
+        self.shared_bd_code = str(special.get("shared_bd") or _get(raw, "charge_codes", "shared_bd"))
         self.mobile_client = str(_get(raw, "clients", "mobile"))
         self.admin_fallback_client = str(_get(raw, "clients", "admin_fallback"))
 
