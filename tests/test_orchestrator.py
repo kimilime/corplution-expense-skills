@@ -22,6 +22,27 @@ import integrity  # noqa: E402
 import workflow_journal  # noqa: E402
 
 
+def empty_close_summary() -> dict:
+    return {
+        "schema_version": "reimbursement_close_summary.v1",
+        "packaged_invoice_count": 0,
+        "packaged_support_count": 0,
+        "excluded_evidence_count": 0,
+        "omitted_unit_count": 0,
+        "not_reimbursed_record_count": 0,
+        "amount_adjustment_count": 0,
+        "policy_advisory_count": 0,
+        "project_count": 0,
+        "grand_total": "0.00",
+        "amount_adjustments": [],
+        "policy_advisories": [],
+        "excluded_evidence": [],
+        "omitted_units": [],
+        "not_reimbursed_records": [],
+        "projects": [],
+    }
+
+
 class WorkflowFixture:
     def __init__(self, root: Path) -> None:
         self.root = root
@@ -456,6 +477,7 @@ class WorkflowStateTests(unittest.TestCase):
             "expense_hint_reconciliation_count": 0,
             "invoice_files": [],
             "support_files": [],
+            "close_summary": empty_close_summary(),
         }
         integrity.stamp(manifest, "test")
         (package / "package-manifest.json").write_text(
@@ -486,6 +508,7 @@ class WorkflowStateTests(unittest.TestCase):
             "expense_hint_reconciliation_count": 0,
             "invoice_files": [],
             "support_files": [],
+            "close_summary": empty_close_summary(),
         }
         integrity.stamp(manifest, "test")
         (staging / "package-manifest.json").write_text(
@@ -518,6 +541,7 @@ class WorkflowStateTests(unittest.TestCase):
             "expense_hint_reconciliation_count": 0,
             "invoice_files": [],
             "support_files": [],
+            "close_summary": empty_close_summary(),
         }
         integrity.stamp(manifest, "test")
         manifest["workbook"] = "tampered.xlsx"

@@ -179,7 +179,7 @@ Stage 3 promotes the workbook plus `final-expense-rows.json/md` as one validated
 python scripts/chief_orchestrator.py run package
 ```
 
-After packaging, copy or summarize the final package summary in chat: package folder, workbook name, invoice/support-document counts, and any unresolved package issues.
+After a successful package run, read `references/close-message.md` and relay the generated `CLOSE MESSAGE TO SHOW IN CHAT` block verbatim. It is sourced from the stamped package manifest and includes the package/workbook locations, evidence counts, amount adjustments and policy advisories, excluded or not-reimbursed items with reasons, and per-project totals. Never replace it with a generic completion sentence or reconstruct totals from conversation memory.
 
 If packaging exits with code `3`, it created a review package with blocking missing-file or approval issues. Do not call it complete or submit it; show the issues in chat, resolve them, then re-run Stage 4.
 
@@ -191,4 +191,4 @@ Detailed extraction, classification, allocation, Excel, packaging, and final-val
 - Stage 2: read `Stage 2 Allocation Rules` there together with `references/stage-2-allocation.md`.
 - Stage 3: read `Stage 3 Excel Output Rules` there together with `references/stage-3-excel-output.md`.
 - Stage 4: read `Stage 4 Packaging Rules` there together with `references/stage-4-package.md`.
-- Completion: read `Validation Expectations` there and verify every applicable invariant.
+- Completion: read `references/close-message.md` plus `Validation Expectations` there, verify every applicable invariant, and relay the generated Close Message only after Stage 4 succeeds with no manifest issues.

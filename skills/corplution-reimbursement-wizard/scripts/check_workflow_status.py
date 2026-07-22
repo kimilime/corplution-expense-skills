@@ -19,6 +19,7 @@ from typing import Any
 import integrity
 import allocate_expenses
 import allocation_generations
+import close_message
 from exit_codes import ExitCode
 from io_utils import configure_utf8_stdio as configure_stdio, sha256_file
 from json_io import read_optional_json_object as load
@@ -119,6 +120,13 @@ def validate_package_manifest(
                 return False, f"package file has no recorded hash: {folder_name}/{path.name}"
             if sha256_file(path) != expected_file_sha:
                 return False, f"package file hash mismatch: {folder_name}/{path.name}"
+    close_ok, close_reason = close_message.validate(
+        manifest.get("close_summary"),
+        invoice_count=manifest.get("invoice_count"),
+        support_count=manifest.get("support_count"),
+    )
+    if not close_ok:
+        return False, close_reason
     return True, "ok"
 
 
@@ -1237,7 +1245,7 @@ def inspect_workflow(
         pending_next = next_step(
             "complete",
             "complete",
-            "Workflow complete; deliver the verified package summary to the applicant.",
+            "Workflow complete; relay the verified Close Message from the current package manifest.",
         )
 
     return {

@@ -20,6 +20,7 @@ import allocate_expenses as allocator  # noqa: E402
 import apply_allocation_answers as updater  # noqa: E402
 import check_workflow_status as workflow_status  # noqa: E402
 import chief_orchestrator as chief  # noqa: E402
+import close_message  # noqa: E402
 import extract_invoices as extractor  # noqa: E402
 import extraction_corrections as extraction_updates  # noqa: E402
 from exit_codes import ExitCode  # noqa: E402
@@ -477,6 +478,192 @@ class CrossStageRegressionTests(unittest.TestCase):
 
             self.assertEqual(2, raised.exception.code)
             self.assertFalse((root / "staging-package").exists())
+
+    def test_close_summary_covers_adjustments_omissions_and_projects(self) -> None:
+        final_rows = {
+            "rows": [
+                {
+                    "source_unit_id": "UNIT-001",
+                    "user_no": 1,
+                    "proof_no": 1,
+                    "expense_date": "2026-07-02",
+                    "source_category": "meal",
+                    "row_order_type": "meal",
+                    "seller_name": "北京盒马",
+                    "invoice_amount": "118.70",
+                    "reimbursable_amount": "114.30",
+                    "client": "千味央厨",
+                    "client_charge_code": "CORP-2026-0035",
+                },
+                {
+                    "source_unit_id": "UNIT-002",
+                    "user_no": 2,
+                    "proof_no": 2,
+                    "expense_date": "2026-07-03",
+                    "source_category": "travel",
+                    "row_order_type": "rail",
+                    "seller_name": "中国铁路",
+                    "invoice_amount": "100.00",
+                    "reimbursable_amount": "100.00",
+                    "client": "千味央厨",
+                    "client_charge_code": "CORP-2026-0035",
+                },
+                {
+                    "source_unit_id": "UNIT-004",
+                    "user_no": 4,
+                    "proof_no": 3,
+                    "expense_date": "2026-07-31",
+                    "source_category": "mobile",
+                    "row_order_type": "mobile",
+                    "seller_name": "中国移动",
+                    "invoice_amount": "130.99",
+                    "reimbursable_amount": "130.99",
+                    "client": "通讯费",
+                    "client_charge_code": "CORP-2026-ADMIN",
+                },
+            ],
+            "meal_daily_cap_checks": [{
+                "date": "2026-06-24",
+                "policy_name": "出差餐费",
+                "total": "153.00",
+                "cap": "150.00",
+                "over_by": "3.00",
+                "status": "超标但已有多人信息",
+                "severity": "advisory",
+            }],
+            "hotel_cap_checks": [],
+            "expense_hint_reconciliation": [{
+                "display_token": "R1@fruit001",
+                "hint_id": "HINT-001",
+                "summary": "6.23 水果 ¥25.00",
+                "source_category": "other",
+                "resolution_action": "not_reimbursed",
+                "resolution_answer": "未提供发票，本次不报销",
+            }],
+        }
+        allocation = {
+            "allocation_units": [
+                {
+                    "unit_id": "UNIT-001",
+                    "status": "confirmed",
+                    "correction_note": "",
+                },
+                {
+                    "unit_id": "UNIT-002",
+                    "status": "confirmed",
+                },
+                {
+                    "unit_id": "UNIT-003",
+                    "user_no": 3,
+                    "status": "dropped",
+                    "expense_date": "2026-07-01",
+                    "source_category": "taxi",
+                    "source_filename": "local-commute.pdf",
+                    "invoice_amount": "20.00",
+                    "seller_name": "本地通勤",
+                },
+                {
+                    "unit_id": "UNIT-004",
+                    "status": "confirmed",
+                },
+            ],
+            "change_log": [{
+                "changes": [
+                    {
+                        "unit_id": "UNIT-001",
+                        "answer": "当日餐费按标准调整",
+                        "before": {"reimbursable_amount": "118.70"},
+                        "after": {"reimbursable_amount": "114.30"},
+                    },
+                    {
+                        "unit_id": "UNIT-003",
+                        "answer": "本地通勤不报销",
+                        "before": {"status": "confirmed"},
+                        "after": {"status": "dropped"},
+                    },
+                ],
+            }],
+        }
+        extraction = {
+            "documents": [
+                {"document_id": "DOC-001", "document_role": "invoice", "source_file": "meal.pdf"},
+                {
+                    "document_id": "DOC-002",
+                    "document_role": "invoice",
+                    "source_file": "duplicate.pdf",
+                    "excluded_by_user": True,
+                    "exclusion_reason": "重复发票",
+                    "invoice": {"total_amount": "88.00"},
+                },
+                {"document_id": "DOC-003", "document_role": "supporting_document", "source_file": "trip.pdf"},
+            ],
+            "unresolved_input_files": [],
+        }
+        manifest = {
+            "package_root": "output/报销申请表-Test-20260721",
+            "workbook": "报销申请表-Test-20260721.xlsx",
+            "invoice_files": [{}, {}],
+            "support_files": [{}],
+            "issues": [],
+        }
+
+        summary = close_message.build_summary(final_rows, allocation, extraction, manifest)
+        manifest["close_summary"] = summary
+
+        self.assertEqual("reimbursement_close_summary.v1", summary["schema_version"])
+        self.assertEqual("345.29", summary["grand_total"])
+        self.assertEqual(2, summary["packaged_invoice_count"])
+        self.assertEqual(1, summary["excluded_invoice_count"])
+        self.assertEqual("当日餐费按标准调整", summary["amount_adjustments"][0]["reason"])
+        self.assertEqual("本地通勤不报销", summary["omitted_units"][0]["reason"])
+        self.assertEqual("未提供发票，本次不报销", summary["not_reimbursed_records"][0]["reason"])
+        self.assertEqual(1, summary["policy_advisory_count"])
+        self.assertEqual(2, summary["project_count"])
+        self.assertEqual("214.30", summary["projects"][0]["total"])
+
+        message = close_message.render(manifest)
+        self.assertIn("**包路径**", message)
+        self.assertIn("¥118.70 → ¥114.30", message)
+        self.assertIn("重复发票", message)
+        self.assertIn("用户记录无票/无唯一凭证不报", message)
+        self.assertIn("CORP-2026-0035 千味央厨", message)
+        self.assertIn("如有疑问或需要修改，请继续对话。", message)
+
+    def test_close_message_prints_one_relay_marker(self) -> None:
+        manifest = {
+            "generated_at": "2026-07-21T12:00:00+08:00",
+            "requester": "Test",
+            "package_date": "20260721",
+            "package_root": "output/package",
+            "workbook": "book.xlsx",
+            "workbook_sha256": "abc",
+            "final_rows_fingerprint": "def",
+            "expense_hint_reconciliation_count": 0,
+            "invoice_files": [],
+            "support_files": [],
+            "issues": [],
+            "close_summary": {
+                "packaged_invoice_count": 0,
+                "packaged_support_count": 0,
+                "grand_total": "0.00",
+                "omitted_unit_count": 0,
+                "not_reimbursed_record_count": 0,
+                "projects": [],
+            },
+        }
+        output = StringIO()
+        with redirect_stdout(output):
+            packager.print_close_message(manifest)
+
+        self.assertEqual(1, output.getvalue().count("CLOSE MESSAGE TO SHOW IN CHAT"))
+        self.assertIn("### 0 个项目汇总", output.getvalue())
+        self.assertIn("## Close Message", packager.build_markdown(manifest))
+
+    def test_close_summary_is_required_for_verified_completion(self) -> None:
+        valid, reason = close_message.validate(None, invoice_count=0, support_count=0)
+
+        self.assertFalse(valid)
+        self.assertIn("close_summary is missing", reason)
 
     def test_hotel_city_update_synchronizes_cap_field_and_row(self) -> None:
         unit = {

@@ -9,6 +9,7 @@ import json
 import integrity
 import subagent_protocol
 import evidence_paths
+import close_message
 from exit_codes import ExitCode
 from io_utils import configure_utf8_stdio as configure_stdio, sha256_file
 from json_io import read_json_object as load_json
@@ -450,6 +451,9 @@ def build_package(
                     "problem": "Substitute invoice missing approval screenshot.",
                 })
 
+    manifest["close_summary"] = close_message.build_summary(
+        final_rows, allocation, extraction, manifest
+    )
     return manifest
 
 
@@ -481,6 +485,8 @@ def build_markdown(manifest: dict[str, Any]) -> str:
     lines += ["", "## Issues", "", "| No. | Problem |", "| ---: | --- |"]
     for item in manifest["issues"]:
         lines.append(f"| {item.get('proof_no','')} | {item.get('problem','')} |")
+    if not manifest["issues"] and isinstance(manifest.get("close_summary"), dict):
+        lines.extend(["", "## Close Message", "", close_message.render(manifest)])
     return "\n".join(lines) + "\n"
 
 
@@ -578,7 +584,7 @@ def promote_package(staging_root: Path, final_root: Path) -> None:
 
 def print_final_summary(manifest: dict[str, Any]) -> None:
     print("")
-    print("FINAL PACKAGE SUMMARY TO SHOW IN CHAT:")
+    print("FINAL PACKAGE VALIDATION SUMMARY:")
     print(f"Package folder: {manifest['package_root']}")
     print(f"Workbook: {manifest['workbook']}")
     print(f"Invoice files: {len(manifest['invoice_files'])}")
@@ -593,6 +599,12 @@ def print_final_summary(manifest: dict[str, Any]) -> None:
             print(f"- {prefix}{item.get('problem', '')}")
     else:
         print("No package issues detected.")
+
+
+def print_close_message(manifest: dict[str, Any]) -> None:
+    print("")
+    print("CLOSE MESSAGE TO SHOW IN CHAT (relay verbatim):")
+    print(close_message.render(manifest))
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -656,7 +668,8 @@ def main(argv: list[str] | None = None) -> int:
             file=sys.stderr,
         )
         return ExitCode.REVIEW_REQUIRED
-    print("WORKFLOW COMPLETE — relay the package summary above to the user.")
+    print_close_message(manifest)
+    print("WORKFLOW COMPLETE — relay the CLOSE MESSAGE block above verbatim to the user.")
     return ExitCode.SUCCESS
 
 

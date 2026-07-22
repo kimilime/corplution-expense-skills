@@ -137,6 +137,7 @@ The manifest should list:
 - amount
 - special-invoice flag
 - missing support or approval issues
+- an integrity-bound `close_summary` containing final evidence counts, amount adjustments, omitted records with reasons, and per-project category totals
 
 JSON shape:
 
@@ -173,6 +174,26 @@ JSON shape:
       "type": "行程单"
     }
   ],
+  "close_summary": {
+    "schema_version": "reimbursement_close_summary.v1",
+    "packaged_invoice_count": 1,
+    "packaged_support_count": 1,
+    "excluded_evidence_count": 0,
+    "excluded_invoice_count": 0,
+    "excluded_support_count": 0,
+    "omitted_unit_count": 0,
+    "not_reimbursed_record_count": 0,
+    "amount_adjustment_count": 0,
+    "policy_advisory_count": 0,
+    "project_count": 0,
+    "grand_total": "446.00",
+    "amount_adjustments": [],
+    "policy_advisories": [],
+    "excluded_evidence": [],
+    "omitted_units": [],
+    "not_reimbursed_records": [],
+    "projects": []
+  },
   "issues": []
 }
 ```
@@ -188,6 +209,12 @@ For the preferred subagent checkpoint, packaging resolves the current accepted a
 On Windows, renaming an existing package can be temporarily blocked by an open workbook, Explorer preview, antivirus scan, or indexer. Retry transient `PermissionError` locks with bounded exponential backoff while preserving the staging/backup rollback. If retries are exhausted, keep the old package intact, attempt to remove staging, warn if Windows also locks cleanup, and tell the agent to close the workbook and package-folder previews before rerunning Stage 4 through Chief. Status and journal discovery ignore hidden `.staging-*`/`.previous-*` folders so an interrupted package cannot masquerade as the deliverable. Direct script invocation does not bypass the lock and must not be presented as the fix.
 
 If `package_reimbursement_files.py` exits with code `3`, it has written a review package and manifest, but `issues` is non-empty. Treat this as a blocking stop: show the issue list in chat, obtain the missing evidence or an explicit applicant decision, then re-run Stage 4. Do not describe that package as complete or submit it.
+
+## Close Message
+
+On exit code `0`, the script prints `CLOSE MESSAGE TO SHOW IN CHAT (relay verbatim)`. Read `references/close-message.md` and relay that complete block verbatim. The stamped `close_summary` is authoritative; do not manually recount files, recompute project totals, infer why an amount changed, or omit excluded/not-reimbursed items.
+
+The Close Message is a success-only artifact. A review package with issues gets the blocking issue list, not a success summary.
 
 ## Validation
 
@@ -206,4 +233,4 @@ Before final delivery:
 - The packaged final rows carry the same applicant expense-record reconciliation as the current allocation, with zero unresolved records.
 - No current subagent-audit blocker exists (Mirror Warden or Gate Challenger), and any current accepted audit fingerprints were consumed by Stage 3.
 - The manifest has no unresolved issues before calling the workflow complete or submitting the package.
-- A concise final package summary has been shown in chat: package folder, workbook filename, and invoice/support-document counts.
+- The generated Close Message has been relayed verbatim in chat, including package/workbook locations, invoice/support counts, total reimbursement, amount adjustments and policy advisories, exclusions/omissions with reasons, and per-project totals.
